@@ -64,32 +64,6 @@ pub fn run_process(
     run_process_with_os_args(program, args, cwd, timeout, &[], cancelled)
 }
 
-/// Runs a process with argv elements that may contain non-UTF-8 platform strings.
-pub fn run_process_os(
-    program: &Path,
-    args: &[OsString],
-    cwd: &Path,
-    cancelled: &Arc<AtomicBool>,
-) -> Result<ChildOutput> {
-    run_process_os_with_env(program, args, cwd, &[], cancelled)
-}
-
-/// Runs a supervised process with explicit environment additions.
-pub fn run_process_os_with_env(
-    program: &Path,
-    args: &[OsString],
-    cwd: &Path,
-    environment: &[(OsString, OsString)],
-    cancelled: &Arc<AtomicBool>,
-) -> Result<ChildOutput> {
-    let output = run_process_with_os_args(program, args, cwd, None, environment, cancelled)?;
-    if output.termination == ProcessTermination::Interrupted {
-        Err(SpecLoopError::Interrupted)
-    } else {
-        Ok(output)
-    }
-}
-
 fn run_process_with_os_args(
     program: &Path,
     args: &[impl AsRef<OsStr>],

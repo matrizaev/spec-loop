@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 
 [specs]
 active_globs = ["specs/*.md"]
@@ -12,17 +12,19 @@ path_template = ".spec-loop/plans/{spec_id}.md"
 [prompts]
 plan_author = ["AGENTS.md"]
 plan_review = ["AGENTS.md"]
-plan_review_status_audit = []
 plan_audit = ["AGENTS.md"]
+plan_review_clarification = ["AGENTS.md"]
 implementation = ["AGENTS.md"]
 review = ["AGENTS.md"]
-review_status_audit = []
 review_audit = ["AGENTS.md"]
+review_clarification = ["AGENTS.md"]
+
+[review.context]
+argv = ["git", "diff"]
 
 [[checks]]
 name = "quality-gate"
 argv = ["make", "check"]
-cwd = "."
 timeout_seconds = 3600
 
 [agent]
@@ -49,7 +51,11 @@ destination = "archive"
 
 [completion]
 max_passes = 0
-commit_message = "Implement {spec_id}"
 
-[acceptance]
-manual_gates = ["product-owner acceptance"]
+[[actions.on_review_success]]
+name = "stage reviewed changes"
+argv = ["git", "add", "--all"]
+
+[[actions.on_finish]]
+name = "commit reviewed changes"
+argv = ["git", "commit", "-m", "Implement {spec_id}"]

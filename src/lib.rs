@@ -7,10 +7,10 @@ mod commands;
 mod config;
 mod discovery;
 mod error;
-mod git;
 mod integrity;
 mod paths;
 mod prompts;
+mod protocol;
 mod run_dir;
 mod workflow;
 

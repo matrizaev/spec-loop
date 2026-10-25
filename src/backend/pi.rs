@@ -131,13 +131,14 @@ fn is_executable_file(path: &Path) -> bool {
 
 fn arguments(agent: &AgentConfig, role: PromptRole, prompt: &str) -> Vec<String> {
     let stage = match role {
-        PromptRole::PlanAuthor | PromptRole::PlanReview => AgentStage::Planning,
-        PromptRole::Implementation => AgentStage::Implementation,
-        PromptRole::PlanReviewStatusAudit
+        PromptRole::PlanAuthor
+        | PromptRole::PlanReview
         | PromptRole::PlanAudit
-        | PromptRole::Review
-        | PromptRole::ReviewStatusAudit
-        | PromptRole::ReviewAudit => AgentStage::Review,
+        | PromptRole::PlanClarification => AgentStage::Planning,
+        PromptRole::Implementation => AgentStage::Implementation,
+        PromptRole::Review | PromptRole::ReviewAudit | PromptRole::ReviewClarification => {
+            AgentStage::Review
+        }
     };
     let mut args = vec![
         "--no-session".to_owned(),
@@ -437,12 +438,18 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--thinking", "medium"])
         );
+        for role in [PromptRole::PlanAudit, PromptRole::PlanClarification] {
+            let args = arguments(&agent, role, "plan prompt");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--model", "provider/planning"])
+            );
+            assert!(args.windows(2).any(|pair| pair == ["--thinking", "low"]));
+        }
         for role in [
-            PromptRole::PlanReviewStatusAudit,
-            PromptRole::PlanAudit,
             PromptRole::Review,
-            PromptRole::ReviewStatusAudit,
             PromptRole::ReviewAudit,
+            PromptRole::ReviewClarification,
         ] {
             let args = arguments(&agent, role, "review prompt");
             assert!(

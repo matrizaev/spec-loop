@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::error::{Result, SpecLoopError, io_error};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const SPEC_ID_PLACEHOLDER: &str = "{spec_id}";
 const SPEC_PATH_PLACEHOLDER: &str = "{spec_path}";
 const PLAN_PATH_PLACEHOLDER: &str = "{plan_path}";
@@ -30,7 +30,9 @@ pub struct Profile {
     #[serde(default)]
     pub completion: CompletionConfig,
     #[serde(default)]
-    pub acceptance: AcceptanceConfig,
+    pub review: ReviewConfig,
+    #[serde(default)]
+    pub actions: ActionsConfig,
 }
 
 /// Spec file patterns, identifier syntax, and ordering policy.
@@ -88,12 +90,12 @@ impl Default for PlanConfig {
 pub struct PromptConfig {
     pub plan_author: Vec<PathBuf>,
     pub plan_review: Vec<PathBuf>,
-    pub plan_review_status_audit: Vec<PathBuf>,
     pub plan_audit: Vec<PathBuf>,
+    pub plan_review_clarification: Vec<PathBuf>,
     pub implementation: Vec<PathBuf>,
     pub review: Vec<PathBuf>,
-    pub review_status_audit: Vec<PathBuf>,
     pub review_audit: Vec<PathBuf>,
+    pub review_clarification: Vec<PathBuf>,
 }
 
 /// One argv-only configured check command.
@@ -102,13 +104,46 @@ pub struct PromptConfig {
 pub struct CheckConfig {
     pub name: String,
     pub argv: Vec<String>,
-    #[serde(default = "default_cwd")]
-    pub cwd: PathBuf,
     pub timeout_seconds: Option<u64>,
 }
 
-fn default_cwd() -> PathBuf {
-    PathBuf::from(".")
+/// Review-context command delegated to Pi tools, never run by the engine.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewConfig {
+    pub context: ReviewContextConfig,
+}
+
+/// Argv supplied to implementation review and grounding roles.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewContextConfig {
+    pub argv: Vec<String>,
+}
+
+impl Default for ReviewContextConfig {
+    fn default() -> Self {
+        Self {
+            argv: vec!["git".to_owned(), "diff".to_owned()],
+        }
+    }
+}
+
+/// Ordered user-authorized lifecycle command lists.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActionsConfig {
+    pub on_review_success: Vec<ActionConfig>,
+    pub on_finish: Vec<ActionConfig>,
+}
+
+/// One argv-only lifecycle command.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionConfig {
+    pub name: String,
+    pub argv: Vec<String>,
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Pi backend settings. Resource availability is controlled only by Pi configuration.
@@ -193,35 +228,31 @@ pub struct ArchiveConfig {
     pub destination: Option<String>,
 }
 
-/// Commit message and retry policy.
-#[derive(Clone, Debug, Deserialize)]
+/// Retry policy for agent roles.
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CompletionConfig {
     pub max_passes: usize,
-    pub commit_message: String,
-}
-
-impl Default for CompletionConfig {
-    fn default() -> Self {
-        Self {
-            max_passes: 0,
-            commit_message: "Implement {spec_id}".to_owned(),
-        }
-    }
-}
-
-/// User-owned acceptance gates that cannot be run by the engine.
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AcceptanceConfig {
-    pub manual_gates: Vec<String>,
 }
 
 impl Profile {
     pub fn load(path: &Path) -> Result<Self> {
         let contents = std::fs::read_to_string(path)
             .map_err(|source| io_error("read profile", path, source))?;
-        let profile: Self = toml::from_str(&contents)
+        let document: toml::Value = toml::from_str(&contents)
+            .map_err(|error| SpecLoopError::Config(format!("{}: {error}", path.display())))?;
+        if document
+            .get("schema_version")
+            .and_then(toml::Value::as_integer)
+            == Some(1)
+        {
+            return Err(SpecLoopError::Config(format!(
+                "{} uses profile schema v1; migrate to schema_version = 2 (no automatic migration is available)",
+                path.display()
+            )));
+        }
+        let profile: Self = document
+            .try_into()
             .map_err(|error| SpecLoopError::Config(format!("{}: {error}", path.display())))?;
         profile.validate()?;
         Ok(profile)
@@ -238,8 +269,9 @@ impl Profile {
         validate_plan_and_archive(&self.plan, &self.archive)?;
         validate_agent(&self.agent)?;
         validate_checks(&self.checks)?;
-        validate_resource_paths(&self.prompts)?;
-        validate_completion(&self.completion, &self.acceptance)
+        validate_actions(&self.actions)?;
+        validate_review_context(&self.review.context)?;
+        validate_resource_paths(&self.prompts)
     }
 }
 
@@ -368,39 +400,13 @@ fn validate_checks(checks: &[CheckConfig]) -> Result<()> {
                 check.name
             )));
         }
-        let Some(program) = check.argv.first() else {
-            return Err(SpecLoopError::Config(format!(
-                "check {:?} must have a non-empty argv",
-                check.name
-            )));
-        };
-        if program.trim().is_empty() {
-            return Err(SpecLoopError::Config(format!(
-                "check {:?} must have a non-empty argv",
-                check.name
-            )));
-        }
-        if program.contains('{') || program.contains('}') {
-            return Err(SpecLoopError::Config(format!(
-                "check {:?} executable argv[0] cannot contain placeholders",
-                check.name
-            )));
-        }
+        let field = format!("check {:?} argv", check.name);
+        validate_argv(&check.argv, &field, false)?;
         if check.timeout_seconds == Some(0) {
             return Err(SpecLoopError::Config(format!(
                 "check {:?} timeout_seconds must be positive when set",
                 check.name
             )));
-        }
-        validate_relative_path(&check.cwd, "check.cwd")?;
-        for argument in &check.argv {
-            if argument.contains('\0') {
-                return Err(SpecLoopError::Config(format!(
-                    "check {:?} argv contains a NUL byte",
-                    check.name
-                )));
-            }
-            validate_placeholders(argument, "check argv")?;
         }
     }
     Ok(())
@@ -411,37 +417,57 @@ fn validate_resource_paths(prompts: &PromptConfig) -> Result<()> {
         .plan_author
         .iter()
         .chain(&prompts.plan_review)
-        .chain(&prompts.plan_review_status_audit)
         .chain(&prompts.plan_audit)
+        .chain(&prompts.plan_review_clarification)
         .chain(&prompts.implementation)
         .chain(&prompts.review)
-        .chain(&prompts.review_status_audit)
         .chain(&prompts.review_audit)
+        .chain(&prompts.review_clarification)
     {
         validate_relative_path(path, "profile resource path")?;
     }
     Ok(())
 }
 
-fn validate_completion(completion: &CompletionConfig, acceptance: &AcceptanceConfig) -> Result<()> {
-    if completion.commit_message.trim().is_empty() || completion.commit_message.contains('\0') {
-        return Err(SpecLoopError::Config(
-            "completion.commit_message cannot be empty or contain NUL".to_owned(),
-        ));
-    }
-    validate_placeholders(&completion.commit_message, "completion.commit_message")?;
-    if completion.commit_message.contains(SPEC_PATH_PLACEHOLDER)
-        || completion.commit_message.contains(PLAN_PATH_PLACEHOLDER)
-    {
-        return Err(SpecLoopError::Config(
-            "completion.commit_message only supports `{spec_id}`".to_owned(),
-        ));
-    }
-    for gate in &acceptance.manual_gates {
-        if gate.trim().is_empty() {
+fn validate_review_context(context: &ReviewContextConfig) -> Result<()> {
+    validate_argv(&context.argv, "review.context.argv", false)
+}
+
+fn validate_actions(actions: &ActionsConfig) -> Result<()> {
+    for action in actions.on_review_success.iter().chain(&actions.on_finish) {
+        if action.name.trim().is_empty() || action.name.contains('\0') {
             return Err(SpecLoopError::Config(
-                "acceptance.manual_gates cannot contain empty names".to_owned(),
+                "action name cannot be empty or contain NUL".to_owned(),
             ));
+        }
+        validate_argv(&action.argv, "action argv", true)?;
+        if action.timeout_seconds == Some(0) {
+            return Err(SpecLoopError::Config(format!(
+                "action {:?} timeout_seconds must be positive when set",
+                action.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_argv(argv: &[String], field: &str, placeholders: bool) -> Result<()> {
+    let Some(program) = argv.first() else {
+        return Err(SpecLoopError::Config(format!("{field} must be non-empty")));
+    };
+    if program.trim().is_empty() || program.contains('\0') {
+        return Err(SpecLoopError::Config(format!(
+            "{field} executable is invalid"
+        )));
+    }
+    for argument in argv {
+        if argument.contains('\0') {
+            return Err(SpecLoopError::Config(format!(
+                "{field} contains a NUL byte"
+            )));
+        }
+        if placeholders {
+            validate_placeholders(argument, field)?;
         }
     }
     Ok(())
@@ -541,7 +567,7 @@ mod tests {
             ("writer_tools", "['read']"),
         ] {
             let profile = format!(
-                "schema_version = 1\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\n{name} = {value}\n"
+                "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\n{name} = {value}\n"
             );
             assert!(
                 toml::from_str::<Profile>(&profile).is_err(),
@@ -553,7 +579,7 @@ mod tests {
     #[test]
     fn rejects_unknown_profile_fields() {
         let result = toml::from_str::<Profile>(
-            "schema_version = 1\nunknown = true\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n",
+            "schema_version = 2\nunknown = true\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n",
         );
         assert!(result.is_err());
     }
@@ -562,7 +588,7 @@ mod tests {
     fn validates_pi_thinking_levels_for_global_and_stage_settings() {
         for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let profile: Profile = toml::from_str(&format!(
-                "schema_version = 1\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nthinking = {level:?}\n"
+                "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nthinking = {level:?}\n"
             ))
             .expect("parse supported thinking level");
             assert!(profile.validate().is_ok(), "thinking level {level:?}");
@@ -578,7 +604,7 @@ mod tests {
             ("[agent.stages.review]", "agent.stages.review.thinking"),
         ] {
             let profile: Profile = toml::from_str(&format!(
-                "schema_version = 1\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n{section}\nthinking = 'unsupported'\n"
+                "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n{section}\nthinking = 'unsupported'\n"
             ))
             .expect("parse unsupported thinking level for validation");
             let error = profile
@@ -593,7 +619,7 @@ mod tests {
     fn rejects_unmatched_closing_brace_before_placeholder() {
         for value in ["}{spec_id}", "prefix}{spec_id}"] {
             let profile: Profile = toml::from_str(&format!(
-                "schema_version = 1\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[[checks]]\nname = 'placeholder test'\nargv = ['printf', {value:?}]\n"
+                "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[[actions.on_finish]]\nname = 'placeholder test'\nargv = ['printf', {value:?}]\n"
             ))
             .expect("parse malformed placeholder profile");
             assert!(
@@ -605,12 +631,25 @@ mod tests {
     }
 
     #[test]
-    fn minimal_profile_uses_engine_owned_complete_patch_staging() {
+    fn check_argv_keeps_non_template_braces_as_literal_data() {
         let profile: Profile = toml::from_str(
-            "schema_version = 1\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n",
+            "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[[checks]]\nname = 'brace arguments'\nargv = ['grep', '-E', '^[0-9]{3}$', '{unknown', '}']\n",
+        )
+        .expect("parse check with literal braces");
+        profile
+            .validate()
+            .expect("literal check argv braces are not templates");
+    }
+
+    #[test]
+    fn minimal_profile_defaults_review_context_and_empty_actions() {
+        let profile: Profile = toml::from_str(
+            "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n",
         )
         .expect("parse minimal profile");
         profile.validate().expect("validate minimal profile");
         assert_eq!(profile.completion.max_passes, 0);
+        assert_eq!(profile.review.context.argv, ["git", "diff"]);
+        assert!(profile.actions.on_finish.is_empty());
     }
 }

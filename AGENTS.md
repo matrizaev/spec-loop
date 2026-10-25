@@ -34,13 +34,13 @@ Every rule in this section is mandatory. No exceptions, suppressions, or local o
 
 These rules apply to every implementation and refactor:
 
-- Preserve user data. Never run `git reset`, `git clean`, checkout, stash, or other destructive recovery commands. Never silently overwrite or discard user changes; review the complete combined patch before engine staging, then stage only after no actionable findings remain.
+- Preserve user data. Never run `git reset`, `git clean`, checkout, stash, or other destructive recovery commands. Never silently overwrite or discard user changes. Spec Loop has no built-in Git state, staging, or commit integration; configured lifecycle commands are explicit user authorization and may have irreversible effects.
 - Never invoke configured commands through a shell. Pass validated argument vectors directly to child processes; keep untrusted spec/config text out of shell syntax.
 - Validate configuration and options before mutation or agent invocation. Reject unknown configuration fields and invalid, ambiguous, or unsafe inputs where required by the active specification rather than guessing. This generic rule does not expand scope explicitly excluded by the active specification. For Spec Loop, parent-traversal rejection, symlink-containment checks, and archive-destination collision guards are explicitly out of scope; do not implement them unless the user deliberately amends the active specification.
-- Keep Git mutation owned by workflow code. Agents must not commit, stage, alter history, or change `HEAD`. Preserve unexpected changes; route ordinary Git-visible file/index edits through checks and review rather than rollback or ownership-based stops. Assume one workflow operator; do not snapshot, poll, lock, or otherwise detect concurrent user/agent Git mutations. After review approval, use standard Git staging/commit behavior without rechecking worktree/index.
-- Preserve the user's effective Pi settings and inherited environment for every role. Pi configuration alone controls tools, extensions, MCP, skills, project trust, and context files; do not add Spec Loop profile fields or invocation flags that alter them. Run every role from repository root. Prompts ask reviewers/grounders not to mutate; Git-visible checks validate workflow inputs before approval, ignore Git-ignored artifacts, and do not sandbox extensions/MCP or reverse external side effects.
-- A failed, malformed, incomplete, or unknown-marker response cannot satisfy a completion marker; retry by default. A noncanonical review status uses the dedicated status auditor to normalize the raw response without adding findings. If status remains genuinely ambiguous after reviewer clarification, pause for user decision. A completion marker is not proof of correctness.
-- Run every configured check even after a failure. If any check fails, immediately return concise failure diagnostics to implementation and skip review for that pass. Review only after all configured checks succeed; stage only after review has no actionable findings. A failed check blocks completion.
+- Keep Git-specific policy out of engine code. Agents must not commit, stage, alter history, or change `HEAD`. Configured checks and lifecycle actions may invoke Git as ordinary argv-based commands. Preserve unexpected changes; do not snapshot, poll, lock, or detect concurrent mutations. Only selected spec and plan hashes trigger integrity stops.
+- Preserve the user's effective Pi settings and inherited environment for every role. Pi configuration alone controls tools, extensions, MCP, skills, project trust, and context files; do not add Spec Loop profile fields or invocation flags that alter them. Run every role from current project root. Implementation review, review clarification, and finding audit receive configured review-context argv and run it through Pi tools; the engine never executes or captures its output. Prompts request no mutation, but extensions/MCP are not sandboxed and external side effects cannot be reversed.
+- Every machine-consumed role response is strict typed JSON matching its generated role schema. A malformed or semantically inconsistent response retries the same role; valid `blocked` stops immediately. Never infer workflow state from prose, markers, or headings. Typed completion is not proof of correctness.
+- Run every configured check even after a failure. If any check fails, return concise diagnostics to implementation and skip review for that pass. Review only after all configured checks succeed. Configured success/finish actions run only at their specified workflow points; action failure stops without retry or rollback.
 - Do not claim a check, review, build, smoke test, or release passed unless it was actually run and its result observed.
 
 ## Implementation and change discipline
@@ -69,10 +69,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 
 Also run relevant integration tests when changing process, packaging, or release behavior. Release-target builds and smoke tests are CI gates, not local validation requirements. For this project:
 
-- Use temporary Git repositories and fake agent/backend processes for automated tests. Tests must not require a network, live model, credentials, or the developer's worktree state.
-- Test process supervision, malformed/partial output, non-zero exits, check ordering, and child termination where relevant.
-- Test duplicate/ambiguous specs, staged-change preservation, reviewer edits routed through repair, ignored-file tolerance, and check/review gates before staging/commit.
-- Assert that failures do not trigger staging/commit or destructive cleanup. Inspect resulting Git state, not only returned errors.
+- Use temporary non-Git project directories, fake agent/backend processes, and fake command executables. Tests must not require a network, live model, credentials, Git installation, or developer worktree state.
+- Test process supervision, malformed/partial output, non-zero exits, check ordering, action ordering, and child termination where relevant.
+- Test duplicate/ambiguous specs, hash protection for selected inputs, unrelated-file tolerance, reviewer repairs, archive paths, and check/review/action gates.
+- Assert failures preserve workspace changes and prior action effects, skip later actions/specs as required, and never trigger rollback.
 - Keep tests deterministic, isolated, and explicit about platform-specific assumptions. Do not make network-dependent tests part of default CI.
 - Run the full configured check list in order; capture each result and continue after failures as required by the workflow.
 
@@ -83,9 +83,9 @@ The selected active specification's acceptance criteria define required coverage
 - Keep CLI errors actionable and non-zero on invalid options, configuration, prerequisites, or failed gates. `--help` should remain usable without a repository profile if required by the spec.
 - Use structured types for profile data, strict deserialization, and validation that reports the offending field/path. Avoid loosely typed maps and scattered stringly typed policy.
 - Build child-process arguments with `std::process::Command` or an equivalent argv-safe API. Capture stdout and stderr without deadlock; preserve useful diagnostics and exit status.
-- Separate raw backend output from parsed final responses. Validate event sequence, settlement, completion state, and exact expected marker per attempt; malformed attempts feed recovery retries and never count as complete.
+- Separate raw backend output from typed final responses. Validate Pi event sequence, settlement, completion state, exact JSON shape, role/version, and input-dependent constraints per attempt; malformed attempts retry and never count as complete.
 - Log enough context to recover and diagnose failures while protecting credentials. Keep retained logs outside the worktree with restrictive permissions where supported.
-- Make dry-run observational: resolve and report intended work without invoking agents or mutating Git/worktree state.
+- Make dry-run observational: resolve and report intended work without invoking agents, checks, lifecycle actions, or mutating workspace state.
 
 ## Completion report
 

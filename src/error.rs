@@ -1,6 +1,5 @@
 use std::io;
 use std::path::PathBuf;
-use std::process::ExitStatus;
 
 /// Errors produced by configuration, process execution, and workflow guards.
 #[derive(Debug, thiserror::Error)]
@@ -45,12 +44,4 @@ pub fn io_error(
         path: path.into(),
         source,
     }
-}
-
-pub fn process_error(program: &str, status: ExitStatus, stderr: &[u8]) -> SpecLoopError {
-    let diagnostic = String::from_utf8_lossy(stderr);
-    SpecLoopError::Process(format!(
-        "{program} exited with {status}; stderr: {}",
-        diagnostic.trim()
-    ))
 }
