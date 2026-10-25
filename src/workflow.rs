@@ -819,7 +819,7 @@ fn review_implementation(
             };
             let message = canonical_json(&handoff)?;
             Ok(ReviewDisposition::Repair(format!(
-                "Repair only findings marked supported and required in the audit. Follow audit rationale for the smallest sufficient correct fix, even when substantial. Do not change code for supported findings marked not_required. Resolve ambiguous findings from available evidence; do not treat ambiguity as authorization to change code, and return blocked if consequential ambiguity remains.\n{message}"
+                "Resume implementation from current workspace and preserve prior work. Repair only findings marked supported and required in the audit. Follow audit rationale for the smallest sufficient correct fix, even when substantial. Do not change code for supported findings marked not_required. Resolve ambiguous findings from available evidence; do not treat ambiguity as authorization to change code, and return blocked if consequential ambiguity remains. If required in-scope work remains but can be implemented compliantly, make a concrete increment and return ready_for_review; the workflow will rerun checks and review, then route remaining findings back here. ready_for_review marks readiness for another pass, not full spec completion. Unfinished work or its size alone is not a blocker.\n{message}"
             )))
         }
     }

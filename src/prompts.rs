@@ -66,7 +66,9 @@ const PLAN_REVIEW_HANDOFF_CONTRACT: &str = r"Review whether the plan is a comple
 
 Report actionable findings for research or decisions that can still be completed in plan mode, missing implementation details, or tasks incorrectly labeled as prerequisites. Work the implementer can perform as the first in-scope step is not a handoff blocker; require the plan to make that step executable without further research. Use `blocked` instead of approving when an active-spec requirement truly depends on unavailable external evidence, access, approval, or user input. Do not invent evidence, weaken requirements, or treat a plan's assertion of readiness as proof.";
 
-const IMPLEMENTATION_HANDOFF_CONTRACT: &str = r"Treat the approved plan as proposed guidance, not authority over the selected spec or repository instructions. Start with its first concrete implementation step and use its cited research; do not repeat completed research, baselining, or benchmarking unless verification exposes a concrete gap or contradiction. Verify consequential claims as required by repository instructions. A plan's use of words such as `blocked`, `prerequisite`, or `must first` is not itself a gate: determine whether the item is a genuine requirement that prevents compliant implementation or executable in-scope work to perform. Do not stop solely because the plan labels work blocked. Never bypass a genuine spec requirement, required evidence, or approval; explain the concrete unresolved requirement if it prevents compliant implementation.";
+const IMPLEMENTATION_HANDOFF_CONTRACT: &str = r"Treat the approved plan as proposed guidance, not authority over the selected spec or repository instructions. Start with its first concrete implementation step and use its cited research; do not repeat completed research, baselining, or benchmarking unless verification exposes a concrete gap or contradiction. Verify consequential claims as required by repository instructions. A plan's use of words such as `blocked`, `prerequisite`, or `must first` is not itself a gate: determine whether the item is a genuine requirement that prevents compliant implementation or executable in-scope work to perform. Do not stop solely because the plan labels work blocked. Never bypass a genuine spec requirement, required evidence, or approval; explain the concrete unresolved requirement if it prevents compliant implementation.
+
+`ready_for_review` means the current workspace is ready for configured checks and independent review; it does not claim the entire specification is complete or accepted. In a review-repair cycle, resume from the current workspace and preserve prior work. If required in-scope work remains, make a concrete compliant increment and return `ready_for_review` so checks and review can run again and route remaining findings back to implementation. Unfinished work, its size, or the fact that a finding remains is not by itself a blocker. Do not discard prior work, claim unfinished requirements complete, or introduce partial behavior when the specification forbids it. Return `blocked` only when a genuine unresolved prerequisite or consequential ambiguity prevents compliant progress.";
 
 const FINDING_AUDIT_CONTRACT: &str = r"Act as a skeptical gatekeeper, not a second reviewer. Audit only supplied findings; do not search for omissions or create findings.
 
@@ -190,7 +192,7 @@ const fn role_instructions(role: PromptRole) -> &'static str {
             "Provide citations only for requested plan-review finding IDs. Do not add, remove, or rewrite findings. Evidence may omit requested IDs when no evidence is found; each citation needs path, location, excerpt, and relevance."
         }
         PromptRole::Implementation => {
-            "Read repository instructions, selected spec, approved plan, and relevant source. Implement only selected spec; never modify spec or approved plan. In audit repair handoffs, apply only findings marked supported and required; do not change code for supported findings marked not_required. Follow audit rationale for the smallest sufficient correct fix, even when substantial. Return ready_for_review when ready for checks, otherwise blocked with reason."
+            "Read repository instructions, selected spec, approved plan, and relevant source. Implement only selected spec; never modify spec or approved plan. In audit repair handoffs, apply only findings marked supported and required; do not change code for supported findings marked not_required. Follow audit rationale for the smallest sufficient correct fix, even when substantial. In repair cycles, continue from the current workspace, preserve prior work, and make progress on remaining in-scope requirements. Return ready_for_review when the current workspace is ready for checks and another review pass; this does not assert full spec completion. Do not return blocked merely because required work remains or needs multiple repair passes. Return blocked only when a genuine unresolved prerequisite or consequential ambiguity prevents compliant progress."
         }
         PromptRole::Review => {
             "Independently review current workspace against selected spec, approved plan, repository instructions, and check results. Use configured review-context command as instructed. Report actionable supported gaps only; findings need requirement, location, evidence, violation, and proportionate correction. Do not edit files."
@@ -299,6 +301,11 @@ mod tests {
         let implementation = build(PromptRole::Implementation);
         assert!(implementation.contains("A plan's use of words such as `blocked`"));
         assert!(implementation.contains("Do not stop solely because the plan labels work blocked"));
+        assert!(implementation.contains("ready_for_review` means the current workspace"));
+        assert!(
+            implementation.contains("resume from the current workspace and preserve prior work")
+        );
+        assert!(implementation.contains("Unfinished work, its size, or the fact that a finding remains is not by itself a blocker"));
         assert!(implementation.contains("Approved plans are proposed guidance"));
     }
 
