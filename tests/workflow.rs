@@ -136,11 +136,15 @@ fn write_fake_responses(directory: &Path) {
         ),
         (
             "audit-supported",
-            "{\"protocol_version\":1,\"role\":\"review_audit\",\"status\":\"complete\",\"classifications\":[{\"finding_id\":1,\"classification\":\"supported\",\"rationale\":\"verified requirement\"}]}",
+            "{\"protocol_version\":1,\"role\":\"review_audit\",\"status\":\"complete\",\"classifications\":[{\"finding_id\":1,\"classification\":\"supported\",\"actionability\":\"required\",\"rationale\":\"verified requirement; smallest correct fix is substantial but required\"}]}",
+        ),
+        (
+            "audit-supported-not-required",
+            "{\"protocol_version\":1,\"role\":\"review_audit\",\"status\":\"complete\",\"classifications\":[{\"finding_id\":1,\"classification\":\"supported\",\"actionability\":\"not_required\",\"rationale\":\"fact is correct but existing requirements require no correction\"}]}",
         ),
         (
             "audit-unsupported",
-            "{\"protocol_version\":1,\"role\":\"review_audit\",\"status\":\"complete\",\"classifications\":[{\"finding_id\":1,\"classification\":\"unsupported\",\"rationale\":\"not supported yet\"}]}",
+            "{\"protocol_version\":1,\"role\":\"review_audit\",\"status\":\"complete\",\"classifications\":[{\"finding_id\":1,\"classification\":\"unsupported\",\"actionability\":\"not_required\",\"rationale\":\"claim is not supported\"}]}",
         ),
         (
             "clarification",
@@ -180,7 +184,7 @@ fn write_fake_pi(
     temporary: &Path,
 ) {
     let script = format!(
-        "#!/bin/sh\nset -eu\nPROMPT=''\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in -p) PROMPT=\"$2\"; shift 2 ;; *) shift ;; esac; done\nprintf '%s\\n---\\n' \"$PROMPT\" >> {prompts}\ncase \"$PROMPT\" in\n  *'Create or revise selected plan only'*) printf 'plan-author\\n' >> {agent_events}; printf '# Authored plan\\n' > .spec-loop/plans/001.md; cat {plan_ready} ;;\n  *'Independently review plan against selected spec'*) printf 'plan-review\\n' >> {agent_events}; cat {plan_clear} ;;\n  *'Implement only selected spec'*) printf 'implementation:%s\\n' \"$PWD\" >> {agent_events}; printf 'implemented\\n' > generated.txt; if [ \"${{MODE-}}\" = blocked ]; then cat {blocked}; else cat {ready}; fi ;;\n  *'Audit only supplied implementation-review findings'*) printf 'review-audit:%s\\n' \"$PWD\" >> {agent_events}; count=0; [ ! -f {audit_count} ] || count=$(cat {audit_count}); count=$((count + 1)); printf '%s' \"$count\" > {audit_count}; if [ \"${{MODE-}}\" = audit-blocked ]; then cat {audit_blocked}; elif {{ [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = clarification-blocked ]; }} && [ \"$count\" -eq 1 ]; then cat {audit_unsupported}; else cat {audit_supported}; fi ;;\n  *'Provide citations only for requested implementation-review finding IDs'*) printf 'review-clarification:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = clarification-blocked ]; then cat {clarification_blocked}; else cat {clarification}; fi ;;\n  *'Independently review current workspace'*) printf 'review:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = review-context-blocked ]; then cat {review_blocked}; elif [ \"${{MODE-}}\" = finding-repair ] || [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = clarification-blocked ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"$count\" -eq 1 ]; then cat {review_issues}; else cat {review_clear}; fi; elif [ \"${{MODE-}}\" = malformed-review-once ] || [ \"${{MODE-}}\" = malformed-review-always ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"${{MODE-}}\" = malformed-review-always ] || [ \"$count\" -eq 1 ]; then cat {malformed}; else cat {review_clear}; fi; else cat {review_clear}; fi ;;\n  *) printf 'unexpected-role\\n' >> {agent_events}; exit 23 ;;\nesac\n",
+        "#!/bin/sh\nset -eu\nPROMPT=''\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in -p) PROMPT=\"$2\"; shift 2 ;; *) shift ;; esac; done\nprintf '%s\\n---\\n' \"$PROMPT\" >> {prompts}\ncase \"$PROMPT\" in\n  *'Create or revise selected plan only'*) printf 'plan-author\\n' >> {agent_events}; printf '# Authored plan\\n' > .spec-loop/plans/001.md; cat {plan_ready} ;;\n  *'Independently review plan against selected spec'*) printf 'plan-review\\n' >> {agent_events}; cat {plan_clear} ;;\n  *'Implement only selected spec'*) printf 'implementation:%s\\n' \"$PWD\" >> {agent_events}; printf 'implemented\\n' > generated.txt; if [ \"${{MODE-}}\" = blocked ]; then cat {blocked}; else cat {ready}; fi ;;\n  *'Audit only supplied implementation-review findings'*) printf 'review-audit:%s\\n' \"$PWD\" >> {agent_events}; count=0; [ ! -f {audit_count} ] || count=$(cat {audit_count}); count=$((count + 1)); printf '%s' \"$count\" > {audit_count}; if [ \"${{MODE-}}\" = audit-blocked ]; then cat {audit_blocked}; elif {{ [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = clarification-blocked ]; }} && [ \"$count\" -eq 1 ]; then cat {audit_unsupported}; elif [ \"${{MODE-}}\" = nonactionable ]; then cat {audit_supported_not_required}; else cat {audit_supported}; fi ;;\n  *'Provide citations only for requested implementation-review finding IDs'*) printf 'review-clarification:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = clarification-blocked ]; then cat {clarification_blocked}; else cat {clarification}; fi ;;\n  *'Independently review current workspace'*) printf 'review:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = review-context-blocked ]; then cat {review_blocked}; elif [ \"${{MODE-}}\" = finding-repair ] || [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = clarification-blocked ] || [ \"${{MODE-}}\" = nonactionable ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"$count\" -eq 1 ]; then cat {review_issues}; else cat {review_clear}; fi; elif [ \"${{MODE-}}\" = malformed-review-once ] || [ \"${{MODE-}}\" = malformed-review-always ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"${{MODE-}}\" = malformed-review-always ] || [ \"$count\" -eq 1 ]; then cat {malformed}; else cat {review_clear}; fi; else cat {review_clear}; fi ;;\n  *) printf 'unexpected-role\\n' >> {agent_events}; exit 23 ;;\nesac\n",
         prompts = shell_quote(prompts),
         agent_events = shell_quote(agent_events),
         plan_ready = shell_quote(&responses.join("plan-ready")),
@@ -195,6 +199,7 @@ fn write_fake_pi(
         audit_count = shell_quote(&temporary.join("audit-count")),
         review_issues = shell_quote(&responses.join("review-issues")),
         audit_supported = shell_quote(&responses.join("audit-supported")),
+        audit_supported_not_required = shell_quote(&responses.join("audit-supported-not-required")),
         audit_unsupported = shell_quote(&responses.join("audit-unsupported")),
         clarification = shell_quote(&responses.join("clarification")),
         review_blocked = shell_quote(&responses.join("review-blocked")),
@@ -447,11 +452,26 @@ fn typed_finding_audit_and_one_time_evidence_clarification_run_with_review_conte
         let prompts = fs::read_to_string(&fixture.prompts).expect("role prompts");
         assert!(prompts.contains("Review-context command argv"));
         assert!(prompts.contains("review_audit"));
+        assert!(prompts.contains("smallest correct fix is substantial but required"));
         if mode == "clarify" {
             assert!(prompts.contains("review_clarification"));
             assert!(prompts.contains("source confirms behavior"));
         }
     }
+}
+
+#[test]
+fn supported_non_actionable_finding_does_not_trigger_repair() {
+    let fixture = Fixture::new(false, false);
+    let output = fixture.run_with_env(&["--spec", "001"], &[("MODE", "nonactionable")]);
+    assert_success(&output);
+    assert_eq!(count_lines(&fixture.agent_events, "review-audit:"), 1);
+    assert_eq!(count_lines(&fixture.agent_events, "implementation:"), 1);
+    assert_eq!(count_lines(&fixture.agent_events, "review:"), 1);
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Review auditor found no required correction for findings: 1")
+    );
 }
 
 #[test]

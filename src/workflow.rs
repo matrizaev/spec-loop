@@ -17,8 +17,8 @@ use crate::integrity::InputIntegrity;
 use crate::paths::{self, expand_template, resolve_optional};
 use crate::prompts::{self, PromptContext, PromptRole};
 use crate::protocol::{
-    self, AuditEvidenceInput, AuditInput, AuditResult, ClarificationInput, Classification,
-    EvidenceResult, Finding, FindingClassification, ImplementationAuditResponse,
+    self, Actionability, AuditEvidenceInput, AuditInput, AuditResult, ClarificationInput,
+    Classification, EvidenceResult, Finding, FindingClassification, ImplementationAuditResponse,
     ImplementationClarificationResponse, ImplementationRepairInput, ImplementationResponse,
     ImplementationReviewResponse, PlanAuditResponse, PlanAuthorResponse, PlanClarificationResponse,
     PlanRepairInput, PlanReviewResponse, Readiness, ResponseFields, ReviewResult,
@@ -60,6 +60,13 @@ struct CheckReport {
 
 struct AuditReport {
     classifications: Vec<FindingClassification>,
+}
+
+struct FindingDisposition<'a> {
+    actionable: Vec<&'a Finding>,
+    not_actionable: Vec<&'a Finding>,
+    unsupported: Vec<&'a Finding>,
+    ambiguous: Vec<&'a Finding>,
 }
 
 impl WorkflowContext<'_> {
@@ -615,29 +622,38 @@ fn run_plan_loop(
                         checks: "",
                     },
                 )?;
-                let (supported, unsupported, ambiguous) = disposition(findings, &report)?;
-                if !unsupported.is_empty() {
+                let findings = disposition(findings, &report)?;
+                if !findings.unsupported.is_empty() {
                     println!(
                         "Plan auditor classified findings unsupported: {}",
-                        ids(&unsupported)
+                        ids(&findings.unsupported)
                     );
                 }
-                if !ambiguous.is_empty() {
+                if !findings.not_actionable.is_empty() {
+                    println!(
+                        "Plan auditor found no required correction for findings: {}",
+                        ids(&findings.not_actionable)
+                    );
+                }
+                if !findings.ambiguous.is_empty() {
                     return Err(SpecLoopError::Workflow(format!(
                         "plan finding audit remains ambiguous for finding IDs {}; inspect run logs at {}",
-                        ids(&ambiguous),
+                        ids(&findings.ambiguous),
                         context.run_dir.root.display()
                     )));
                 }
-                if supported.is_empty() {
+                if findings.actionable.is_empty() {
                     return Ok(());
                 }
                 let handoff = PlanRepairInput {
-                    findings: supported,
+                    actionable_findings: findings.actionable,
                     classifications: report
                         .classifications
                         .iter()
-                        .filter(|item| item.classification == Classification::Supported)
+                        .filter(|item| {
+                            item.classification == Classification::Supported
+                                && item.actionability == Actionability::Required
+                        })
                         .collect(),
                 };
                 feedback = Some(canonical_json(&handoff)?);
@@ -786,18 +802,24 @@ fn review_implementation(
                     checks,
                 },
             )?;
-            let (supported, _unsupported, ambiguous) = disposition(findings, &report)?;
-            if supported.is_empty() && ambiguous.is_empty() {
+            let findings = disposition(findings, &report)?;
+            if !findings.not_actionable.is_empty() {
+                println!(
+                    "Review auditor found no required correction for findings: {}",
+                    ids(&findings.not_actionable)
+                );
+            }
+            if findings.actionable.is_empty() && findings.ambiguous.is_empty() {
                 return Ok(ReviewDisposition::Approved);
             }
             let handoff = ImplementationRepairInput {
-                supported_findings: supported,
-                ambiguous_findings: ambiguous,
+                actionable_findings: findings.actionable,
+                ambiguous_findings: findings.ambiguous,
                 audit: &report.classifications,
             };
             let message = canonical_json(&handoff)?;
             Ok(ReviewDisposition::Repair(format!(
-                "Repair only supported findings using smallest architecture-aligned changes. Ambiguous findings remain unresolved and must be fixed or clarified.\n{message}"
+                "Repair only findings marked supported and required in the audit. Follow audit rationale for the smallest sufficient correct fix, even when substantial. Do not change code for supported findings marked not_required. Resolve ambiguous findings from available evidence; do not treat ambiguity as authorization to change code, and return blocked if consequential ambiguity remains.\n{message}"
             )))
         }
     }
@@ -825,10 +847,11 @@ fn audit_findings<R: Serialize>(
     request: AuditRequest<'_, R>,
 ) -> Result<AuditReport> {
     let initial = invoke_audit(context, request, None)?;
-    let (_, unsupported, ambiguous) = disposition(request.findings, &initial)?;
-    let requested = unsupported
+    let findings = disposition(request.findings, &initial)?;
+    let requested = findings
+        .unsupported
         .iter()
-        .chain(&ambiguous)
+        .chain(&findings.ambiguous)
         .map(|finding| finding.id)
         .collect::<Vec<_>>();
     if requested.is_empty() {
@@ -1019,19 +1042,37 @@ fn invoke_audit(
 fn disposition<'a>(
     findings: &'a [Finding],
     report: &AuditReport,
-) -> Result<(Vec<&'a Finding>, Vec<&'a Finding>, Vec<&'a Finding>)> {
+) -> Result<FindingDisposition<'a>> {
     protocol::validate_classifications(&report.classifications, findings)?;
-    let mut supported = Vec::new();
-    let mut unsupported = Vec::new();
-    let mut ambiguous = Vec::new();
-    for (finding, classification) in findings.iter().zip(&report.classifications) {
-        match classification.classification {
-            Classification::Supported => supported.push(finding),
-            Classification::Unsupported => unsupported.push(finding),
-            Classification::Ambiguous => ambiguous.push(finding),
+    let mut disposition = FindingDisposition {
+        actionable: Vec::new(),
+        not_actionable: Vec::new(),
+        unsupported: Vec::new(),
+        ambiguous: Vec::new(),
+    };
+    for (finding, assessment) in findings.iter().zip(&report.classifications) {
+        match (assessment.classification, assessment.actionability) {
+            (Classification::Unsupported, Actionability::NotRequired) => {
+                disposition.unsupported.push(finding);
+            }
+            (Classification::Supported, Actionability::Required) => {
+                disposition.actionable.push(finding);
+            }
+            (Classification::Supported, Actionability::NotRequired) => {
+                disposition.not_actionable.push(finding);
+            }
+            (Classification::Supported | Classification::Ambiguous, Actionability::Ambiguous) => {
+                disposition.ambiguous.push(finding);
+            }
+            (Classification::Unsupported, Actionability::Required | Actionability::Ambiguous)
+            | (Classification::Ambiguous, Actionability::Required | Actionability::NotRequired) => {
+                return Err(SpecLoopError::Agent(
+                    "audit classification and actionability conflict".to_owned(),
+                ));
+            }
         }
     }
-    Ok((supported, unsupported, ambiguous))
+    Ok(disposition)
 }
 
 fn ids(findings: &[&Finding]) -> String {

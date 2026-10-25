@@ -89,21 +89,43 @@ macro_rules! review_response {
 review_response!(PlanReviewResponse, "plan_review");
 review_response!(ImplementationReviewResponse, "review");
 
+/// Describes whether a finding's factual claim is established by evidence.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Classification {
+    /// Evidence establishes the finding's factual claim.
     Supported,
+    /// Evidence disproves the finding's factual claim.
     Unsupported,
+    /// Available evidence cannot settle the finding's factual claim.
     Ambiguous,
 }
 
+/// Describes whether a factually supported finding requires a correction.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Actionability {
+    /// Existing requirements require a correction.
+    Required,
+    /// No correction is needed under existing requirements and scope.
+    NotRequired,
+    /// Available evidence cannot settle whether correction is required.
+    Ambiguous,
+}
+
+/// Records factual validity separately from whether a correction is necessary.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[schemars(deny_unknown_fields)]
 #[serde(deny_unknown_fields)]
 pub struct FindingClassification {
+    /// ID of corresponding input finding.
     #[schemars(range(min = 1))]
     pub finding_id: u64,
+    /// Factual validity of the reported finding.
     pub classification: Classification,
+    /// Whether repository requirements require a correction.
+    pub actionability: Actionability,
+    /// Evidence-based rationale, including correction proportionality.
     #[schemars(length(min = 1))]
     pub rationale: String,
 }
@@ -221,20 +243,25 @@ pub struct ClarificationInput<'a, R> {
     pub requested_finding_ids: &'a [u64],
 }
 
-/// Supported plan findings passed to `PlanAuthor` for repair.
+/// Actionable plan findings passed to `PlanAuthor` for repair.
 #[derive(JsonSchema, Serialize)]
 #[schemars(deny_unknown_fields)]
 pub struct PlanRepairInput<'a> {
-    pub findings: Vec<&'a Finding>,
+    /// Findings audited as supported and requiring correction.
+    pub actionable_findings: Vec<&'a Finding>,
+    /// Audit rationale for each finding sent for repair.
     pub classifications: Vec<&'a FindingClassification>,
 }
 
-/// Supported and unresolved findings passed to implementation for repair.
+/// Actionable and unresolved findings passed to implementation for repair.
 #[derive(JsonSchema, Serialize)]
 #[schemars(deny_unknown_fields)]
 pub struct ImplementationRepairInput<'a> {
-    pub supported_findings: Vec<&'a Finding>,
+    /// Findings audited as supported and requiring correction.
+    pub actionable_findings: Vec<&'a Finding>,
+    /// Findings whose factual validity or actionability remains unresolved.
     pub ambiguous_findings: Vec<&'a Finding>,
+    /// Complete audit rationale, including findings that require no repair.
     pub audit: &'a [FindingClassification],
 }
 
@@ -419,6 +446,7 @@ fn validate_audit(result: &AuditResult) -> Result<()> {
                         "classification finding_id must be positive".to_owned(),
                     ));
                 }
+                validate_assessment(item)?;
                 validate_text(&item.rationale, "classification rationale")?;
             }
             Ok(())
@@ -510,7 +538,26 @@ pub fn validate_classifications(
                 finding.id, classification.finding_id
             )));
         }
+        validate_assessment(classification)?;
         validate_text(&classification.rationale, "classification rationale")?;
+    }
+    Ok(())
+}
+
+fn validate_assessment(assessment: &FindingClassification) -> Result<()> {
+    if assessment.classification == Classification::Unsupported
+        && assessment.actionability != Actionability::NotRequired
+    {
+        return Err(SpecLoopError::Agent(
+            "unsupported findings cannot require correction".to_owned(),
+        ));
+    }
+    if assessment.classification == Classification::Ambiguous
+        && assessment.actionability != Actionability::Ambiguous
+    {
+        return Err(SpecLoopError::Agent(
+            "ambiguous findings require ambiguous actionability".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -548,10 +595,10 @@ pub fn validate_evidence(evidence: &[FindingEvidence], requested_ids: &[u64]) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditResult, Classification, Finding, FindingClassification, FindingEvidence,
-        ImplementationAuditResponse, ImplementationClarificationResponse, ImplementationResponse,
-        ImplementationReviewResponse, PlanAuditResponse, PlanAuthorResponse,
-        PlanClarificationResponse, PlanReviewResponse, ReviewResult, schema,
+        Actionability, AuditResult, Classification, Finding, FindingClassification,
+        FindingEvidence, ImplementationAuditResponse, ImplementationClarificationResponse,
+        ImplementationResponse, ImplementationReviewResponse, PlanAuditResponse,
+        PlanAuthorResponse, PlanClarificationResponse, PlanReviewResponse, ReviewResult, schema,
         validate_classifications, validate_evidence, validate_findings,
     };
 
@@ -750,6 +797,7 @@ mod tests {
         let classification = FindingClassification {
             finding_id: 1,
             classification: Classification::Supported,
+            actionability: Actionability::Required,
             rationale: "supported by evidence".to_owned(),
         };
         assert!(
@@ -760,14 +808,30 @@ mod tests {
             .is_ok()
         );
         assert!(validate_classifications(&[], std::slice::from_ref(&finding)).is_err());
+        let supported_observation = FindingClassification {
+            actionability: Actionability::NotRequired,
+            ..classification.clone()
+        };
+        assert!(
+            validate_classifications(
+                std::slice::from_ref(&supported_observation),
+                std::slice::from_ref(&finding)
+            )
+            .is_ok()
+        );
         let wrong_order = FindingClassification {
             finding_id: 2,
-            ..classification
+            ..classification.clone()
         };
         assert!(validate_classifications(&[wrong_order], std::slice::from_ref(&finding)).is_err());
+        let inconsistent = FindingClassification {
+            classification: Classification::Unsupported,
+            ..classification
+        };
+        assert!(validate_classifications(&[inconsistent], std::slice::from_ref(&finding)).is_err());
 
         let valid = super::parse::<PlanAuditResponse>(
-            r#"{"protocol_version":1,"role":"plan_audit","status":"complete","classifications":[{"finding_id":1,"classification":"supported","rationale":"verified"}]}"#,
+            r#"{"protocol_version":1,"role":"plan_audit","status":"complete","classifications":[{"finding_id":1,"classification":"supported","actionability":"required","rationale":"verified"}]}"#,
             "plan_audit",
         )
         .expect("valid audit");
@@ -779,7 +843,12 @@ mod tests {
         .expect("valid blocked audit");
         assert!(matches!(blocked.result, AuditResult::Blocked { .. }));
         assert!(super::parse::<PlanAuditResponse>(
-            r#"{"protocol_version":1,"role":"plan_audit","status":"complete","classifications":[{"finding_id":1,"classification":"supported","rationale":"ok","extra":true}]}"#,
+            r#"{"protocol_version":1,"role":"plan_audit","status":"complete","classifications":[{"finding_id":1,"classification":"supported","actionability":"required","rationale":"ok","extra":true}]}"#,
+            "plan_audit",
+        )
+        .is_err());
+        assert!(super::parse::<PlanAuditResponse>(
+            r#"{"protocol_version":1,"role":"plan_audit","status":"complete","classifications":[{"finding_id":1,"classification":"supported","rationale":"missing actionability"}]}"#,
             "plan_audit",
         )
         .is_err());

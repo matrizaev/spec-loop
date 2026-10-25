@@ -1,6 +1,6 @@
 [package]
 name = "spec-loop"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Guarded, profile-driven implementation loop for repository specifications"
 license = "MIT"

@@ -29,6 +29,14 @@ See [`examples/profiles/basic.toml`](examples/profiles/basic.toml) and [`example
 6. A valid typed `blocked` response stops workflow. Malformed or inconsistent typed JSON retries same role; exhausted retries fail closed. Each prompt receives a generated role-specific JSON Schema 2020-12.
 7. After successful checks and review with no actionable findings, optional archival moves selected spec unchanged. Ordered `actions.on_review_success` run after archive; `actions.on_finish` run after those actions. Action commands are explicit repository-owner authorization and can have irreversible effects.
 
+### Finding audits
+
+Auditors act as skeptical gatekeepers, not second reviewers: they assess supplied findings and do not search for additional improvements. Typed audit results separate factual validity (`supported`, `unsupported`, or `ambiguous`) from actionability (`required`, `not_required`, or `ambiguous`). A true observation can be supported but require no change; only findings marked both supported and required enter repair. An excessive proposed fix does not invalidate a real, actionable defect: auditors identify the smallest sufficient correct fix, and repairs follow that rationale. Reject speculative hardening, hypothetical extensibility, duplicated validation, and architectural expansion without demonstrated need. Do not dismiss a proven in-scope defect because its smallest correct fix is difficult or substantial; simplicity limits unnecessary complexity, not necessary work.
+
+### Writing specifications
+
+Keep each spec small, coherent, and bounded around one independently reviewable outcome with observable acceptance criteria. Split broad “implement everything” requests and unrelated work into focused specs; state dependencies and intended order explicitly. Narrow specs make planning, implementation, review, and repair easier to verify.
+
 Pi owns its effective tools, extensions, MCP servers, skills, project trust, context, and inherited environment. Spec Loop does not sandbox Pi resources. Review/grounding roles are asked not to mutate files. Only selected spec and plan contents are hash-protected; changes to other files do not trigger snapshots, rollback, or re-review. Run logs are retained outside project directory.
 
 ## Usage
