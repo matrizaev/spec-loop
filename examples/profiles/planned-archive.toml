@@ -1,0 +1,55 @@
+schema_version = 1
+
+[specs]
+active_globs = ["specs/*.md"]
+id_regex = '^(?:specs|archive)/(?P<id>[0-9]+)\.md$'
+ordering = "numeric"
+selection = "any"
+
+[plan]
+path_template = ".spec-loop/plans/{spec_id}.md"
+
+[prompts]
+plan_author = ["AGENTS.md"]
+plan_review = ["AGENTS.md"]
+plan_review_status_audit = []
+plan_audit = ["AGENTS.md"]
+implementation = ["AGENTS.md"]
+review = ["AGENTS.md"]
+review_status_audit = []
+review_audit = ["AGENTS.md"]
+
+[[checks]]
+name = "quality-gate"
+argv = ["make", "check"]
+cwd = "."
+timeout_seconds = 3600
+
+[agent]
+backend = "pi"
+executable = "pi"
+model = "provider/model-name"
+thinking = "high"
+
+[agent.stages.planning]
+model = "provider/planning-model"
+thinking = "medium"
+
+[agent.stages.implementation]
+model = "provider/implementation-model"
+thinking = "high"
+
+[agent.stages.review]
+model = "provider/review-model"
+thinking = "high"
+
+[archive]
+enabled = true
+destination = "archive"
+
+[completion]
+max_passes = 0
+commit_message = "Implement {spec_id}"
+
+[acceptance]
+manual_gates = ["product-owner acceptance"]

@@ -171,11 +171,11 @@ spec-loop [--spec ID] [--review | --plan] [--dry-run]
 
 Each target repository supplies a profile describing at least:
 
-- Active and archived spec path patterns, ID extraction, ordering, and
-  eligibility rules. Selection must detect duplicate IDs and ambiguous paths
-  rather than silently choosing one.
-- Whether a requested ID must be next in order, may select any eligible spec,
-  or is valid only for archived review.
+- Active spec path patterns, ID extraction, ordering, and eligibility rules.
+  Selection must reject duplicate IDs rather than silently choosing one.
+  Archived specs are archival outputs, not discovery or review candidates.
+- Whether a requested active ID must be next in order or may select any
+  eligible active spec. There is no archived-spec review mode.
 - Plan path template. Every implementation requires an approved plan; plan mode
   is always available. There is no `required` or `enabled` toggle.
 - Repository instruction and workflow prompt files for plan authoring,
@@ -208,11 +208,12 @@ Each target repository supplies a profile describing at least:
   field inherits global `[agent]`, then Pi's configured default. Model settings
   never override Pi tools, extensions, MCP, skills, trust, or context.
 - Optional agent and per-check timeouts. Omitted timeout means unlimited.
-- Whether completed specs are archived, the archive destination, and any
-  validation required for the transition. Archiving occurs before checks and
-  review so transition is included in reviewed patch. If archiving is disabled,
-  do not move or mark specs complete: skip completed IDs only for current run;
-  user owns archiving them to prevent selection in future runs.
+- Whether completed specs are archived, the archive destination directory, and
+  any validation required for the transition. Preserve the selected spec's
+  filename. Archiving occurs before checks and review so transition is included
+  in reviewed patch. Archived files are not discovery candidates. If archiving
+  is disabled, do not move or mark specs complete: skip completed IDs only for
+  current run; user owns archiving them to prevent selection in future runs.
 - Commit message policy and maximum pass count. CLI `--commit` and `--continue`
   switches are the sole authorizations; the profile has no `commit_allowed` or
   `continue_allowed` fields. Defaults are no commit, stop after one spec, and
@@ -233,7 +234,7 @@ permissions.
 1. Resolve the target Git worktree from the caller's current directory and load
    `.spec-loop.toml` from its root.
 2. Validate profile, options, configured executables and paths. Select eligible
-   spec and resolve its ID, plan path, and archive counterpart. In implementation
+   spec and resolve its ID, plan path, and archive destination. In implementation
    mode, require existing approved plan before invoking writer; if missing, report
    `spec-loop --spec ID --plan`. In `--plan --continue`, skip specs with existing
    plan files. Reject missing, duplicate, or invalid required resources.
