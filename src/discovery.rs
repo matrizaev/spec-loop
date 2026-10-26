@@ -192,7 +192,7 @@ mod tests {
 
     fn profile() -> Profile {
         toml::from_str(
-            "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '^specs/(?P<id>[0-9]+)(?:-[^/]*)?\\.md$'\n",
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '^specs/(?P<id>[0-9]+)(?:-[^/]*)?\\.md$'\n[agent]\nbackend = 'pi'\n",
         )
         .expect("parse test profile")
     }

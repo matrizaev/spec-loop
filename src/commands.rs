@@ -26,20 +26,34 @@ pub enum ProcessTermination {
 pub struct ChildOutput {
     /// Child exit status, when the process was waited successfully.
     pub status: Option<ExitStatus>,
-    /// Complete stdout captured before the child and its descendants exited.
+    /// Captured stdout, bounded only for built-in tool invocations.
     pub stdout: Vec<u8>,
-    /// Complete stderr captured before the child and its descendants exited.
+    /// Captured stderr, bounded only for built-in tool invocations.
     pub stderr: Vec<u8>,
+    /// Whether stdout exceeded its assigned capture allowance.
+    pub stdout_truncated: bool,
+    /// Whether stderr exceeded its assigned capture allowance.
+    pub stderr_truncated: bool,
     /// Why process supervision stopped; captured output is retained for every outcome.
     pub termination: ProcessTermination,
 }
 
+#[derive(Clone, Copy)]
+struct ProcessOptions<'a> {
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    max_output_bytes: Option<usize>,
+    environment: &'a [(OsString, OsString)],
+    cancelled: &'a Arc<AtomicBool>,
+}
+
 struct ReaderWait<'a> {
-    stdout: &'a thread::JoinHandle<std::io::Result<Vec<u8>>>,
-    stderr: &'a thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stdout: &'a thread::JoinHandle<std::io::Result<CapturedOutput>>,
+    stderr: &'a thread::JoinHandle<std::io::Result<CapturedOutput>>,
     child: &'a mut std::process::Child,
     program: &'a Path,
     timeout: Option<Duration>,
+    deadline: Option<Instant>,
     started: Instant,
     cancelled: &'a Arc<AtomicBool>,
     termination: &'a mut ProcessTermination,
@@ -61,9 +75,40 @@ pub fn run_process(
     timeout: Option<Duration>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<ChildOutput> {
-    run_process_with_os_args(program, args, cwd, timeout, &[], cancelled)
+    let deadline = timeout
+        .map(|duration| {
+            Instant::now().checked_add(duration).ok_or_else(|| {
+                SpecLoopError::Config("process timeout exceeds monotonic clock range".to_owned())
+            })
+        })
+        .transpose()?;
+    run_process_until(program, args, cwd, deadline, None, cancelled)
 }
 
+/// Runs a process under an absolute role deadline with an optional combined output cap.
+pub fn run_process_until(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    deadline: Option<Instant>,
+    max_output_bytes: Option<usize>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<ChildOutput> {
+    run_process_with_options(
+        program,
+        args,
+        cwd,
+        ProcessOptions {
+            timeout: None,
+            deadline,
+            max_output_bytes,
+            environment: &[],
+            cancelled,
+        },
+    )
+}
+
+#[cfg(test)]
 fn run_process_with_os_args(
     program: &Path,
     args: &[impl AsRef<OsStr>],
@@ -72,7 +117,45 @@ fn run_process_with_os_args(
     environment: &[(OsString, OsString)],
     cancelled: &Arc<AtomicBool>,
 ) -> Result<ChildOutput> {
+    run_process_with_options(
+        program,
+        args,
+        cwd,
+        ProcessOptions {
+            timeout,
+            deadline: None,
+            max_output_bytes: None,
+            environment,
+            cancelled,
+        },
+    )
+}
+
+fn run_process_with_options(
+    program: &Path,
+    args: &[impl AsRef<OsStr>],
+    cwd: &Path,
+    options: ProcessOptions<'_>,
+) -> Result<ChildOutput> {
+    let ProcessOptions {
+        timeout,
+        deadline,
+        max_output_bytes,
+        environment,
+        cancelled,
+    } = options;
     ensure_not_cancelled(cancelled)?;
+    let started = Instant::now();
+    if deadline.is_some_and(|limit| started >= limit) {
+        return Ok(ChildOutput {
+            status: None,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            termination: ProcessTermination::TimedOut,
+        });
+    }
     let mut command = Command::new(program);
     command
         .args(args)
@@ -107,38 +190,20 @@ fn run_process_with_os_args(
             program.display()
         )));
     };
-    let stdout_reader = thread::spawn(move || read_all(stdout));
-    let stderr_reader = thread::spawn(move || read_all(stderr));
-    let started = Instant::now();
-    let (status, mut termination) = loop {
-        if cancelled.load(Ordering::Relaxed) {
-            terminate_child(&mut child, program)?;
-            let status = child.wait().map_err(|source| {
-                io_error("wait for interrupted child process", program, source)
-            })?;
-            break (status, ProcessTermination::Interrupted);
-        }
-        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            terminate_child(&mut child, program)?;
-            let status = child
-                .wait()
-                .map_err(|source| io_error("wait for timed-out process", program, source))?;
-            break (status, ProcessTermination::TimedOut);
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|source| io_error("wait for child process", program, source))?
-        {
-            break (status, ProcessTermination::Exited);
-        }
-        thread::sleep(Duration::from_millis(20));
-    };
+    let (stdout_limit, stderr_limit) = max_output_bytes.map_or((None, None), |limit| {
+        (Some(limit / 2 + limit % 2), Some(limit / 2))
+    });
+    let stdout_reader = thread::spawn(move || read_captured(stdout, stdout_limit));
+    let stderr_reader = thread::spawn(move || read_captured(stderr, stderr_limit));
+    let (status, mut termination) =
+        wait_for_child(&mut child, program, timeout, deadline, started, cancelled)?;
     wait_for_readers(ReaderWait {
         stdout: &stdout_reader,
         stderr: &stderr_reader,
         child: &mut child,
         program,
         timeout,
+        deadline,
         started,
         cancelled,
         termination: &mut termination,
@@ -147,10 +212,45 @@ fn run_process_with_os_args(
     let stderr = join_reader(stderr_reader, program)?;
     Ok(ChildOutput {
         status: Some(status),
-        stdout,
-        stderr,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
         termination,
     })
+}
+
+fn wait_for_child(
+    child: &mut std::process::Child,
+    program: &Path,
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    started: Instant,
+    cancelled: &AtomicBool,
+) -> Result<(ExitStatus, ProcessTermination)> {
+    loop {
+        let termination = if cancelled.load(Ordering::Relaxed) {
+            Some(ProcessTermination::Interrupted)
+        } else if deadline_reached(timeout, deadline, started) {
+            Some(ProcessTermination::TimedOut)
+        } else {
+            None
+        };
+        if let Some(termination) = termination {
+            terminate_child(child, program)?;
+            let status = child
+                .wait()
+                .map_err(|source| io_error("wait for stopped child process", program, source))?;
+            return Ok((status, termination));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| io_error("wait for child process", program, source))?
+        {
+            return Ok((status, ProcessTermination::Exited));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn terminate_child(child: &mut std::process::Child, program: &Path) -> Result<()> {
@@ -228,6 +328,7 @@ fn wait_for_readers(wait: ReaderWait<'_>) -> Result<()> {
         child,
         program,
         timeout,
+        deadline,
         started,
         cancelled,
         termination,
@@ -238,7 +339,7 @@ fn wait_for_readers(wait: ReaderWait<'_>) -> Result<()> {
             *termination = ProcessTermination::Interrupted;
         }
         if *termination == ProcessTermination::Exited
-            && timeout.is_some_and(|limit| started.elapsed() >= limit)
+            && deadline_reached(timeout, deadline, started)
         {
             terminate_child(child, program)?;
             *termination = ProcessTermination::TimedOut;
@@ -248,16 +349,55 @@ fn wait_for_readers(wait: ReaderWait<'_>) -> Result<()> {
     Ok(())
 }
 
-fn read_all(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_captured(mut reader: impl Read, limit: Option<usize>) -> std::io::Result<CapturedOutput> {
     let mut output = Vec::new();
-    reader.read_to_end(&mut output)?;
-    Ok(output)
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let retained = match limit {
+            Some(limit) => {
+                let remaining = limit.checked_sub(output.len()).ok_or_else(|| {
+                    std::io::Error::other("captured output exceeded its configured limit")
+                })?;
+                let retained = read.min(remaining);
+                truncated |= retained < read;
+                retained
+            }
+            None => read,
+        };
+        output
+            .try_reserve(retained)
+            .map_err(std::io::Error::other)?;
+        output.extend_from_slice(&buffer[..retained]);
+    }
+    Ok(CapturedOutput {
+        bytes: output,
+        truncated,
+    })
+}
+
+fn deadline_reached(
+    timeout: Option<Duration>,
+    deadline: Option<Instant>,
+    started: Instant,
+) -> bool {
+    deadline.is_some_and(|limit| Instant::now() >= limit)
+        || timeout.is_some_and(|limit| started.elapsed() >= limit)
 }
 
 fn join_reader(
-    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    handle: thread::JoinHandle<std::io::Result<CapturedOutput>>,
     program: &Path,
-) -> Result<Vec<u8>> {
+) -> Result<CapturedOutput> {
     let result = handle.join().map_err(|_| {
         SpecLoopError::Process(format!("output reader for {} panicked", program.display()))
     })?;
@@ -276,6 +416,8 @@ pub fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<()> {
 pub fn status_success(output: &ChildOutput) -> bool {
     output.termination == ProcessTermination::Exited
         && output.status.is_some_and(|status| status.success())
+        && !output.stdout_truncated
+        && !output.stderr_truncated
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -289,7 +431,55 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{ProcessTermination, ensure_not_cancelled, run_process, run_process_with_os_args};
+    use super::{
+        ProcessTermination, ensure_not_cancelled, run_process, run_process_until,
+        run_process_with_os_args,
+    };
+
+    #[test]
+    fn bounded_capture_drains_both_streams_and_marks_truncation() {
+        let temporary = TempDir::new().expect("create temporary directory");
+        let args = [
+            "-c".to_owned(),
+            "head -c 65536 /dev/zero; head -c 65536 /dev/zero >&2".to_owned(),
+        ];
+
+        let output = run_process_until(
+            Path::new("/bin/sh"),
+            &args,
+            temporary.path(),
+            Some(Instant::now() + Duration::from_secs(5)),
+            Some(6),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("run bounded process");
+
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert_eq!(output.stdout, [0; 3]);
+        assert_eq!(output.stderr, [0; 3]);
+        assert!(output.stdout_truncated);
+        assert!(output.stderr_truncated);
+    }
+
+    #[test]
+    fn absolute_deadline_stops_running_child() {
+        let temporary = TempDir::new().expect("create temporary directory");
+        let args = ["-c".to_owned(), "sleep 30".to_owned()];
+        let started = Instant::now();
+
+        let output = run_process_until(
+            Path::new("/bin/sh"),
+            &args,
+            temporary.path(),
+            Some(started + Duration::from_millis(100)),
+            Some(32),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("run process with deadline");
+
+        assert_eq!(output.termination, ProcessTermination::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
 
     #[test]
     fn cancellation_before_spawn_does_not_run_the_child() {

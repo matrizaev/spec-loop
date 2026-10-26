@@ -1,7 +1,7 @@
 # Example completion status update. This profile assumes GNU sed (`sed -i`).
 # Create specs/implemented before running with archival enabled.
 # Final actions stage all workspace changes, then commit; configure Git identity.
-schema_version = 2
+schema_version = 3
 
 [specs]
 active_globs = ["specs/*.md"]

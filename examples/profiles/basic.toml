@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 3
 
 [specs]
 active_globs = ["specs/*.md"]
@@ -20,8 +20,8 @@ argv = ["cargo", "test", "--all-targets", "--all-features"]
 timeout_seconds = 1800
 
 [agent]
-backend = "pi"
-executable = "pi"
+# Omitted backend selects built-in OpenAI Responses; set model before use.
+model = "your-chatgpt-model"
 timeout_seconds = 3600
 
 [completion]

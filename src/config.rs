@@ -1,15 +1,17 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use crate::error::{Result, SpecLoopError, io_error};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
+const DEFAULT_MAX_TOOL_CALLS: usize = 50;
+const DEFAULT_MAX_TOOL_OUTPUT_BYTES: usize = 1_048_576;
 const SPEC_ID_PLACEHOLDER: &str = "{spec_id}";
 const SPEC_PATH_PLACEHOLDER: &str = "{spec_path}";
 const PLAN_PATH_PLACEHOLDER: &str = "{plan_path}";
-const PI_THINKING_LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// Strict repository policy loaded from `.spec-loop.toml`.
 #[derive(Clone, Debug, Deserialize)]
@@ -107,7 +109,7 @@ pub struct CheckConfig {
     pub timeout_seconds: Option<u64>,
 }
 
-/// Review-context command delegated to Pi tools, never run by the engine.
+/// Review-context command delegated to selected-backend tools, never run by the engine.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewConfig {
@@ -146,27 +148,77 @@ pub struct ActionConfig {
     pub timeout_seconds: Option<u64>,
 }
 
-/// Pi backend settings. Resource availability is controlled only by Pi configuration.
+/// Selects built-in `OpenAI` or explicitly configured Pi agent execution.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBackendKind {
+    /// ChatGPT-authorized `OpenAI` Responses API harness.
+    #[default]
+    Builtin,
+    /// Pi CLI, using its effective user configuration and resources.
+    Pi,
+}
+
+/// Reasoning level accepted by Pi and mapped to `OpenAI` Responses effort.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingLevel {
+    /// Disable extended reasoning.
+    Off,
+    /// Use minimal reasoning effort.
+    Minimal,
+    /// Use low reasoning effort.
+    Low,
+    /// Use medium reasoning effort.
+    Medium,
+    /// Use high reasoning effort.
+    High,
+    /// Use extra-high reasoning effort.
+    Xhigh,
+    /// Use maximum reasoning effort.
+    Max,
+}
+
+impl ThinkingLevel {
+    /// Returns the Pi spelling and `OpenAI` Responses effort setting, in that order.
+    pub const fn provider_values(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Off => ("off", "none"),
+            Self::Minimal => ("minimal", "minimal"),
+            Self::Low => ("low", "low"),
+            Self::Medium => ("medium", "medium"),
+            Self::High => ("high", "high"),
+            Self::Xhigh => ("xhigh", "xhigh"),
+            Self::Max => ("max", "max"),
+        }
+    }
+}
+
+/// Agent settings shared by supported backends.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
-    pub backend: String,
+    pub backend: AgentBackendKind,
     pub executable: PathBuf,
     pub model: Option<String>,
-    pub thinking: Option<String>,
+    pub thinking: Option<ThinkingLevel>,
     pub stages: AgentStages,
     pub timeout_seconds: Option<u64>,
+    pub max_tool_calls: Option<usize>,
+    pub max_tool_output_bytes: Option<usize>,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            backend: "pi".to_owned(),
+            backend: AgentBackendKind::default(),
             executable: PathBuf::from("pi"),
             model: None,
             thinking: None,
             stages: AgentStages::default(),
             timeout_seconds: None,
+            max_tool_calls: None,
+            max_tool_output_bytes: None,
         }
     }
 }
@@ -185,7 +237,7 @@ pub struct AgentStages {
 #[serde(default, deny_unknown_fields)]
 pub struct AgentStageConfig {
     pub model: Option<String>,
-    pub thinking: Option<String>,
+    pub thinking: Option<ThinkingLevel>,
 }
 
 /// Role family used to resolve model and thinking settings.
@@ -197,6 +249,22 @@ pub enum AgentStage {
 }
 
 impl AgentConfig {
+    /// Returns configured or specification-default shell calls per built-in role.
+    pub const fn max_tool_calls(&self) -> usize {
+        match self.max_tool_calls {
+            Some(value) => value,
+            None => DEFAULT_MAX_TOOL_CALLS,
+        }
+    }
+
+    /// Returns configured or specification-default retained output bytes per shell call.
+    pub const fn max_tool_output_bytes(&self) -> usize {
+        match self.max_tool_output_bytes {
+            Some(value) => value,
+            None => DEFAULT_MAX_TOOL_OUTPUT_BYTES,
+        }
+    }
+
     pub fn model_for(&self, stage: AgentStage) -> Option<&str> {
         self.stage_config(stage)
             .model
@@ -204,11 +272,8 @@ impl AgentConfig {
             .or(self.model.as_deref())
     }
 
-    pub fn thinking_for(&self, stage: AgentStage) -> Option<&str> {
-        self.stage_config(stage)
-            .thinking
-            .as_deref()
-            .or(self.thinking.as_deref())
+    pub fn thinking_for(&self, stage: AgentStage) -> Option<ThinkingLevel> {
+        self.stage_config(stage).thinking.or(self.thinking)
     }
 
     const fn stage_config(&self, stage: AgentStage) -> &AgentStageConfig {
@@ -241,13 +306,12 @@ impl Profile {
             .map_err(|source| io_error("read profile", path, source))?;
         let document: toml::Value = toml::from_str(&contents)
             .map_err(|error| SpecLoopError::Config(format!("{}: {error}", path.display())))?;
-        if document
+        if let Some(version @ (1 | 2)) = document
             .get("schema_version")
             .and_then(toml::Value::as_integer)
-            == Some(1)
         {
             return Err(SpecLoopError::Config(format!(
-                "{} uses profile schema v1; migrate to schema_version = 2 (no automatic migration is available)",
+                "{} uses profile schema v{version}; migrate manually to schema_version = 3 (no automatic migration is available). Set agent.backend = \"pi\" under [agent] to preserve pre-v3 backend behavior; the built-in backend requires agent.model",
                 path.display()
             )));
         }
@@ -311,44 +375,63 @@ fn validate_plan_and_archive(plan: &PlanConfig, archive: &ArchiveConfig) -> Resu
 }
 
 fn validate_agent(agent: &AgentConfig) -> Result<()> {
-    if agent.backend != "pi" {
-        return Err(SpecLoopError::Config(format!(
-            "unsupported agent backend {:?}; only `pi` is available",
-            agent.backend
-        )));
-    }
-    if agent.executable.as_os_str().is_empty() || agent.executable.to_string_lossy().contains('\0')
-    {
-        return Err(SpecLoopError::Config(
-            "agent.executable cannot be empty or contain NUL".to_owned(),
-        ));
+    match agent.backend {
+        AgentBackendKind::Builtin => {
+            if agent.model.as_deref().is_none_or(str::is_empty) {
+                return Err(SpecLoopError::Config(
+                    "agent.model is required and must be non-empty when agent.backend = \"builtin\""
+                        .to_owned(),
+                ));
+            }
+            if agent.max_tool_calls() == 0 {
+                return Err(SpecLoopError::Config(
+                    "agent.max_tool_calls must be positive when set".to_owned(),
+                ));
+            }
+            if agent.max_tool_output_bytes() == 0 {
+                return Err(SpecLoopError::Config(
+                    "agent.max_tool_output_bytes must be positive when set".to_owned(),
+                ));
+            }
+        }
+        AgentBackendKind::Pi => {
+            if agent.executable.as_os_str().is_empty()
+                || agent.executable.to_string_lossy().contains('\0')
+            {
+                return Err(SpecLoopError::Config(
+                    "agent.executable cannot be empty or contain NUL".to_owned(),
+                ));
+            }
+            if agent.max_tool_calls.is_some() || agent.max_tool_output_bytes.is_some() {
+                return Err(SpecLoopError::Config(
+                    "agent.max_tool_calls and agent.max_tool_output_bytes are only valid for the built-in backend"
+                        .to_owned(),
+                ));
+            }
+        }
     }
     if agent.timeout_seconds == Some(0) {
         return Err(SpecLoopError::Config(
             "agent.timeout_seconds must be positive when set".to_owned(),
         ));
     }
+    if agent.timeout_seconds.is_some_and(|seconds| {
+        Instant::now()
+            .checked_add(Duration::from_secs(seconds))
+            .is_none()
+    }) {
+        return Err(SpecLoopError::Config(
+            "agent.timeout_seconds exceeds the supported monotonic clock range".to_owned(),
+        ));
+    }
     for (field, value) in [
         ("agent.model", &agent.model),
-        ("agent.thinking", &agent.thinking),
         ("agent.stages.planning.model", &agent.stages.planning.model),
-        (
-            "agent.stages.planning.thinking",
-            &agent.stages.planning.thinking,
-        ),
         (
             "agent.stages.implementation.model",
             &agent.stages.implementation.model,
         ),
-        (
-            "agent.stages.implementation.thinking",
-            &agent.stages.implementation.thinking,
-        ),
         ("agent.stages.review.model", &agent.stages.review.model),
-        (
-            "agent.stages.review.thinking",
-            &agent.stages.review.thinking,
-        ),
     ] {
         if value
             .as_ref()
@@ -356,30 +439,6 @@ fn validate_agent(agent: &AgentConfig) -> Result<()> {
         {
             return Err(SpecLoopError::Config(format!(
                 "{field} cannot be empty or contain NUL"
-            )));
-        }
-    }
-    for (field, value) in [
-        ("agent.thinking", agent.thinking.as_deref()),
-        (
-            "agent.stages.planning.thinking",
-            agent.stages.planning.thinking.as_deref(),
-        ),
-        (
-            "agent.stages.implementation.thinking",
-            agent.stages.implementation.thinking.as_deref(),
-        ),
-        (
-            "agent.stages.review.thinking",
-            agent.stages.review.thinking.as_deref(),
-        ),
-    ] {
-        if let Some(value) = value
-            && !PI_THINKING_LEVELS.contains(&value)
-        {
-            return Err(SpecLoopError::Config(format!(
-                "unsupported {field} value {value:?}; expected one of {}",
-                PI_THINKING_LEVELS.join(", ")
             )));
         }
     }
@@ -543,7 +602,29 @@ fn validate_template_path(template: &str, field: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Profile;
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::{AgentBackendKind, AgentStage, Profile};
+
+    #[test]
+    fn profile_load_reports_manual_migration_for_legacy_versions() {
+        for version in [1, 2] {
+            let temporary = TempDir::new().expect("create temporary profile directory");
+            let path = temporary.path().join("profile.toml");
+            fs::write(&path, format!("schema_version = {version}\n"))
+                .expect("write legacy profile");
+
+            let error = Profile::load(&path).expect_err("legacy profile must be rejected");
+            let message = error.to_string();
+            assert!(message.contains(&format!("profile schema v{version}")));
+            assert!(message.contains("migrate manually to schema_version = 3"));
+            assert!(message.contains("no automatic migration is available"));
+            assert!(message.contains("agent.backend = \"pi\""));
+            assert!(message.contains("built-in backend requires agent.model"));
+        }
+    }
 
     #[test]
     fn documented_profiles_parse_and_validate() {
@@ -582,6 +663,96 @@ mod tests {
     }
 
     #[test]
+    fn builtin_backend_defaults_limits_and_requires_explicit_model() {
+        let missing_model: Profile = toml::from_str(
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n",
+        )
+        .expect("parse profile with omitted backend");
+        assert_eq!(missing_model.agent.backend, AgentBackendKind::Builtin);
+        let error = missing_model
+            .validate()
+            .expect_err("built-in backend requires explicit model");
+        assert!(error.to_string().contains("agent.model is required"));
+
+        let configured: Profile = toml::from_str(
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'model-name'\n",
+        )
+        .expect("parse built-in profile");
+        configured.validate().expect("valid built-in profile");
+        assert_eq!(configured.agent.max_tool_calls(), 50);
+        assert_eq!(configured.agent.max_tool_output_bytes(), 1_048_576);
+    }
+
+    #[test]
+    fn validates_backend_specific_tool_limits() {
+        for (field, value) in [("max_tool_calls", 0), ("max_tool_output_bytes", 0)] {
+            let profile: Profile = toml::from_str(&format!(
+                "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'model-name'\n{field} = {value}\n"
+            ))
+            .expect("parse zero builtin limit");
+            assert!(profile.validate().is_err());
+
+            let pi_profile: Profile = toml::from_str(&format!(
+                "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\n{field} = 1\n"
+            ))
+            .expect("parse Pi builtin-only limit");
+            let error = pi_profile
+                .validate()
+                .expect_err("Pi rejects built-in-only tool limits");
+            assert!(
+                error
+                    .to_string()
+                    .contains("only valid for the built-in backend")
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_maps_thinking_levels_and_respects_stage_override() {
+        let profile: Profile = toml::from_str(
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'model-name'\nthinking = 'off'\n[agent.stages.implementation]\nmodel = 'stage-model'\nthinking = 'xhigh'\n",
+        )
+        .expect("parse reasoning profile");
+        let agent = &profile.agent;
+        assert_eq!(
+            agent
+                .thinking_for(AgentStage::Planning)
+                .map(|thinking| thinking.provider_values().1),
+            Some("none")
+        );
+        assert_eq!(
+            agent
+                .thinking_for(AgentStage::Implementation)
+                .map(|thinking| thinking.provider_values().1),
+            Some("xhigh")
+        );
+        assert_eq!(agent.model_for(AgentStage::Review), Some("model-name"));
+        assert_eq!(
+            agent.model_for(AgentStage::Implementation),
+            Some("stage-model")
+        );
+        for (input, expected) in [
+            ("minimal", "minimal"),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("max", "max"),
+        ] {
+            let profile: Profile = toml::from_str(&format!(
+                "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'model-name'\nthinking = {input:?}\n"
+            ))
+            .expect("parse thinking profile");
+            assert_eq!(
+                profile
+                    .agent
+                    .thinking_for(AgentStage::Review)
+                    .map(|thinking| thinking.provider_values().1),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
     fn rejects_pi_resource_overrides_in_profile() {
         for (name, value) in [
             ("trust_project", "false"),
@@ -591,7 +762,7 @@ mod tests {
             ("writer_tools", "['read']"),
         ] {
             let profile = format!(
-                "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\n{name} = {value}\n"
+                "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\n{name} = {value}\n"
             );
             assert!(
                 toml::from_str::<Profile>(&profile).is_err(),
@@ -603,7 +774,7 @@ mod tests {
     #[test]
     fn rejects_unknown_profile_fields() {
         let result = toml::from_str::<Profile>(
-            "schema_version = 2\nunknown = true\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n",
+            "schema_version = 3\nunknown = true\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\n",
         );
         assert!(result.is_err());
     }
@@ -612,30 +783,30 @@ mod tests {
     fn validates_pi_thinking_levels_for_global_and_stage_settings() {
         for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let profile: Profile = toml::from_str(&format!(
-                "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nthinking = {level:?}\n"
+                "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\nthinking = {level:?}\n"
             ))
             .expect("parse supported thinking level");
             assert!(profile.validate().is_ok(), "thinking level {level:?}");
         }
 
-        for (section, field) in [
-            ("[agent]", "agent.thinking"),
-            ("[agent.stages.planning]", "agent.stages.planning.thinking"),
-            (
-                "[agent.stages.implementation]",
-                "agent.stages.implementation.thinking",
-            ),
-            ("[agent.stages.review]", "agent.stages.review.thinking"),
+        for section in [
+            "[agent]",
+            "[agent.stages.planning]",
+            "[agent.stages.implementation]",
+            "[agent.stages.review]",
         ] {
-            let profile: Profile = toml::from_str(&format!(
-                "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n{section}\nthinking = 'unsupported'\n"
-            ))
-            .expect("parse unsupported thinking level for validation");
-            let error = profile
-                .validate()
-                .expect_err("unsupported thinking level must fail validation");
-            assert!(error.to_string().contains(field));
-            assert!(error.to_string().contains("unsupported"));
+            let agent = if section == "[agent]" {
+                format!("{section}\nbackend = 'pi'\nthinking = 'unsupported'\n")
+            } else {
+                format!("[agent]\nbackend = 'pi'\n{section}\nthinking = 'unsupported'\n")
+            };
+            let profile = format!(
+                "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n{agent}"
+            );
+            assert!(
+                toml::from_str::<Profile>(&profile).is_err(),
+                "unsupported thinking level in {section} must fail deserialization"
+            );
         }
     }
 
@@ -643,7 +814,7 @@ mod tests {
     fn rejects_unmatched_closing_brace_before_placeholder() {
         for value in ["}{spec_id}", "prefix}{spec_id}"] {
             let profile: Profile = toml::from_str(&format!(
-                "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[[actions.on_finish]]\nname = 'placeholder test'\nargv = ['printf', {value:?}]\n"
+                "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\n[[actions.on_finish]]\nname = 'placeholder test'\nargv = ['printf', {value:?}]\n"
             ))
             .expect("parse malformed placeholder profile");
             assert!(
@@ -657,7 +828,7 @@ mod tests {
     #[test]
     fn check_argv_keeps_non_template_braces_as_literal_data() {
         let profile: Profile = toml::from_str(
-            "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[[checks]]\nname = 'brace arguments'\nargv = ['grep', '-E', '^[0-9]{3}$', '{unknown', '}']\n",
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\n[[checks]]\nname = 'brace arguments'\nargv = ['grep', '-E', '^[0-9]{3}$', '{unknown', '}']\n",
         )
         .expect("parse check with literal braces");
         profile
@@ -668,7 +839,7 @@ mod tests {
     #[test]
     fn minimal_profile_defaults_review_context_and_empty_actions() {
         let profile: Profile = toml::from_str(
-            "schema_version = 2\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n",
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\n",
         )
         .expect("parse minimal profile");
         profile.validate().expect("validate minimal profile");

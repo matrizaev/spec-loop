@@ -1,11 +1,14 @@
+use std::any::Any;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::config::Profile;
+use crate::config::{AgentBackendKind, Profile};
 use crate::error::{Result, SpecLoopError};
 use crate::prompts::PromptRole;
 
+mod builtin;
 pub mod pi;
 
 /// The validated final response from an agent backend.
@@ -19,10 +22,88 @@ pub struct AgentResponse {
     pub response_model: Option<String>,
 }
 
+/// Classifies backend failures before workflow-level role retries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendFailureKind {
+    /// Failure may be retried by the existing role retry policy.
+    Retryable,
+    /// Failure must stop the role to avoid replaying side effects.
+    Fatal,
+}
+
+/// Backend failure with retry policy kept separate from diagnostic details.
+pub struct BackendFailure {
+    kind: BackendFailureKind,
+    cause: SpecLoopError,
+}
+
+impl BackendFailure {
+    /// Creates a backend failure eligible for generic role retry.
+    pub const fn retryable(cause: SpecLoopError) -> Self {
+        Self {
+            kind: BackendFailureKind::Retryable,
+            cause,
+        }
+    }
+
+    /// Creates a backend failure that must not replay a role's side effects.
+    pub const fn fatal(cause: SpecLoopError) -> Self {
+        Self {
+            kind: BackendFailureKind::Fatal,
+            cause,
+        }
+    }
+
+    /// Returns failure retry classification.
+    pub const fn kind(&self) -> BackendFailureKind {
+        self.kind
+    }
+
+    /// Consumes failure into actionable workflow error, preserving interruption.
+    pub fn into_error(self) -> SpecLoopError {
+        if matches!(&self.cause, SpecLoopError::Interrupted) {
+            return self.cause;
+        }
+        match self.kind {
+            BackendFailureKind::Retryable => self.cause,
+            BackendFailureKind::Fatal => {
+                SpecLoopError::Workflow(format!("fatal agent backend failure: {}", self.cause))
+            }
+        }
+    }
+}
+
+impl fmt::Display for BackendFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.cause, formatter)
+    }
+}
+
+/// Opaque backend state retained for correction-only retries.
+pub struct BackendContinuation(Box<dyn Any + Send>);
+
+impl BackendContinuation {
+    /// Wraps backend-owned state without exposing its representation to workflow policy.
+    pub fn new<T: Any + Send>(state: T) -> Self {
+        Self(Box::new(state))
+    }
+
+    /// Recovers state created by matching backend or reports a contract error.
+    pub fn into_state<T: Any + Send>(self) -> Result<T> {
+        self.0.downcast::<T>().map(|state| *state).map_err(|_| {
+            SpecLoopError::Workflow(
+                "agent backend continuation does not match selected backend".to_owned(),
+            )
+        })
+    }
+}
+
 /// Process output plus a separately parsed final response.
 pub struct AgentRun {
-    /// Parsed final response or the backend's validation/process error.
-    pub outcome: Result<AgentResponse>,
+    /// Parsed final response or a backend-classified failure.
+    pub outcome: std::result::Result<AgentResponse, BackendFailure>,
+    /// State needed to correct final-response formatting without repeating tools.
+    pub continuation: Option<BackendContinuation>,
     /// Raw backend stdout, retained independently for diagnostics.
     pub stdout: Vec<u8>,
     /// Raw backend stderr, retained independently for diagnostics.
@@ -41,14 +122,57 @@ pub trait AgentBackend {
         role: PromptRole,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<AgentRun>;
+
+    /// Continues a prior response solely to repair its typed handoff.
+    fn run_with_continuation(
+        &self,
+        root: &Path,
+        profile: &Profile,
+        prompt: &str,
+        role: PromptRole,
+        cancelled: &Arc<AtomicBool>,
+        continuation: Option<BackendContinuation>,
+    ) -> Result<AgentRun> {
+        if continuation.is_some() {
+            return Err(SpecLoopError::Workflow(
+                "selected backend cannot resume a typed-response correction".to_owned(),
+            ));
+        }
+        self.run(root, profile, prompt, role, cancelled)
+    }
 }
 
 /// Constructs the configured backend after profile validation.
-pub fn create(profile: &Profile) -> Result<Box<dyn AgentBackend>> {
-    match profile.agent.backend.as_str() {
-        "pi" => Ok(Box::new(pi::PiBackend)),
-        backend => Err(SpecLoopError::Config(format!(
-            "unsupported agent backend {backend:?}"
-        ))),
+pub fn create(profile: &Profile) -> Box<dyn AgentBackend> {
+    match profile.agent.backend {
+        AgentBackendKind::Builtin => Box::new(builtin::BuiltinBackend),
+        AgentBackendKind::Pi => Box::new(pi::PiBackend),
+    }
+}
+
+/// Validates selected-backend prerequisites before workflow agent invocation.
+pub fn validate_prerequisites(profile: &Profile) -> Result<()> {
+    match profile.agent.backend {
+        AgentBackendKind::Builtin => builtin::validate_shell_prerequisites(),
+        AgentBackendKind::Pi => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendFailure, BackendFailureKind};
+    use crate::error::SpecLoopError;
+
+    #[test]
+    fn retryable_backend_failure_preserves_original_error() {
+        let retryable = BackendFailure::retryable(SpecLoopError::Agent("retry".to_owned()));
+        assert_eq!(retryable.kind(), BackendFailureKind::Retryable);
+        assert!(matches!(retryable.into_error(), SpecLoopError::Agent(_)));
+    }
+
+    #[test]
+    fn backend_interruption_remains_interruption() {
+        let retryable = BackendFailure::retryable(SpecLoopError::Interrupted);
+        assert!(matches!(retryable.into_error(), SpecLoopError::Interrupted));
     }
 }

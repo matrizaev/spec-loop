@@ -78,7 +78,7 @@ impl Fixture {
             "^specs/(?P<id>[0-9]+)\\.md$"
         };
         let mut profile = format!(
-            "schema_version = 2\n\n[specs]\nactive_globs = [\"specs/*.md\"]\nid_regex = {:?}\nordering = \"numeric\"\nselection = \"next\"\n\n[plan]\npath_template = \".spec-loop/plans/{{spec_id}}.md\"\n\n[review.context]\nargv = [{:?}, \"--inspect\"]\n\n[agent]\nexecutable = {:?}\n\n[completion]\nmax_passes = 2\n\n[[checks]]\nname = \"first\"\nargv = [{:?}]\n\n[[checks]]\nname = \"second\"\nargv = [{:?}]\n\n[[actions.on_review_success]]\nname = \"record reviewed spec\"\nargv = [{:?}, \"{{spec_path}}\", \"{{plan_path}}\", \"{{spec_id}}\", \"argument with spaces\"]\n\n[[actions.on_finish]]\nname = \"record finished spec\"\nargv = [{:?}, \"{{spec_path}}\", \"{{plan_path}}\", \"{{spec_id}}\", \"argument with spaces\"]\n",
+            "schema_version = 3\n\n[specs]\nactive_globs = [\"specs/*.md\"]\nid_regex = {:?}\nordering = \"numeric\"\nselection = \"next\"\n\n[plan]\npath_template = \".spec-loop/plans/{{spec_id}}.md\"\n\n[review.context]\nargv = [{:?}, \"--inspect\"]\n\n[agent]\nbackend = \"pi\"\nexecutable = {:?}\n\n[completion]\nmax_passes = 2\n\n[[checks]]\nname = \"first\"\nargv = [{:?}]\n\n[[checks]]\nname = \"second\"\nargv = [{:?}]\n\n[[actions.on_review_success]]\nname = \"record reviewed spec\"\nargv = [{:?}, \"{{spec_path}}\", \"{{plan_path}}\", \"{{spec_id}}\", \"argument with spaces\"]\n\n[[actions.on_finish]]\nname = \"record finished spec\"\nargv = [{:?}, \"{{spec_path}}\", \"{{plan_path}}\", \"{{spec_id}}\", \"argument with spaces\"]\n",
             active_regex,
             review_context.to_string_lossy(),
             fake_pi.to_string_lossy(),
@@ -519,6 +519,111 @@ fn review_resume_accepts_non_git_workspace_without_a_patch() {
 }
 
 #[test]
+fn auth_status_and_help_work_without_project_profile() {
+    let temporary = TempDir::new().expect("create profile-free directory");
+    let config_root = TempDir::new().expect("create external auth config root");
+    let config = config_root.path().join("config");
+    let status = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
+        .args(["auth", "status"])
+        .current_dir(temporary.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .expect("run auth status");
+    assert_success(&status);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(stdout.contains("ChatGPT authorization: not configured"));
+    assert!(!temporary.path().join(".spec-loop.toml").exists());
+    assert!(!config.exists());
+
+    let auth_directory = config.join("spec-loop");
+    fs::create_dir_all(&auth_directory).expect("create auth registry directory");
+    let registry_path = auth_directory.join("auth.json");
+    fs::write(
+        &registry_path,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "host_id": "d14149b3-410d-43bc-a7b6-555e79ac61b6",
+            "active_registration_id": "324c1466308102826b42e39df00686baf739944a4b5290423a7d7ad11300783c",
+            "registrations": [{
+                "id": "324c1466308102826b42e39df00686baf739944a4b5290423a7d7ad11300783c",
+                "issuer": "https://auth.openai.com",
+                "subject": "subject",
+                "client_id": "issued-client-id",
+                "credential_storage": "file",
+                "fallback_credential": {
+                    "access_token": "access-secret",
+                    "refresh_token": "refresh-secret",
+                    "id_token": "id-secret",
+                    "scopes": ["chatgpt.tokens.use.direct"],
+                    "expires_at_unix": 1_900_000_000
+                }
+            }]
+        }))
+        .expect("serialize fixture credentials"),
+    )
+    .expect("write auth registry fixture");
+    let status = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
+        .args(["auth", "status"])
+        .current_dir(temporary.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .expect("run configured auth status");
+    assert_success(&status);
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(stdout.contains("granted locally"));
+    assert!(!stdout.contains("access-secret"));
+    assert!(!stdout.contains("refresh-secret"));
+    assert!(!stdout.contains("id-secret"));
+
+    let logout = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
+        .args([
+            "auth",
+            "logout",
+            "--account",
+            "324c1466308102826b42e39df00686baf739944a4b5290423a7d7ad11300783c",
+        ])
+        .current_dir(temporary.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .expect("run auth logout");
+    assert_success(&logout);
+    let registry = fs::read_to_string(registry_path).expect("read logged-out registry");
+    assert!(registry.contains("issued-client-id"));
+    assert!(!registry.contains("access-secret"));
+    assert!(!registry.contains("refresh-secret"));
+    assert!(!registry.contains("id-secret"));
+    assert!(!temporary.path().join(".spec-loop.toml").exists());
+
+    let help = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
+        .arg("--help")
+        .current_dir(temporary.path())
+        .output()
+        .expect("run top-level help");
+    assert_success(&help);
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("Manage `OpenAI` `ChatGPT` authorization")
+    );
+}
+
+#[test]
+fn auth_login_rejects_relative_xdg_config_home_before_storage_or_network() {
+    let temporary = TempDir::new().expect("create temporary project");
+    let output = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
+        .args(["auth", "login", "--new-account"])
+        .current_dir(temporary.path())
+        .env("XDG_CONFIG_HOME", ".")
+        .output()
+        .expect("run login with unsafe XDG_CONFIG_HOME");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("authentication storage path must be absolute")
+    );
+    assert!(!temporary.path().join("spec-loop/auth.json").exists());
+}
+
+#[test]
 fn profile_must_be_in_current_directory_without_parent_search() {
     let fixture = Fixture::new(false, false);
     let child = fixture.root.join("child");
@@ -543,13 +648,37 @@ fn schema_v1_profile_fails_with_migration_message_before_agent_invocation() {
     let profile_path = fixture.root.join(".spec-loop.toml");
     let profile = fs::read_to_string(&profile_path)
         .expect("profile")
-        .replace("schema_version = 2", "schema_version = 1");
+        .replace("schema_version = 3", "schema_version = 1");
     fs::write(profile_path, profile).expect("downgrade profile");
 
     let output = fixture.run(&["--spec", "001"]);
 
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("migrate to schema_version = 2"));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("profile schema v1"));
+    assert!(error.contains("migrate manually to schema_version = 3"));
+    assert!(error.contains("no automatic migration is available"));
+    assert!(error.contains("backend = \"pi\""));
+    assert!(!fixture.agent_events.exists());
+}
+
+#[test]
+fn schema_v2_profile_fails_with_migration_message_before_agent_invocation() {
+    let fixture = Fixture::new(false, false);
+    let profile_path = fixture.root.join(".spec-loop.toml");
+    let profile = fs::read_to_string(&profile_path)
+        .expect("profile")
+        .replace("schema_version = 3", "schema_version = 2");
+    fs::write(profile_path, profile).expect("downgrade profile");
+
+    let output = fixture.run(&["--spec", "001"]);
+
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("profile schema v2"));
+    assert!(error.contains("migrate manually to schema_version = 3"));
+    assert!(error.contains("no automatic migration is available"));
+    assert!(error.contains("backend = \"pi\""));
     assert!(!fixture.agent_events.exists());
 }
 

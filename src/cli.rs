@@ -1,4 +1,4 @@
-use clap::{Args, Parser};
+use clap::{Args, Parser, Subcommand};
 
 /// Command-line options for the generic specification workflow.
 #[derive(Clone, Debug, Parser)]
@@ -6,10 +6,14 @@ use clap::{Args, Parser};
     name = "spec-loop",
     version,
     about = "Implement repository specs through a guarded agent loop",
-    long_about = "Run the workflow from the current directory, which must contain `.spec-loop.toml`. Specs are discovered from configured filesystem globs; Git is not required. Pi preserves its effective tools, extensions, MCP, skills, trust, context, and inherited environment. Repository instructions and selected specification remain authoritative.",
-    after_help = "Retries and process timeouts are unlimited by default; completion.max_passes configures the retry cap for every Pi role. Checks and lifecycle actions use argv arrays from the profile, never a shell, and run from the current directory. Review-context command runs through reviewer Pi tools and defaults to `git diff`; configure another command for non-Git projects. Run logs remain outside the project directory in a system temporary directory."
+    long_about = "Run the workflow from the current directory, which must contain `.spec-loop.toml`. Specs are discovered from configured filesystem globs; Git is not required. Schema v3 defaults to the built-in OpenAI Responses backend, which requires `agent.model` and `spec-loop auth login`; it uses ChatGPT OAuth and one automatic POSIX shell tool. Set `agent.backend = \"pi\"` to use Pi and preserve its effective resources. Repository instructions and selected specification remain authoritative.",
+    after_help = "Generic role retries and process timeouts are unlimited by default; `completion.max_passes` configures the generic role retry cap, while built-in provider retries are limited to three per request. Built-in shell runs automatically with same-user permissions and is not sandboxed; commands may access or transmit available credentials and secrets. Checks and lifecycle actions use argv arrays, never a shell. Review-context commands run through selected-backend tools; default is `git diff`. Run logs remain outside the project directory and may contain sensitive shell output."
 )]
 pub struct Cli {
+    /// Run profile-independent authentication commands.
+    #[command(subcommand)]
+    pub command: Option<CliCommand>,
+
     /// Select one eligible specification identifier.
     #[arg(long, value_name = "ID")]
     pub spec: Option<String>,
@@ -47,6 +51,39 @@ struct CompletionOptions {
     /// Continue to later eligible specifications after this one completes.
     #[arg(long = "continue")]
     continue_run: bool,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum CliCommand {
+    /// Manage `OpenAI` `ChatGPT` authorization without loading a project profile.
+    Auth(AuthArgs),
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub command: AuthSubcommand,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum AuthSubcommand {
+    /// Authorize Spec Loop with `ChatGPT` in a browser.
+    Login {
+        /// Reauthorize a saved registration ID.
+        #[arg(long, conflicts_with = "new_account", value_name = "REGISTRATION_ID")]
+        account: Option<String>,
+        /// Start a distinct dynamic client registration.
+        #[arg(long, conflicts_with = "account")]
+        new_account: bool,
+    },
+    /// Show local authorization and direct-use permission state.
+    Status,
+    /// Remove selected or active Spec Loop credentials.
+    Logout {
+        /// Opaque registration ID to remove locally.
+        #[arg(long, value_name = "REGISTRATION_ID")]
+        account: Option<String>,
+    },
 }
 
 impl Cli {

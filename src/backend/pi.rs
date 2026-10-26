@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{AgentBackend, AgentResponse, AgentRun};
+use super::{AgentBackend, AgentResponse, AgentRun, BackendFailure};
 use crate::commands::{ProcessTermination, run_process, status_success};
 use crate::config::{AgentConfig, AgentStage, Profile};
 use crate::error::{Result, SpecLoopError, io_error};
@@ -54,7 +54,8 @@ impl AgentBackend for PiBackend {
             parse_jsonl(&output.stdout)
         };
         Ok(AgentRun {
-            outcome,
+            outcome: outcome.map_err(BackendFailure::retryable),
+            continuation: None,
             stdout: output.stdout,
             stderr: output.stderr,
         })
@@ -149,7 +150,10 @@ fn arguments(agent: &AgentConfig, role: PromptRole, prompt: &str) -> Vec<String>
         args.extend(["--model".to_owned(), model.to_owned()]);
     }
     if let Some(thinking) = agent.thinking_for(stage) {
-        args.extend(["--thinking".to_owned(), thinking.to_owned()]);
+        args.extend([
+            "--thinking".to_owned(),
+            thinking.provider_values().0.to_owned(),
+        ]);
     }
     args.extend(["-p".to_owned(), prompt.to_owned()]);
     args
@@ -323,7 +327,7 @@ fn parse_settled_aborted(value: &Value, line_number: usize) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{arguments, display_arguments, parse_jsonl};
-    use crate::config::{AgentConfig, AgentStageConfig, AgentStages};
+    use crate::config::{AgentConfig, AgentStageConfig, AgentStages, ThinkingLevel};
     use crate::prompts::PromptRole;
 
     fn event_json() -> String {
@@ -402,7 +406,7 @@ mod tests {
     fn stage_overrides_apply_to_every_role_family_and_fall_back_globally() {
         let agent = AgentConfig {
             model: Some("provider/global".to_owned()),
-            thinking: Some("low".to_owned()),
+            thinking: Some(ThinkingLevel::Low),
             stages: AgentStages {
                 planning: AgentStageConfig {
                     model: Some("provider/planning".to_owned()),
@@ -410,11 +414,11 @@ mod tests {
                 },
                 implementation: AgentStageConfig {
                     model: None,
-                    thinking: Some("medium".to_owned()),
+                    thinking: Some(ThinkingLevel::Medium),
                 },
                 review: AgentStageConfig {
                     model: Some("provider/review".to_owned()),
-                    thinking: Some("high".to_owned()),
+                    thinking: Some(ThinkingLevel::High),
                 },
             },
             ..AgentConfig::default()
@@ -464,7 +468,7 @@ mod tests {
     fn explicit_model_and_thinking_profile_settings_are_passed_through() {
         let agent = AgentConfig {
             model: Some("provider/model".to_owned()),
-            thinking: Some("high".to_owned()),
+            thinking: Some(ThinkingLevel::High),
             ..AgentConfig::default()
         };
         let args = arguments(&agent, PromptRole::Implementation, "review prompt");

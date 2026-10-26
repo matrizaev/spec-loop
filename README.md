@@ -5,7 +5,7 @@ Spec Loop is a repository-agnostic Rust CLI for implementing filesystem-selected
 ## Requirements
 
 - Run Spec Loop from project root; `.spec-loop.toml` must be directly in current working directory.
-- Pi CLI available as configured by `agent.executable` (default `pi`).
+- Schema-v3 profiles default to built-in OpenAI and require explicit `agent.model` plus ChatGPT authorization. Built-in and auth implementation is present but remains incomplete against the active specification; use `agent.backend = "pi"` with Pi installed until full acceptance is met.
 - Each configured check/action executable available when used.
 - Git is not required by Spec Loop. Default review context is `git diff`; projects without Git should configure a different command.
 
@@ -52,13 +52,29 @@ spec-loop [--spec ID] [--review] [--plan] [--dry-run] [--continue]
 - `--continue` advances to later eligible specs after successful review and lifecycle actions. No commit authorization is required.
 - `--dry-run` prints resolved spec, plan, checks, review-context argv, and expanded actions without invoking agents or commands.
 - `--commit` is not supported. Configure stage/commit behavior explicitly under `[actions]` if desired.
-- `completion.max_passes = 0` means unlimited role calls. Agent, check, and action timeouts are optional; omitted means unlimited.
+- `completion.max_passes = 0` means unlimited generic role calls. Built-in provider retries are separately capped at three retries per request; agent, check, and action timeouts are optional unless configured.
 
 Completed specs remain active if archival is disabled. A later invocation can select them again; repository owners control eligibility through active globs and archive transitions.
 
-## Profile schema v2
+## Profile schema v3
 
-Profiles use strict TOML with `schema_version = 2`. Version 1 profiles fail with a migration message; no automatic migration is performed. Unknown fields fail validation. Checks and lifecycle actions use argv arrays, never shell strings, and all configured checks/actions run from current working directory. No command has a configurable `cwd`.
+Profiles use strict TOML with `schema_version = 3`. Omitted `agent.backend` selects `builtin`; set `backend = "pi"` explicitly to retain Pi. Built-in profiles require non-empty global `agent.model`; stage-specific model and thinking settings override global values. `max_tool_calls` and `max_tool_output_bytes` default to 50 and 1,048,576, and are valid only for the built-in backend. Unknown fields fail validation.
+
+Version 1 and 2 profiles require manual migration to `schema_version = 3`; no automatic migration is performed. Add an `[agent]` table with `backend = "pi"` to preserve prior backend behavior, or configure built-in model and authentication. Checks and lifecycle actions use argv arrays, never shell strings, and all configured checks/actions run from current working directory. No command has a configurable `cwd`.
+
+**Implementation status:** schema-v3 selection, profile-independent auth commands, and an initial built-in Responses/shell backend are present. The implementation remains incomplete against the full active-spec acceptance criteria; do not treat built-in workflow execution as complete. Authentication commands do not load or modify project profiles.
+
+### Built-in authentication and security boundary
+
+Built-in authentication uses the official OpenAI Sign in with ChatGPT flow for eligible ChatGPT-plan use and is intended for the Responses API. It does not accept API keys, use `OPENAI_API_KEY`, or fall back to API-key billing or another provider. Login requires `chatgpt.tokens.use.direct`; missing permission stops authorization. Subscription access and usage limits are provider-controlled; ChatGPT authorization does not promise unlimited usage.
+
+Run `spec-loop auth login`, then configure a profile with non-empty global `agent.model` (stage-specific model settings override it). Login attempts to open authorization URL and always prints it for manual use. Flow requires reachable localhost callback; remote/SSH users must arrange loopback reachability, for example port forwarding. No device-code fallback exists. With multiple saved registrations, use `auth login --account REGISTRATION_ID` to reauthorize one, or `--new-account` to create distinct registration. `auth status` does not display tokens. `auth logout [--account REGISTRATION_ID]` removes only Spec Loop's local credentials; it does not revoke upstream grant.
+
+OAuth credentials must stay outside the worktree and run logs, in an operating-system credential store where available or an owner-only platform credential file otherwise. The file fallback is plaintext at rest, not encrypted by Spec Loop. Expected fallback paths are `$XDG_CONFIG_HOME/spec-loop/auth.json` (or `$HOME/.config/spec-loop/auth.json`) on Linux, `~/Library/Application Support/Spec Loop/auth.json` on macOS, and `%APPDATA%\Spec Loop\auth.json` on Windows. File permissions must be restricted where supported.
+
+Built-in shell commands execute automatically without per-command approval via POSIX `/bin/sh -c`, from project root, with the inherited environment and same-user operating-system permissions. This is not a sandbox: a requested command may access same-user credentials, inherited environment secrets, and files outside the worktree, then expose or transmit them. No credential isolation is promised. The configured limits are 50 calls per role and 1,048,576 combined stdout/stderr bytes retained per call by default; configured role timeout and cancellation apply to provider requests and shell execution. Unsupported platforms must fail rather than silently change shell semantics.
+
+Shell commands and bounded outputs are retained in external run logs for diagnosis. Tool output can contain workspace data, credentials, or inherited secrets; transcript logging cannot reliably remove secrets. Commands and external side effects may alter files or systems outside the worktree. The implementation remains incomplete against full acceptance criteria; these descriptions do not assert completion or approval.
 
 Review context defaults to:
 
@@ -67,7 +83,7 @@ Review context defaults to:
 argv = ["git", "diff"]
 ```
 
-Spec Loop never executes or captures this command. It supplies exact argv and project-root working directory to implementation review, implementation finding audit, and implementation evidence clarification prompts; those roles run it through configured Pi tools and return `blocked` if it fails. Plan roles do not receive the command.
+Spec Loop never executes or captures this command. It supplies exact argv and project-root working directory to implementation review, implementation finding audit, and implementation evidence clarification prompts; those roles delegate it to the selected backend's available tools and return `blocked` if it fails. The engine never executes or captures the command. Plan roles do not receive it.
 
 Lifecycle actions are ordered and optional:
 
@@ -83,9 +99,9 @@ argv = ["git", "commit", "-m", "Implement {spec_id}"]
 
 Supported action placeholders: `{spec_id}`, `{spec_path}`, `{plan_path}`. They expand within argv elements, not through a shell. `{spec_path}` names archived destination after a move, otherwise original spec path. Actions inherit environment, capture stdout/stderr in run logs, and stop workflow on nonzero status without retry or rollback. Before the first `on_finish` action, Spec Loop verifies selected spec and plan hashes; after finish actions begin, it no longer checks selected-spec hash, allowing an explicitly configured action to update that spec. Selected-plan hash remains checked before and after every action, and `on_review_success` actions remain protected for both inputs. The status-update profile demonstrates GNU `sed -i` changing `**Status:** Active` to `**Status:** Complete`; these labels are example convention only, not engine policy. Omitted action lists are empty. The self-host profile defines no actions, so it does not stage or commit changes.
 
-Configure checks as ordered `[[checks]]` entries with `name`, non-empty `argv`, and optional `timeout_seconds`. Every check runs from project root. All checks run after a failure; any failure blocks review for that pass. Agent executable, prompts, and checks are validated before agent invocation. All command argv share structural validation (non-empty executable; no NUL bytes). Checks substitute exact `{spec_id}`, `{spec_path}`, and `{plan_path}` tokens; other brace text remains literal. Review-context argv is passed unchanged. Lifecycle actions use strict placeholder validation.
+Configure checks as ordered `[[checks]]` entries with `name`, non-empty `argv`, and optional `timeout_seconds`. Every check runs from project root. All checks run after a failure; any failure blocks review for that pass. The Pi executable is validated only when Pi is selected; prompts and checks are validated before agent invocation. All command argv share structural validation (non-empty executable; no NUL bytes). Checks substitute exact `{spec_id}`, `{spec_path}`, and `{plan_path}` tokens; other brace text remains literal. Review-context argv is passed unchanged. Lifecycle actions use strict placeholder validation.
 
-Pi resource availability is controlled only by user's Pi configuration; Spec Loop does not add resource overrides. Optional per-stage model/thinking settings use `[agent.stages.planning]`, `[agent.stages.implementation]`, and `[agent.stages.review]`; omitted values preserve Pi defaults. Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
+Pi resource availability is controlled only by user's Pi configuration; Spec Loop does not add resource overrides. The built-in backend uses only OpenAI ChatGPT OAuth and its shell tool, with no Pi extensions, MCP, skills, trust, or context integration; implementation remains incomplete against full acceptance criteria. Optional per-stage model/thinking settings use `[agent.stages.planning]`, `[agent.stages.implementation]`, and `[agent.stages.review]`; omitted values inherit global values. Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; the intended built-in mapping is `off` to `none` and remaining values directly to reasoning effort.
 
 ## Self-hosting
 
@@ -102,6 +118,6 @@ Plans are stored under `.spec-loop/`; each clean checkout needs its own approved
 
 ## Logs and distribution
 
-Run logs are retained outside project tree under a system temporary directory. Prompt text is passed directly to Pi; Spec Loop writes no prompt files. Logs include child output and agent response data and should be handled accordingly.
+Run logs are retained outside project tree under a system temporary directory. Role prompts are passed directly to the selected backend; Spec Loop writes no prompt files. Logs include child output, built-in shell transcripts, and agent response data and should be handled accordingly because tool output may contain accessible secrets.
 
 The crate targets Rust 2024 and pins nightly toolchain for formatting. MIT license. GitHub release workflow builds Linux x86_64 musl binaries; release workflow has not been run as part of local checks.
