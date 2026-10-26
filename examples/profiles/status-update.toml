@@ -1,0 +1,40 @@
+# Example completion status update. This profile assumes GNU sed (`sed -i`).
+# Create specs/implemented before running with archival enabled.
+schema_version = 2
+
+[specs]
+active_globs = ["specs/*.md"]
+id_regex = '^(?:specs|specs/implemented)/(?P<id>[0-9]+)(?:-[a-z0-9-]+)?\.md$'
+ordering = "numeric"
+selection = "next"
+
+[plan]
+path_template = ".spec-loop/plans/{spec_id}.md"
+
+[review.context]
+argv = ["git", "diff"]
+
+[[checks]]
+name = "quality-gate"
+argv = ["make", "check"]
+timeout_seconds = 3600
+
+[agent]
+backend = "pi"
+executable = "pi"
+
+[archive]
+enabled = true
+destination = "specs/implemented"
+
+[completion]
+max_passes = 0
+
+[[actions.on_finish]]
+name = "mark archived spec complete (GNU sed)"
+argv = [
+  "sed",
+  "-i",
+  's/^\*\*Status:\*\* Active$/**Status:** Complete/',
+  "{spec_path}",
+]

@@ -43,6 +43,11 @@ impl InputIntegrity {
         self.selected_plan.verify(root)
     }
 
+    /// Verifies only the selected plan after finish actions may update the selected spec.
+    pub fn verify_plan(&self, root: &Path) -> Result<()> {
+        self.selected_plan.verify(root)
+    }
+
     pub fn agent_finished(&mut self, root: &Path, is_plan_author: bool) -> Result<()> {
         self.selected_spec.verify(root)?;
         if self.plan_author_may_update && is_plan_author {
@@ -154,6 +159,18 @@ mod tests {
             fs::read_to_string(temporary.path().join("plans/001.md")).expect("preserved plan"),
             "changed plan\n"
         );
+    }
+
+    #[test]
+    fn plan_only_verification_ignores_spec_changes_but_protects_plan() {
+        let (temporary, integrity) = fixture(true, false);
+        fs::write(temporary.path().join("specs/001.md"), "finished spec\n").expect("edit spec");
+        integrity
+            .verify_plan(temporary.path())
+            .expect("finish may update selected spec");
+
+        fs::write(temporary.path().join("plans/001.md"), "changed plan\n").expect("edit plan");
+        assert!(integrity.verify_plan(temporary.path()).is_err());
     }
 
     #[test]

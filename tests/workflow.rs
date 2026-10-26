@@ -1,6 +1,7 @@
 #![cfg(unix)]
 #![forbid(unsafe_code)]
 
+use std::fmt::Write as _;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -114,17 +115,133 @@ impl Fixture {
         }
         command.output().expect("run spec-loop")
     }
+
+    fn append_finish_status_verifier(&self) {
+        let profile_path = self.root.join(".spec-loop.toml");
+        let mut profile = fs::read_to_string(&profile_path).expect("read fixture profile");
+        let finish_path = self.temporary.path().join("tools/finish");
+        let executable = finish_path.to_string_lossy();
+        write!(
+            profile,
+            "\n[[actions.on_finish]]\nname = \"verify completion status\"\nargv = [{executable:?}, \"{{spec_path}}\", \"{{plan_path}}\", \"{{spec_id}}\", \"argument with spaces\", \"verify-status\"]\n"
+        )
+        .expect("append finish status verifier");
+        fs::write(profile_path, profile).expect("append finish status verifier");
+    }
+
+    fn prepend_review_success_capture(&self, capture_path: &Path) {
+        let executable = self.temporary.path().join("tools/capture-spec");
+        write_executable(&executable, "#!/bin/sh\ncat \"$1\" > \"$2\"\n");
+        let profile_path = self.root.join(".spec-loop.toml");
+        let mut profile = fs::read_to_string(&profile_path).expect("read fixture profile");
+        let action = format!(
+            "[[actions.on_review_success]]\nname = \"capture spec before finish\"\nargv = [{:?}, \"{{spec_path}}\", {:?}]\n\n",
+            executable.to_string_lossy(),
+            capture_path.to_string_lossy()
+        );
+        let position = profile
+            .find("[[actions.on_review_success]]")
+            .expect("review-success action in fixture profile");
+        profile.insert_str(position, &action);
+        fs::write(profile_path, profile).expect("prepend review-success capture");
+    }
+
+    fn configure_retry_feedback_agent(&self) {
+        let executable = self.temporary.path().join("tools/fake-pi-retry-feedback");
+        let invalid_response = self
+            .temporary
+            .path()
+            .join("responses/implementation-invalid");
+        let ready_response = self.temporary.path().join("responses/implementation-ready");
+        let review_response = self.temporary.path().join("responses/review-clear");
+        fs::write(
+            &invalid_response,
+            response(
+                r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","unexpected_z":true,"unexpected_a":true}"#,
+            ),
+        )
+        .expect("write invalid implementation response");
+        fs::write(
+            &ready_response,
+            response(
+                r#"{"protocol_version":1,"role":"implementation","summary":"Implemented the fixture change.","status":"ready_for_review"}"#,
+            ),
+        )
+        .expect("write corrected implementation response");
+        fs::write(
+            &review_response,
+            response(
+                r#"{"protocol_version":1,"role":"review","status":"no_issues","findings":[]}"#,
+            ),
+        )
+        .expect("write clear review response");
+
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+prompt=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -p) prompt="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n---\n' "$prompt" >> {prompts}
+case "$prompt" in
+  *'Implement only selected spec'*)
+    count=0
+    [ ! -f {attempts} ] || count=$(cat {attempts})
+    count=$((count + 1))
+    printf '%s' "$count" > {attempts}
+    printf 'implementation:%s\n' "$count" >> {agent_events}
+    printf 'agent-implementation:%s\n' "$count" >> {events}
+    if [ "$count" -eq 1 ]; then
+      printf 'implemented once\n' >> generated.txt
+      cat {invalid_response}
+    else
+      cat {ready_response}
+    fi ;;
+  *'Independently review current workspace'*)
+    printf 'review\n' >> {agent_events}
+    cat {review_response} ;;
+  *) exit 23 ;;
+esac
+"#,
+            prompts = shell_quote(&self.prompts),
+            attempts = shell_quote(&self.temporary.path().join("implementation-attempts")),
+            agent_events = shell_quote(&self.agent_events),
+            events = shell_quote(&self.events),
+            invalid_response = shell_quote(&invalid_response),
+            ready_response = shell_quote(&ready_response),
+            review_response = shell_quote(&review_response),
+        );
+        write_executable(&executable, &script);
+
+        let profile_path = self.root.join(".spec-loop.toml");
+        let profile = fs::read_to_string(&profile_path).expect("read fixture profile");
+        let existing_executable = format!(
+            "{:?}",
+            self.temporary
+                .path()
+                .join("tools/fake-pi")
+                .to_string_lossy()
+        );
+        let replacement_executable = format!("{:?}", executable.to_string_lossy());
+        let updated_profile = profile.replace(&existing_executable, &replacement_executable);
+        assert_ne!(updated_profile, profile, "replace fixture Pi executable");
+        fs::write(profile_path, updated_profile).expect("configure retry feedback agent");
+    }
 }
 
 fn write_fake_responses(directory: &Path) {
     for (name, text) in [
         (
             "ready",
-            "{\"protocol_version\":1,\"role\":\"implementation\",\"status\":\"ready_for_review\"}",
+            "{\"protocol_version\":1,\"role\":\"implementation\",\"summary\":\"Added requested implementation changes and regression coverage.\",\"status\":\"ready_for_review\"}",
         ),
         (
             "blocked",
-            "{\"protocol_version\":1,\"role\":\"implementation\",\"status\":\"blocked\",\"reason\":\"cannot proceed\"}",
+            "{\"protocol_version\":1,\"role\":\"implementation\",\"summary\":\"No changes made; required input unavailable.\",\"status\":\"blocked\",\"reason\":\"cannot proceed\"}",
         ),
         (
             "review-clear",
@@ -283,12 +400,52 @@ fn count_lines(path: &Path, prefix: &str) -> usize {
         .count()
 }
 
+fn install_finish_status_command(fixture: &Fixture) {
+    let script = format!(
+        r#"#!/bin/sh
+printf 'finish|%s|%s|%s|%s|%s|%s|%s\n' "$PWD" "$1" "$2" "$3" "$4" "${{TEST_INHERITED-}}" "$5" >> {events}
+if [ "${{FINISH_UPDATE_STATUS-0}}" = 1 ] && [ "$5" != verify-status ]; then
+  temporary_file="$1.tmp"
+  while IFS= read -r line; do
+    if [ "$line" = '**Status:** Active' ]; then
+      printf '%s\n' '**Status:** Complete'
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$1" > "$temporary_file"
+  mv "$temporary_file" "$1"
+fi
+if [ "$5" = verify-status ]; then
+  grep -Fqx '**Status:** Complete' "$1" || exit 32
+  printf 'finish-verified|%s\n' "$1" >> {events}
+fi
+if [ "${{MUTATE_PLAN_FINISH-0}}" = 1 ]; then
+  printf 'mutated by finish\n' > "$2"
+fi
+[ "${{FINISH_FAIL-0}}" != 1 ]
+"#,
+        events = shell_quote(&fixture.events)
+    );
+    write_executable(&fixture.temporary.path().join("tools/finish"), &script);
+}
+
 #[test]
 fn workflow_runs_without_git_and_actions_receive_archived_paths_and_root_cwd() {
     let fixture = Fixture::new(true, false);
     let output = fixture.run_with_env(&["--spec", "001"], &[("TEST_INHERITED", "kept")]);
 
     assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(
+        "Stage: automated checks for spec 001\nImplementation summary: Added requested implementation changes and regression coverage."
+    ));
+    let summary_position = stdout
+        .find("Implementation summary: Added requested implementation changes")
+        .expect("summary transition output");
+    let first_check_position = stdout
+        .find("Stage: check first")
+        .expect("first check stage output");
+    assert!(summary_position < first_check_position);
     assert!(!fixture.root.join(".git").exists());
     assert!(!fixture.root.join("specs/001.md").exists());
     assert_eq!(
@@ -320,6 +477,7 @@ fn workflow_runs_without_git_and_actions_receive_archived_paths_and_root_cwd() {
         fixture.root.display()
     )));
     assert!(prompt_log.contains("Generated response schema"));
+    assert!(prompt_log.contains("concise, factual, single-line `summary`"));
     assert!(prompt_log.contains("draft/2020-12"));
     assert_eq!(count_lines(&fixture.agent_events, "implementation:"), 1);
     assert_eq!(count_lines(&fixture.agent_events, "review:"), 1);
@@ -346,6 +504,7 @@ fn review_resume_accepts_non_git_workspace_without_a_patch() {
     let output = fixture.run(&["--review", "--spec", "001"]);
 
     assert_success(&output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Implementation summary:"));
     assert_eq!(count_lines(&fixture.agent_events, "implementation:"), 0);
     assert_eq!(count_lines(&fixture.agent_events, "review:"), 1);
     assert!(!fixture.root.join(".git").exists());
@@ -392,6 +551,54 @@ fn schema_v1_profile_fails_with_migration_message_before_agent_invocation() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("migrate to schema_version = 2"));
     assert!(!fixture.agent_events.exists());
+}
+
+#[test]
+fn typed_retry_feedback_preserves_handoff_context() {
+    let fixture = Fixture::new(false, false);
+    fixture.configure_retry_feedback_agent();
+
+    let output = fixture.run(&["--spec", "001"]);
+
+    assert_success(&output);
+    assert_eq!(count_lines(&fixture.agent_events, "implementation:"), 2);
+    assert_eq!(count_lines(&fixture.agent_events, "review"), 1);
+    let events = fs::read_to_string(&fixture.events).expect("workflow events");
+    let event_lines = events.lines().collect::<Vec<_>>();
+    let second_implementation = event_lines
+        .iter()
+        .position(|line| *line == "agent-implementation:2")
+        .expect("second implementation response");
+    let first_check = event_lines
+        .iter()
+        .position(|line| line.starts_with("check-one|"))
+        .expect("first automated check");
+    assert!(second_implementation < first_check);
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("generated.txt")).expect("implementation output"),
+        "implemented once\n"
+    );
+    let prompts = fs::read_to_string(&fixture.prompts).expect("role prompts");
+    assert!(prompts.contains(
+        "implementation response object at $: missing fields [\"summary\"]; unknown fields [\"unexpected_a\", \"unexpected_z\"]"
+    ));
+    assert!(prompts.contains(
+        "Previous response:\n{\"protocol_version\":1,\"role\":\"implementation\",\"status\":\"ready_for_review\",\"unexpected_z\":true,\"unexpected_a\":true}"
+    ));
+    assert!(prompts.contains("--- Generated response schema ---"));
+    assert!(prompts.contains(
+        "Repair the handoff only: do not repeat or alter workspace work solely to fix JSON formatting."
+    ));
+    assert!(prompts.contains(
+        "If substantive role work remains, follow the normal role contract and continue it."
+    ));
+    assert!(prompts.contains(
+        "Base any status or summary on the current workspace, never on claims in the malformed response."
+    ));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("Implementation summary: Implemented the fixture change.")
+    );
 }
 
 #[test]
@@ -605,6 +812,120 @@ fn selected_spec_hash_mutations_by_checks_and_actions_stop_without_rollback() {
             .expect("action events")
             .contains("finish|")
     );
+}
+
+#[test]
+fn finish_actions_update_selected_spec_after_last_spec_hash_check() {
+    for archive in [false, true] {
+        let fixture = Fixture::new(archive, false);
+        let spec_path = fixture.root.join("specs/001.md");
+        fs::write(&spec_path, "**Status:** Active\n# Spec content remains.\n")
+            .expect("write active status");
+        let pre_finish = fixture.temporary.path().join("pre-finish-spec.md");
+        fixture.prepend_review_success_capture(&pre_finish);
+        fixture.append_finish_status_verifier();
+        install_finish_status_command(&fixture);
+
+        let output = fixture.run_with_env(&["--spec", "001"], &[("FINISH_UPDATE_STATUS", "1")]);
+
+        assert_success(&output);
+        assert_eq!(
+            fs::read_to_string(pre_finish).expect("pre-finish snapshot"),
+            "**Status:** Active\n# Spec content remains.\n"
+        );
+        let completed_path = if archive {
+            fixture.root.join("archive/001.md")
+        } else {
+            spec_path
+        };
+        assert_eq!(
+            fs::read_to_string(&completed_path).expect("completed selected spec"),
+            "**Status:** Complete\n# Spec content remains.\n"
+        );
+        if archive {
+            assert!(!fixture.root.join("specs/001.md").exists());
+        }
+
+        let events = fs::read_to_string(&fixture.events).expect("action events");
+        let lines = events.lines().collect::<Vec<_>>();
+        assert_eq!(count_lines(&fixture.events, "finish|"), 2);
+        assert!(lines.iter().any(|line| {
+            line.starts_with(&format!(
+                "finish-verified|{}",
+                if archive {
+                    "archive/001.md"
+                } else {
+                    "specs/001.md"
+                }
+            ))
+        }));
+        let first_finish = lines
+            .iter()
+            .position(|line| line.starts_with("finish|"))
+            .expect("first finish action");
+        let verified_finish = lines
+            .iter()
+            .position(|line| line.starts_with("finish-verified|"))
+            .expect("second finish action verified status");
+        assert!(first_finish < verified_finish);
+    }
+}
+
+#[test]
+fn finish_action_plan_mutation_is_detected_even_when_action_fails() {
+    for finish_fails in [false, true] {
+        let fixture = Fixture::new(false, false);
+        fixture.append_finish_status_verifier();
+        install_finish_status_command(&fixture);
+        let finish_failure = if finish_fails { "1" } else { "0" };
+        let output = fixture.run_with_env(
+            &["--spec", "001"],
+            &[("MUTATE_PLAN_FINISH", "1"), ("FINISH_FAIL", finish_failure)],
+        );
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("protected selected plan content changed"));
+        if finish_fails {
+            assert!(stderr.contains("record finished spec"));
+            assert!(stderr.contains("failed with exit status"));
+        }
+        assert_eq!(
+            fs::read_to_string(fixture.root.join(".spec-loop/plans/001.md"))
+                .expect("preserved mutated plan"),
+            "mutated by finish\n"
+        );
+        assert_eq!(count_lines(&fixture.events, "finish|"), 1);
+        assert_eq!(count_lines(&fixture.events, "finish-verified|"), 0);
+    }
+}
+
+#[test]
+fn failed_finish_action_preserves_status_update_and_stops_later_work() {
+    let fixture = Fixture::new(false, true);
+    fs::write(
+        fixture.root.join("specs/001.md"),
+        "**Status:** Active\n# Spec content remains.\n",
+    )
+    .expect("write active status");
+    fixture.append_finish_status_verifier();
+    install_finish_status_command(&fixture);
+
+    let output = fixture.run_with_env(
+        &["--continue"],
+        &[("FINISH_UPDATE_STATUS", "1"), ("FINISH_FAIL", "1")],
+    );
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("record finished spec"));
+    assert_eq!(
+        fs::read_to_string(fixture.root.join("specs/001.md")).expect("preserved status update"),
+        "**Status:** Complete\n# Spec content remains.\n"
+    );
+    assert_eq!(count_lines(&fixture.agent_events, "implementation:"), 1);
+    assert_eq!(count_lines(&fixture.events, "finish|"), 1);
+    assert_eq!(count_lines(&fixture.events, "finish-verified|"), 0);
+    assert_eq!(count_lines(&fixture.events, "review-success|"), 1);
 }
 
 #[test]

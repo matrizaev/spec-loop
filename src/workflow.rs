@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::Serialize;
 
 use crate::backend::{self, AgentBackend, AgentResponse};
@@ -56,6 +57,14 @@ struct CandidateFiles {
 struct CheckReport {
     passed: bool,
     summary: String,
+}
+
+#[derive(Clone, Copy)]
+enum ActionIntegrityPolicy {
+    /// Check both protected inputs before and after each action.
+    SelectedInputs,
+    /// Check only the protected plan once finish actions begin.
+    SelectedPlan,
 }
 
 struct AuditReport {
@@ -701,7 +710,7 @@ fn run_implementation_workflow(
 ) -> Result<()> {
     let mut feedback: Option<String> = None;
     loop {
-        if !review_resume || feedback.is_some() {
+        let implementation_summary = if !review_resume || feedback.is_some() {
             let response = call_typed::<ImplementationResponse>(
                 context,
                 AgentRequest {
@@ -723,15 +732,19 @@ fn run_implementation_workflow(
                 Readiness::Blocked { reason } => {
                     return Err(role_blocked("implementation", &reason));
                 }
-                Readiness::ReadyForReview => {}
+                Readiness::ReadyForReview => Some(response.summary),
             }
-        }
+        } else {
+            None
+        };
         review_resume = false;
         context.integrity.verify(context.root)?;
-        commands::report_progress(&format!(
-            "Stage: automated checks for spec {}",
-            candidate.id
-        ))?;
+        let mut transition = format!("Stage: automated checks for spec {}", candidate.id);
+        if let Some(summary) = implementation_summary {
+            transition.push_str("\nImplementation summary: ");
+            transition.push_str(&summary);
+        }
+        commands::report_progress(&transition)?;
         let checks = run_checks(context, candidate, plan_path)?;
         println!("{}", checks.summary);
         if !checks.passed {
@@ -1102,12 +1115,17 @@ fn complete_spec(
         &context.profile.actions.on_review_success,
         &completed_candidate,
         plan_path,
+        ActionIntegrityPolicy::SelectedInputs,
     )?;
+    if !context.profile.actions.on_finish.is_empty() {
+        context.integrity.verify(context.root)?;
+    }
     run_actions(
         context,
         &context.profile.actions.on_finish,
         &completed_candidate,
         plan_path,
+        ActionIntegrityPolicy::SelectedPlan,
     )?;
     Ok(())
 }
@@ -1150,14 +1168,41 @@ fn run_actions(
     actions: &[ActionConfig],
     candidate: &SpecCandidate,
     plan_path: &Path,
+    integrity_policy: ActionIntegrityPolicy,
 ) -> Result<()> {
     for action in actions {
-        context.integrity.verify(context.root)?;
+        verify_action_integrity(context, integrity_policy)?;
         let argv = expand_argv(&action.argv, &candidate.id, &candidate.path, plan_path);
-        run_action(context, action, &argv)?;
-        context.integrity.verify(context.root)?;
+        let action_result = run_action(context, action, &argv);
+        let integrity_result = verify_action_integrity(context, integrity_policy);
+        combine_action_and_integrity_results(action_result, integrity_result)?;
     }
     Ok(())
+}
+
+fn verify_action_integrity(
+    context: &WorkflowContext<'_>,
+    policy: ActionIntegrityPolicy,
+) -> Result<()> {
+    match policy {
+        ActionIntegrityPolicy::SelectedInputs => context.integrity.verify(context.root),
+        ActionIntegrityPolicy::SelectedPlan => context.integrity.verify_plan(context.root),
+    }
+}
+
+/// Keeps diagnostics from both action failure and post-action integrity failure.
+fn combine_action_and_integrity_results(
+    action_result: Result<()>,
+    integrity_result: Result<()>,
+) -> Result<()> {
+    match (action_result, integrity_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(action_error), Ok(())) => Err(action_error),
+        (Ok(()), Err(integrity_error)) => Err(integrity_error),
+        (Err(action_error), Err(integrity_error)) => Err(SpecLoopError::Workflow(format!(
+            "{action_error}; post-action integrity verification also failed: {integrity_error}"
+        ))),
+    }
 }
 
 fn run_action(
@@ -1390,7 +1435,7 @@ fn call_typed<T>(
     mut validate: impl FnMut(&T) -> Result<()>,
 ) -> Result<T>
 where
-    T: serde::de::DeserializeOwned + ResponseFields + Serialize,
+    T: serde::de::DeserializeOwned + JsonSchema + ResponseFields,
 {
     let mut validation_feedback = request.validation_feedback.map(str::to_owned);
     loop {
@@ -1410,7 +1455,8 @@ where
                     role_display(request.role)
                 ))?;
                 validation_feedback = Some(format!(
-                    "Previous complete response failed typed JSON validation: {error}\nPrevious response:\n{response}\nReturn one corrected JSON object only."
+                    "Typed response failed validation for role {}: {error}\nPrevious response:\n{response}\n\nThe generated role schema is included in this prompt. Return one corrected JSON object only. Repair the handoff only: do not repeat or alter workspace work solely to fix JSON formatting. If substantive role work remains, follow the normal role contract and continue it. Base any status or summary on the current workspace, never on claims in the malformed response.",
+                    role_display(request.role)
                 ));
             }
         }

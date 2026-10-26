@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -51,7 +53,26 @@ macro_rules! readiness_response {
 }
 
 readiness_response!(PlanAuthorResponse, "plan_author");
-readiness_response!(ImplementationResponse, "implementation");
+
+const MAX_IMPLEMENTATION_SUMMARY_CHARS: usize = 500;
+
+/// Typed implementation handoff, including a concise account of completed work.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[schemars(deny_unknown_fields)]
+pub struct ImplementationResponse {
+    /// Protocol version in response envelope.
+    #[schemars(range(min = 1, max = 1))]
+    pub protocol_version: u32,
+    /// Exact role identifier in response envelope.
+    #[schemars(regex(pattern = "^implementation$"))]
+    pub role: String,
+    /// Brief factual summary printed when workflow enters automated checks.
+    #[schemars(length(min = 1, max = 500))]
+    pub summary: String,
+    /// Whether implementation is reviewable or blocked.
+    #[serde(flatten)]
+    pub result: Readiness,
+}
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -347,29 +368,28 @@ fn close_flattened_schema(schema: &mut serde_json::Value) -> Result<()> {
 }
 
 /// Deserializes one complete typed role response and validates common invariants.
-pub fn parse<T: DeserializeOwned + ResponseFields + Serialize>(
+pub fn parse<T: DeserializeOwned + JsonSchema + ResponseFields>(
     response: &str,
     role: &str,
 ) -> Result<T> {
-    let parsed: T = serde_json::from_str(response)
-        .map_err(|error| SpecLoopError::Agent(format!("invalid role JSON: {error}")))?;
     let supplied: serde_json::Value = serde_json::from_str(response)
         .map_err(|error| SpecLoopError::Agent(format!("invalid role JSON: {error}")))?;
-    let supplied = supplied
-        .as_object()
-        .ok_or_else(|| SpecLoopError::Agent("role response must be one JSON object".to_owned()))?;
-    let canonical = serde_json::to_value(&parsed)
-        .map_err(|error| SpecLoopError::Agent(format!("serialize typed role response: {error}")))?;
-    let canonical = canonical.as_object().ok_or_else(|| {
-        SpecLoopError::Agent("typed role response did not serialize as an object".to_owned())
-    })?;
-    if supplied.keys().collect::<std::collections::BTreeSet<_>>()
-        != canonical.keys().collect::<std::collections::BTreeSet<_>>()
-    {
+    if !supplied.is_object() {
         return Err(SpecLoopError::Agent(
-            "role response contains missing or unknown fields".to_owned(),
+            "role response must be one JSON object".to_owned(),
         ));
     }
+    let generated_schema: serde_json::Value =
+        serde_json::from_str(&schema::<T>()?).map_err(|error| {
+            SpecLoopError::Agent(format!("parse generated response schema: {error}"))
+        })?;
+    let mut field_errors = Vec::new();
+    validate_response_shape(&supplied, &generated_schema, role, &mut field_errors)?;
+    if !field_errors.is_empty() {
+        return Err(SpecLoopError::Agent(field_errors.join("; ")));
+    }
+    let parsed: T = serde_json::from_value(supplied)
+        .map_err(|error| SpecLoopError::Agent(format!("invalid role JSON: {error}")))?;
     if parsed.protocol_version() != PROTOCOL_VERSION {
         return Err(SpecLoopError::Agent(format!(
             "protocol_version must be {PROTOCOL_VERSION}"
@@ -383,6 +403,242 @@ pub fn parse<T: DeserializeOwned + ResponseFields + Serialize>(
     }
     parsed.validate_response()?;
     Ok(parsed)
+}
+
+fn validate_response_shape(
+    response: &serde_json::Value,
+    schema: &serde_json::Value,
+    role: &str,
+    field_errors: &mut Vec<String>,
+) -> Result<()> {
+    let object = response
+        .as_object()
+        .ok_or_else(|| SpecLoopError::Agent("role response must be one JSON object".to_owned()))?;
+    let branches = schema
+        .get("oneOf")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            SpecLoopError::Agent("generated response schema has no status branches".to_owned())
+        })?;
+    let selected_branch = object
+        .get("status")
+        .and_then(|status| select_status_branch(status, branches));
+    if let Some(branch) = selected_branch {
+        validate_schema_value(response, branch, schema, role, "$", field_errors)
+    } else {
+        validate_unselected_status_shape(object, branches, role, field_errors)
+    }
+}
+
+fn select_status_branch<'a>(
+    status: &serde_json::Value,
+    branches: &'a [serde_json::Value],
+) -> Option<&'a serde_json::Value> {
+    branches.iter().find(|branch| {
+        let Some(status_schema) = branch
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|properties| properties.get("status"))
+        else {
+            return false;
+        };
+        status_schema.get("const") == Some(status)
+            || status_schema
+                .get("enum")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|values| values.contains(status))
+    })
+}
+
+fn validate_unselected_status_shape(
+    response: &serde_json::Map<String, serde_json::Value>,
+    branches: &[serde_json::Value],
+    role: &str,
+    field_errors: &mut Vec<String>,
+) -> Result<()> {
+    let mut allowed_fields = BTreeSet::new();
+    let mut common_required: Option<BTreeSet<String>> = None;
+    for branch in branches {
+        let properties = branch
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                SpecLoopError::Agent(
+                    "generated status schema has no envelope properties".to_owned(),
+                )
+            })?;
+        allowed_fields.extend(properties.keys().cloned());
+        let required = schema_string_set(branch.get("required"), "required fields")?;
+        common_required = Some(match common_required {
+            Some(common) => common.intersection(&required).cloned().collect(),
+            None => required,
+        });
+    }
+    let common_required = common_required.ok_or_else(|| {
+        SpecLoopError::Agent("generated response schema has no status branches".to_owned())
+    })?;
+    append_field_error(
+        response,
+        &allowed_fields,
+        &common_required,
+        role,
+        "$",
+        true,
+        field_errors,
+    );
+    Ok(())
+}
+
+fn validate_schema_value(
+    value: &serde_json::Value,
+    schema: &serde_json::Value,
+    root_schema: &serde_json::Value,
+    role: &str,
+    path: &str,
+    field_errors: &mut Vec<String>,
+) -> Result<()> {
+    let schema = resolve_schema_reference(schema, root_schema, role, path)?;
+    if let Some(object) = value.as_object() {
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object);
+        let allowed_fields = properties.map_or_else(BTreeSet::new, |properties| {
+            properties.keys().cloned().collect()
+        });
+        let required_fields = schema_string_set(schema.get("required"), "required fields")?;
+        let reject_unknown = schema
+            .get("additionalProperties")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
+        append_field_error(
+            object,
+            &allowed_fields,
+            &required_fields,
+            role,
+            path,
+            reject_unknown,
+            field_errors,
+        );
+        if let Some(properties) = properties {
+            let mut names = properties.keys().collect::<Vec<_>>();
+            names.sort_unstable();
+            for name in names {
+                if let (Some(child_value), Some(child_schema)) =
+                    (object.get(name), properties.get(name))
+                {
+                    let child_path = format!("{path}.{name}");
+                    validate_schema_value(
+                        child_value,
+                        child_schema,
+                        root_schema,
+                        role,
+                        &child_path,
+                        field_errors,
+                    )?;
+                }
+            }
+        }
+    } else if let (Some(array), Some(item_schema)) = (
+        value.as_array(),
+        schema.get("items").filter(|items| items.is_object()),
+    ) {
+        for (index, item) in array.iter().enumerate() {
+            let item_path = format!("{path}[{index}]");
+            validate_schema_value(
+                item,
+                item_schema,
+                root_schema,
+                role,
+                &item_path,
+                field_errors,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_schema_reference<'a>(
+    schema: &'a serde_json::Value,
+    root_schema: &'a serde_json::Value,
+    role: &str,
+    path: &str,
+) -> Result<&'a serde_json::Value> {
+    let Some(reference) = schema.get("$ref").and_then(serde_json::Value::as_str) else {
+        return Ok(schema);
+    };
+    if !reference.starts_with("#/") {
+        return Err(SpecLoopError::Agent(format!(
+            "generated {role} schema has unsupported reference {reference:?} at {path}"
+        )));
+    }
+    let pointer = reference.strip_prefix('#').ok_or_else(|| {
+        SpecLoopError::Agent(format!(
+            "generated {role} schema has unsupported reference {reference:?} at {path}"
+        ))
+    })?;
+    root_schema.pointer(pointer).ok_or_else(|| {
+        SpecLoopError::Agent(format!(
+            "generated {role} schema reference {reference:?} does not resolve at {path}"
+        ))
+    })
+}
+
+fn schema_string_set(value: Option<&serde_json::Value>, field: &str) -> Result<BTreeSet<String>> {
+    let Some(value) = value else {
+        return Ok(BTreeSet::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        SpecLoopError::Agent(format!("generated response schema {field} is not an array"))
+    })?;
+    let mut strings = BTreeSet::new();
+    for value in values {
+        let value = value.as_str().ok_or_else(|| {
+            SpecLoopError::Agent(format!(
+                "generated response schema {field} contains a non-string"
+            ))
+        })?;
+        strings.insert(value.to_owned());
+    }
+    Ok(strings)
+}
+
+fn append_field_error(
+    object: &serde_json::Map<String, serde_json::Value>,
+    allowed_fields: &BTreeSet<String>,
+    required_fields: &BTreeSet<String>,
+    role: &str,
+    path: &str,
+    reject_unknown: bool,
+    field_errors: &mut Vec<String>,
+) {
+    let missing = required_fields
+        .iter()
+        .filter(|field| !object.contains_key(field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut unknown = if reject_unknown {
+        object
+            .keys()
+            .filter(|field| !allowed_fields.contains(field.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    unknown.sort_unstable();
+    let mut details = Vec::new();
+    if !missing.is_empty() {
+        details.push(format!("missing fields {missing:?}"));
+    }
+    if !unknown.is_empty() {
+        details.push(format!("unknown fields {unknown:?}"));
+    }
+    if !details.is_empty() {
+        field_errors.push(format!(
+            "{role} response object at {path}: {}",
+            details.join("; ")
+        ));
+    }
 }
 
 /// Common fields shared by all role response envelopes.
@@ -407,7 +663,6 @@ macro_rules! impl_response_fields {
 
 impl_response_fields!(
     PlanAuthorResponse => validate_readiness,
-    ImplementationResponse => validate_readiness,
     PlanReviewResponse => validate_review,
     ImplementationReviewResponse => validate_review,
     PlanAuditResponse => validate_audit,
@@ -415,6 +670,36 @@ impl_response_fields!(
     PlanClarificationResponse => validate_evidence_result,
     ImplementationClarificationResponse => validate_evidence_result,
 );
+
+impl ResponseFields for ImplementationResponse {
+    fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    fn role(&self) -> &str {
+        &self.role
+    }
+
+    fn validate_response(&self) -> Result<()> {
+        validate_readiness(&self.result)?;
+        validate_implementation_summary(&self.summary)
+    }
+}
+
+fn validate_implementation_summary(summary: &str) -> Result<()> {
+    validate_text(summary, "implementation summary")?;
+    if summary.chars().count() > MAX_IMPLEMENTATION_SUMMARY_CHARS {
+        return Err(SpecLoopError::Agent(format!(
+            "implementation summary cannot exceed {MAX_IMPLEMENTATION_SUMMARY_CHARS} characters"
+        )));
+    }
+    if summary.chars().any(char::is_control) {
+        return Err(SpecLoopError::Agent(
+            "implementation summary cannot contain control characters".to_owned(),
+        ));
+    }
+    Ok(())
+}
 
 fn validate_readiness(result: &Readiness) -> Result<()> {
     if let Readiness::Blocked { reason } = result {
@@ -620,6 +905,187 @@ mod tests {
             assert!(
                 super::parse::<PlanAuthorResponse>(response, "plan_author").is_err(),
                 "accepted invalid response: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn implementation_response_requires_brief_single_line_summary() {
+        let valid = serde_json::json!({
+            "protocol_version": 1,
+            "role": "implementation",
+            "summary": "Implemented requested changes and added regression coverage.",
+            "status": "ready_for_review"
+        })
+        .to_string();
+        assert!(super::parse::<ImplementationResponse>(&valid, "implementation").is_ok());
+
+        let blocked = serde_json::json!({
+            "protocol_version": 1,
+            "role": "implementation",
+            "summary": "No changes made; required input unavailable.",
+            "status": "blocked",
+            "reason": "required input unavailable"
+        })
+        .to_string();
+        assert!(super::parse::<ImplementationResponse>(&blocked, "implementation").is_ok());
+
+        let missing_summary =
+            r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review"}"#;
+        assert!(super::parse::<ImplementationResponse>(missing_summary, "implementation").is_err());
+
+        for summary in ["  ", "first line\nsecond line", "contains \u{1b} escape"] {
+            let response = serde_json::json!({
+                "protocol_version": 1,
+                "role": "implementation",
+                "summary": summary,
+                "status": "ready_for_review"
+            })
+            .to_string();
+            assert!(
+                super::parse::<ImplementationResponse>(&response, "implementation").is_err(),
+                "accepted invalid implementation summary: {summary:?}"
+            );
+        }
+
+        let too_long = "x".repeat(super::MAX_IMPLEMENTATION_SUMMARY_CHARS + 1);
+        let response = serde_json::json!({
+            "protocol_version": 1,
+            "role": "implementation",
+            "summary": too_long,
+            "status": "ready_for_review"
+        })
+        .to_string();
+        assert!(super::parse::<ImplementationResponse>(&response, "implementation").is_err());
+    }
+
+    #[test]
+    fn field_shape_diagnostics_are_exact_and_deterministic() {
+        let missing = serde_json::json!({
+            "protocol_version": 1,
+            "role": "implementation",
+            "status": "ready_for_review"
+        })
+        .to_string();
+        let error = super::parse::<ImplementationResponse>(&missing, "implementation")
+            .expect_err("missing summary is rejected");
+        assert_eq!(
+            error.to_string(),
+            "agent response error: implementation response object at $: missing fields [\"summary\"]"
+        );
+
+        let unknown = serde_json::json!({
+            "protocol_version": 1,
+            "role": "implementation",
+            "summary": "Implemented the requested change.",
+            "status": "ready_for_review",
+            "unexpected_z": true
+        })
+        .to_string();
+        let error = super::parse::<ImplementationResponse>(&unknown, "implementation")
+            .expect_err("unknown field is rejected");
+        assert_eq!(
+            error.to_string(),
+            "agent response error: implementation response object at $: unknown fields [\"unexpected_z\"]"
+        );
+
+        let combined = serde_json::json!({
+            "protocol_version": 1,
+            "role": "implementation",
+            "status": "ready_for_review",
+            "unexpected_z": true,
+            "unexpected_a": true
+        })
+        .to_string();
+        let error = super::parse::<ImplementationResponse>(&combined, "implementation")
+            .expect_err("missing and unknown fields are both reported");
+        assert_eq!(
+            error.to_string(),
+            "agent response error: implementation response object at $: missing fields [\"summary\"]; unknown fields [\"unexpected_a\", \"unexpected_z\"]"
+        );
+
+        let unrecognized_status = serde_json::json!({
+            "protocol_version": 1,
+            "role": "implementation",
+            "status": "future_status",
+            "unexpected": true
+        })
+        .to_string();
+        let error = super::parse::<ImplementationResponse>(&unrecognized_status, "implementation")
+            .expect_err("unrecognized status still reports conservative envelope defects");
+        assert_eq!(
+            error.to_string(),
+            "agent response error: implementation response object at $: missing fields [\"summary\"]; unknown fields [\"unexpected\"]"
+        );
+
+        let nested = serde_json::json!({
+            "protocol_version": 1,
+            "role": "review",
+            "status": "issues",
+            "findings": [{
+                "id": 1,
+                "location": "src/example.rs",
+                "evidence": "observed behavior",
+                "violation": "requirement not met",
+                "proposed_correction": "apply the required fix",
+                "unexpected_z": true,
+                "unexpected_a": true
+            }]
+        })
+        .to_string();
+        let error = super::parse::<ImplementationReviewResponse>(&nested, "review")
+            .expect_err("nested missing and unknown fields are both reported");
+        assert_eq!(
+            error.to_string(),
+            "agent response error: review response object at $.findings[0]: missing fields [\"requirement\"]; unknown fields [\"unexpected_a\", \"unexpected_z\"]"
+        );
+
+        let valid_root = serde_json::json!({
+            "protocol_version": 1,
+            "role": "implementation",
+            "summary": "Implemented the requested change.",
+            "status": "ready_for_review"
+        })
+        .to_string();
+        assert!(super::parse::<ImplementationResponse>(&valid_root, "implementation").is_ok());
+
+        let valid_nested = serde_json::json!({
+            "protocol_version": 1,
+            "role": "review",
+            "status": "issues",
+            "findings": [{
+                "id": 1,
+                "requirement": "required behavior",
+                "location": "src/example.rs",
+                "evidence": "observed behavior",
+                "violation": "requirement not met",
+                "proposed_correction": "apply the required fix"
+            }]
+        })
+        .to_string();
+        assert!(super::parse::<ImplementationReviewResponse>(&valid_nested, "review").is_ok());
+    }
+
+    #[test]
+    fn implementation_schema_requires_bounded_summary_for_each_status() {
+        let generated = serde_json::from_str::<serde_json::Value>(
+            &schema::<ImplementationResponse>().expect("generated implementation schema"),
+        )
+        .expect("parse implementation schema");
+        let branches = generated["oneOf"].as_array().expect("status branches");
+        assert_eq!(branches.len(), 2);
+        for branch in branches {
+            assert_eq!(branch["properties"]["summary"]["minLength"], 1);
+            assert_eq!(
+                branch["properties"]["summary"]["maxLength"],
+                super::MAX_IMPLEMENTATION_SUMMARY_CHARS
+            );
+            assert!(
+                branch["required"]
+                    .as_array()
+                    .expect("required fields")
+                    .iter()
+                    .any(|field| field == "summary")
             );
         }
     }

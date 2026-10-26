@@ -550,11 +550,35 @@ mod tests {
         for example in [
             include_str!("../examples/profiles/basic.toml"),
             include_str!("../examples/profiles/planned-archive.toml"),
+            include_str!("../examples/profiles/status-update.toml"),
             include_str!("../.spec-loop.toml"),
         ] {
             let profile: Profile = toml::from_str(example).expect("valid example TOML");
             assert!(profile.validate().is_ok());
         }
+
+        let status_update: Profile =
+            toml::from_str(include_str!("../examples/profiles/status-update.toml"))
+                .expect("valid status-update profile");
+        assert!(status_update.validate().is_ok());
+        assert_eq!(
+            status_update.archive.destination.as_deref(),
+            Some("specs/implemented")
+        );
+        let finish_action = status_update
+            .actions
+            .on_finish
+            .first()
+            .expect("status-update finish action");
+        assert_eq!(
+            finish_action.argv,
+            [
+                "sed",
+                "-i",
+                r"s/^\*\*Status:\*\* Active$/**Status:** Complete/",
+                "{spec_path}"
+            ]
+        );
     }
 
     #[test]
