@@ -28,3 +28,12 @@ max_passes = 0
 [archive]
 enabled = true
 destination = "specs/implemented"
+
+[[actions.on_finish]]
+name = "mark archived spec complete (GNU sed)"
+argv = [
+  "sed",
+  "-i",
+  's/^\*\*Status:\*\* Active$/**Status:** Complete/',
+  "{spec_path}",
+]

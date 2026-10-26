@@ -1,6 +1,6 @@
 # Spec 003: Visible Handoffs and Finish-Action Updates
 
-**Status:** Implemented
+**Status:** Complete
 
 ## Goal
 
