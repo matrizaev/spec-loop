@@ -1,5 +1,6 @@
 # Example completion status update. This profile assumes GNU sed (`sed -i`).
 # Create specs/implemented before running with archival enabled.
+# Final actions stage all workspace changes, then commit; configure Git identity.
 schema_version = 2
 
 [specs]
@@ -38,3 +39,11 @@ argv = [
   's/^\*\*Status:\*\* Active$/**Status:** Complete/',
   "{spec_path}",
 ]
+
+[[actions.on_finish]]
+name = "stage changes including completion status"
+argv = ["git", "add", "--all"]
+
+[[actions.on_finish]]
+name = "commit completed spec"
+argv = ["git", "commit", "-m", "Complete {spec_id}"]
