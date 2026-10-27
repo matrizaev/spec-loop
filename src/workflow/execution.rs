@@ -31,8 +31,8 @@ pub(super) fn run_plan_workflow(
     cli: &Cli,
     mut candidate: SpecCandidate,
     mut files: CandidateFiles,
+    mut completed: BTreeSet<String>,
 ) -> Result<()> {
-    let mut completed = BTreeSet::new();
     loop {
         if cli.continue_requested() && files.has_plan {
             context.integrity.verify(context.root)?;
@@ -757,58 +757,25 @@ fn run_action(
     action: &ActionConfig,
     argv: &[String],
 ) -> Result<()> {
-    let Some(program_text) = argv.first() else {
-        return Err(SpecLoopError::Config(format!(
-            "action {:?} has empty argv",
-            action.name
-        )));
-    };
-    let program = PathBuf::from(program_text);
-    let arguments = &argv[1..];
     context.output.stage(&format!(
         "Action {:?}\nCommand argv: {argv:?}\nWorking directory: {}",
         action.name,
         context.root.display()
     ))?;
-    let timeout = action.timeout_seconds.map(Duration::from_secs);
-    let outcome = commands::run_process(
-        &program,
-        arguments,
-        context.root,
-        timeout,
-        &context.cancelled,
-    );
-    let (success, status, termination, stdout, stderr) = match outcome {
-        Ok(output) => (
-            status_success(&output),
-            output
-                .status
-                .map_or_else(|| "no exit status".to_owned(), |value| value.to_string()),
-            Some(output.termination),
-            output.stdout,
-            output.stderr,
-        ),
-        Err(SpecLoopError::Interrupted) => return Err(SpecLoopError::Interrupted),
-        Err(error) => (
-            false,
-            "failed to start or monitor".to_owned(),
-            None,
-            Vec::new(),
-            error.to_string().into_bytes(),
-        ),
-    };
-    let mut log = format!(
-        "Action: {}\nCommand argv: {argv:?}\nWorking directory: {}\nStatus: {status}\n--- stdout ({} bytes) ---\n",
-        action.name,
-        context.root.display(),
-        stdout.len()
-    )
-    .into_bytes();
-    log.extend_from_slice(&stdout);
-    log.extend_from_slice(format!("\n--- stderr ({} bytes) ---\n", stderr.len()).as_bytes());
-    log.extend_from_slice(&stderr);
-    let log_name = format!("action-{:04}.log", context.next_log_index()?);
-    let log_path = context.run_dir.write_log(&log_name, &log)?;
+    let CommandReport {
+        success,
+        status,
+        termination,
+        stdout,
+        stderr,
+        log_path,
+    } = run_logged_command(
+        context,
+        "Action",
+        &action.name,
+        argv,
+        action.timeout_seconds,
+    )?;
     context.output.stdout(&format!(
         "[{}] Action {:?}: {}\n  Log: {}\n{}",
         if success { "PASS" } else { "FAIL" },
@@ -874,57 +841,18 @@ fn run_check(
         .output
         .stage(&format!("Stage: check {}", check.name))?;
     let argv = expand_argv(&check.argv, &candidate.id, &candidate.path, plan_path);
-    let Some(program_text) = argv.first() else {
-        return Err(SpecLoopError::Config(format!(
-            "check {:?} has empty argv",
-            check.name
-        )));
-    };
-    let program = PathBuf::from(program_text);
-    let arguments = &argv[1..];
     context.output.metadata(&format!(
         "Command argv: {argv:?}\nWorking directory: {}",
         context.root.display()
     ))?;
-    let timeout = check.timeout_seconds.map(Duration::from_secs);
-    let outcome = commands::run_process(
-        &program,
-        arguments,
-        context.root,
-        timeout,
-        &context.cancelled,
-    );
-    let (success, status, termination, stdout, stderr) = match outcome {
-        Ok(output) => (
-            status_success(&output),
-            output
-                .status
-                .map_or_else(|| "no exit status".to_owned(), |value| value.to_string()),
-            Some(output.termination),
-            output.stdout,
-            output.stderr,
-        ),
-        Err(SpecLoopError::Interrupted) => return Err(SpecLoopError::Interrupted),
-        Err(error) => (
-            false,
-            "failed to start or monitor".to_owned(),
-            None,
-            Vec::new(),
-            error.to_string().into_bytes(),
-        ),
-    };
-    let mut log = format!(
-        "Check: {}\nCommand argv: {argv:?}\nWorking directory: {}\nStatus: {status}\n--- stdout ({} bytes) ---\n",
-        check.name,
-        context.root.display(),
-        stdout.len()
-    )
-    .into_bytes();
-    log.extend_from_slice(&stdout);
-    log.extend_from_slice(format!("\n--- stderr ({} bytes) ---\n", stderr.len()).as_bytes());
-    log.extend_from_slice(&stderr);
-    let log_name = format!("check-{:04}.log", context.next_log_index()?);
-    let log_path = context.run_dir.write_log(&log_name, &log)?;
+    let CommandReport {
+        success,
+        status,
+        termination,
+        stdout,
+        stderr,
+        log_path,
+    } = run_logged_command(context, "Check", &check.name, &argv, check.timeout_seconds)?;
     context.output.stdout(&format!(
         "[{}] Check {}: {}\n  Log: {}\n",
         if success { "PASS" } else { "FAIL" },
@@ -951,6 +879,76 @@ fn run_check(
         display_output_excerpt(&stdout, &stderr)
     );
     Ok((success, summary, display_summary))
+}
+
+struct CommandReport {
+    success: bool,
+    status: String,
+    termination: Option<ProcessTermination>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    log_path: PathBuf,
+}
+
+fn run_logged_command(
+    context: &mut WorkflowContext<'_>,
+    kind: &str,
+    name: &str,
+    argv: &[String],
+    timeout_seconds: Option<u64>,
+) -> Result<CommandReport> {
+    let Some((program, arguments)) = argv.split_first() else {
+        return Err(SpecLoopError::Config(format!(
+            "{kind} {name:?} has empty argv"
+        )));
+    };
+    let outcome = commands::run_process(
+        Path::new(program),
+        arguments,
+        context.root,
+        timeout_seconds.map(Duration::from_secs),
+        &context.cancelled,
+    );
+    let (success, status, termination, stdout, stderr) = match outcome {
+        Ok(output) => (
+            status_success(&output),
+            output
+                .status
+                .map_or_else(|| "no exit status".to_owned(), |value| value.to_string()),
+            Some(output.termination),
+            output.stdout,
+            output.stderr,
+        ),
+        Err(SpecLoopError::Interrupted) => return Err(SpecLoopError::Interrupted),
+        Err(error) => (
+            false,
+            "failed to start or monitor".to_owned(),
+            None,
+            Vec::new(),
+            error.to_string().into_bytes(),
+        ),
+    };
+    let mut log = format!(
+        "{kind}: {name}\nCommand argv: {argv:?}\nWorking directory: {}\nStatus: {status}\n--- stdout ({} bytes) ---\n",
+        context.root.display(), stdout.len()
+    ).into_bytes();
+    log.extend_from_slice(&stdout);
+    log.extend_from_slice(format!("\n--- stderr ({} bytes) ---\n", stderr.len()).as_bytes());
+    log.extend_from_slice(&stderr);
+    let log_name = format!(
+        "{}-{:04}.log",
+        kind.to_ascii_lowercase(),
+        context.next_log_index()?
+    );
+    let log_path = context.run_dir.write_log(&log_name, &log)?;
+    Ok(CommandReport {
+        success,
+        status,
+        termination,
+        stdout,
+        stderr,
+        log_path,
+    })
 }
 
 pub(super) fn output_excerpt(stdout: &[u8], stderr: &[u8]) -> String {

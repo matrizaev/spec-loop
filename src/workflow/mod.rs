@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,11 +151,6 @@ fn run_at(
         "[RUNNING] Workflow started\nRun logs: {}\n",
         run_dir.root.display()
     ))?;
-    if cli.workflow_mode()? == WorkflowMode::Plan {
-        execution::run_plan_workflow(&mut context, cli, candidate, files)?;
-        return Ok(Some(run_dir.root.clone()));
-    }
-
     let mut completed = BTreeSet::new();
     if cli.continue_requested() {
         for prior in discovery::discover_specs(&root, &profile)? {
@@ -166,6 +160,11 @@ fn run_at(
             completed.insert(prior.id);
         }
     }
+    if cli.workflow_mode()? == WorkflowMode::Plan {
+        execution::run_plan_workflow(&mut context, cli, candidate, files, completed)?;
+        return Ok(Some(run_dir.root.clone()));
+    }
+
     let mut entry = if cli.workflow_mode()? == WorkflowMode::Review {
         ImplementationEntry::ResumeReview
     } else {
@@ -292,7 +291,7 @@ fn validate_resources(root: &Path, profile: &Profile) -> Result<()> {
     }
     backend::validate_prerequisites(profile)?;
     if profile.agent.backend == AgentBackendKind::Pi {
-        validate_executable(root, &profile.agent.executable, "agent")?;
+        paths::resolve_executable(root, &profile.agent.executable, "agent")?;
     }
     Ok(())
 }
@@ -311,7 +310,7 @@ fn validate_check_executables(
                 check.name
             )));
         };
-        validate_executable(root, Path::new(program), &format!("check {:?}", check.name))?;
+        paths::resolve_executable(root, Path::new(program), &format!("check {:?}", check.name))?;
     }
     Ok(())
 }
@@ -347,7 +346,7 @@ fn validate_action_executables(
         } else {
             expanded
         };
-        validate_executable(
+        paths::resolve_executable(
             root,
             Path::new(&executable),
             &format!("action {:?}", action.name),
@@ -381,63 +380,9 @@ fn same_path(root: &Path, left: &Path, right: &Path) -> bool {
     normalized(root, left) == normalized(root, right)
 }
 
-fn validate_executable(root: &Path, executable: &Path, field: &str) -> Result<()> {
-    let has_path_component = executable.is_absolute()
-        || executable
-            .parent()
-            .is_some_and(|parent| !parent.as_os_str().is_empty());
-    let candidates = if has_path_component {
-        vec![if executable.is_absolute() {
-            executable.to_path_buf()
-        } else {
-            root.join(executable)
-        }]
-    } else {
-        let search_path = std::env::var_os("PATH").ok_or_else(|| {
-            SpecLoopError::Config(format!(
-                "PATH is unavailable while resolving {field} executable"
-            ))
-        })?;
-        std::env::split_paths(&search_path)
-            .map(|directory| {
-                if directory.is_absolute() {
-                    directory.join(executable)
-                } else {
-                    root.join(directory).join(executable)
-                }
-            })
-            .collect()
-    };
-    if candidates.iter().any(|path| is_executable_file(path)) {
-        return Ok(());
-    }
-    Err(SpecLoopError::Config(format!(
-        "{field} executable was not found or is not executable: {}",
-        executable.display()
-    )))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 fn plan_exists(root: &Path, path: &Path) -> Result<bool> {
     let absolute = resolve_optional(root, path);
-    match fs::metadata(&absolute) {
+    match std::fs::metadata(&absolute) {
         Ok(metadata) if metadata.is_file() => Ok(true),
         Ok(_) => Err(SpecLoopError::Config(format!(
             "plan path is not a regular file: {}",
@@ -561,7 +506,7 @@ fn print_dry_run(cli: &Cli, prepared: &PreparedRun, output: &Output) -> Result<(
             ))?;
         }
     }
-    output.stdout(&format!("Maximum calls per Pi role: {} (0 means unlimited)\n[PASS] Dry run: no agents, checks, or actions invoked.\n", prepared.profile.completion.max_passes))?;
+    output.stdout(&format!("Maximum calls per role: {} (0 means unlimited)\n[PASS] Dry run: no agents, checks, or actions invoked.\n", prepared.profile.completion.max_passes))?;
     Ok(())
 }
 

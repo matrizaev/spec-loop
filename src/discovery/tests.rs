@@ -3,7 +3,7 @@ use std::fs;
 
 use tempfile::TempDir;
 
-use super::{discover_specs, select_spec, sort_key};
+use super::{collect_files, discover_specs, literal_top_level_roots, select_spec, sort_key};
 use crate::config::{OrderingPolicy, Profile};
 
 fn profile() -> Profile {
@@ -70,6 +70,39 @@ fn request_and_continue_selection_obey_profile_ordering() {
         Some("002".to_owned())
     );
     assert!(select_spec(temporary.path(), &profile(), Some("002"), &BTreeSet::new()).is_err());
+}
+
+#[test]
+fn traversal_prunes_unrelated_directories_but_keeps_wildcard_roots() {
+    let temporary = TempDir::new().expect("temporary project");
+    for directory in ["specs", "other"] {
+        fs::create_dir(temporary.path().join(directory)).expect("create directory");
+        fs::write(temporary.path().join(directory).join("001.md"), "spec").expect("write spec");
+    }
+    let mut paths = Vec::new();
+    collect_files(
+        temporary.path(),
+        temporary.path(),
+        &mut paths,
+        Some(&["specs"]),
+    )
+    .expect("collect pruned files");
+    assert_eq!(paths, [temporary.path().join("specs/001.md")]);
+    paths.clear();
+    collect_files(temporary.path(), temporary.path(), &mut paths, None).expect("collect all files");
+    assert_eq!(paths.len(), 2);
+}
+
+#[test]
+fn traversal_pruning_is_conservative_for_glob_syntax() {
+    let patterns = vec!["specs/*.md".to_owned(), "other/**/*.md".to_owned()];
+    assert_eq!(
+        literal_top_level_roots(&patterns),
+        Some(vec!["specs", "other"])
+    );
+    for pattern in ["*.md", "*/spec.md", "{specs,other}/*.md", "spec\\s/*.md"] {
+        assert_eq!(literal_top_level_roots(&[pattern.to_owned()]), None);
+    }
 }
 
 #[test]

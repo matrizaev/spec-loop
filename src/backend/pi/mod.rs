@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +11,7 @@ use crate::commands::{ProcessTermination, run_process, status_success};
 use crate::config::{AgentConfig, AgentStage, Profile};
 use crate::error::{Result, SpecLoopError, io_error};
 use crate::output::Output;
+use crate::paths;
 use crate::prompts::PromptRole;
 
 #[cfg(test)]
@@ -61,7 +61,9 @@ fn run_agent(
     let args = arguments(&profile.agent, role, prompt);
     let timeout = profile.agent.timeout_seconds.map(Duration::from_secs);
     let cwd = PathBuf::from(root);
-    let executable = resolve_executable(root, &profile.agent.executable)?;
+    let executable = paths::resolve_executable(root, &profile.agent.executable, "agent")?;
+    let executable = fs::canonicalize(&executable)
+        .map_err(|source| io_error("resolve agent executable", &executable, source))?;
     let mut command_argv = vec![executable.display().to_string()];
     command_argv.extend(display_arguments(&args).into_iter().map(str::to_owned));
     output_formatter.stdout(&format!(
@@ -107,59 +109,6 @@ fn display_arguments(args: &[String]) -> Vec<&str> {
             }
         })
         .collect()
-}
-
-fn resolve_executable(root: &Path, executable: &Path) -> Result<PathBuf> {
-    let has_path_component = executable.is_absolute()
-        || executable
-            .parent()
-            .is_some_and(|parent| !parent.as_os_str().is_empty());
-    let candidates = if executable.is_absolute() {
-        vec![executable.to_path_buf()]
-    } else if has_path_component {
-        vec![root.join(executable)]
-    } else {
-        let search_path = env::var_os("PATH").ok_or_else(|| {
-            SpecLoopError::Config("PATH is unavailable while resolving agent executable".to_owned())
-        })?;
-        env::split_paths(&search_path)
-            .map(|directory| {
-                if directory.is_absolute() {
-                    directory.join(executable)
-                } else {
-                    root.join(directory).join(executable)
-                }
-            })
-            .collect()
-    };
-    for candidate in candidates {
-        if is_executable_file(&candidate) {
-            return fs::canonicalize(&candidate)
-                .map_err(|source| io_error("resolve agent executable", &candidate, source));
-        }
-    }
-    Err(SpecLoopError::Config(format!(
-        "agent executable was not found or is not executable: {}",
-        executable.display()
-    )))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 fn arguments(agent: &AgentConfig, role: PromptRole, prompt: &str) -> Vec<String> {

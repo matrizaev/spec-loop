@@ -9,6 +9,62 @@ const SPEC_ID_PLACEHOLDER: &str = "{spec_id}";
 const SPEC_PATH_PLACEHOLDER: &str = "{spec_path}";
 const PLAN_PATH_PLACEHOLDER: &str = "{plan_path}";
 
+pub fn resolve_executable(root: &Path, executable: &Path, field: &str) -> Result<PathBuf> {
+    let has_path_component = executable.is_absolute()
+        || executable
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty());
+    let candidates = if has_path_component {
+        vec![if executable.is_absolute() {
+            executable.to_path_buf()
+        } else {
+            root.join(executable)
+        }]
+    } else {
+        let search_path = std::env::var_os("PATH").ok_or_else(|| {
+            SpecLoopError::Config(format!(
+                "PATH is unavailable while resolving {field} executable"
+            ))
+        })?;
+        std::env::split_paths(&search_path)
+            .map(|directory| {
+                if directory.is_absolute() {
+                    directory.join(executable)
+                } else {
+                    root.join(directory).join(executable)
+                }
+            })
+            .collect()
+    };
+    candidates
+        .into_iter()
+        .find(|path| is_executable_file(path))
+        .ok_or_else(|| {
+            SpecLoopError::Config(format!(
+                "{field} executable was not found or is not executable: {}",
+                executable.display()
+            ))
+        })
+}
+
+pub fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 pub fn resolve_existing(root: &Path, relative: &Path, field: &str) -> Result<PathBuf> {
     let path = root.join(relative);
     fs::metadata(&path).map_err(|source| {

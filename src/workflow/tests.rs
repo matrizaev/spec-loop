@@ -8,12 +8,13 @@ use tempfile::TempDir;
 
 use super::execution::{display_output_excerpt, output_excerpt};
 use super::{
-    CandidateFiles, ImplementationEntry, archive_destination, is_executable_file, run_at,
-    validate_action_executables, validate_check_executables,
+    CandidateFiles, ImplementationEntry, archive_destination, run_at, validate_action_executables,
+    validate_check_executables,
 };
 use crate::backend::{AgentBackend, AgentResponse, AgentRun, BackendContinuation, BackendFailure};
 use crate::config::Profile;
 use crate::error::{Result, SpecLoopError};
+use crate::paths::is_executable_file;
 use crate::prompts::PromptRole;
 
 struct FakeBuiltinBackend {

@@ -65,7 +65,8 @@ pub fn discover_specs(root: &Path, profile: &Profile) -> Result<Vec<SpecCandidat
     let id_regex = Regex::new(&profile.specs.id_regex)
         .map_err(|error| SpecLoopError::Config(format!("specs.id_regex: {error}")))?;
     let mut paths = Vec::new();
-    collect_files(root, root, &mut paths)?;
+    let roots = literal_top_level_roots(&profile.specs.active_globs);
+    collect_files(root, root, &mut paths, roots.as_deref())?;
     let mut by_id: BTreeMap<String, SpecCandidate> = BTreeMap::new();
     for absolute in paths {
         let relative = absolute.strip_prefix(root).map_err(|_| {
@@ -108,7 +109,32 @@ pub fn discover_specs(root: &Path, profile: &Profile) -> Result<Vec<SpecCandidat
     Ok(candidates)
 }
 
-fn collect_files(root: &Path, directory: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+// Only prune when every pattern has a literal first directory component. Patterns
+// with escapes or glob syntax there must retain the full filesystem walk.
+fn literal_top_level_roots(patterns: &[String]) -> Option<Vec<&str>> {
+    patterns
+        .iter()
+        .map(|pattern| {
+            let (first, _) = pattern.split_once('/')?;
+            if first.is_empty()
+                || first
+                    .chars()
+                    .any(|character| "*?[]{}\\".contains(character))
+            {
+                None
+            } else {
+                Some(first)
+            }
+        })
+        .collect()
+}
+
+fn collect_files(
+    root: &Path,
+    directory: &Path,
+    paths: &mut Vec<PathBuf>,
+    roots: Option<&[&str]>,
+) -> Result<()> {
     let entries = fs::read_dir(directory)
         .map_err(|source| io_error("read project directory", directory, source))?;
     for entry in entries {
@@ -119,7 +145,12 @@ fn collect_files(root: &Path, directory: &Path, paths: &mut Vec<PathBuf>) -> Res
             .file_type()
             .map_err(|source| io_error("inspect project directory entry", &path, source))?;
         if file_type.is_dir() {
-            collect_files(root, &path, paths)?;
+            if directory == root
+                && roots.is_some_and(|roots| !roots.iter().any(|name| entry.file_name() == *name))
+            {
+                continue;
+            }
+            collect_files(root, &path, paths, roots)?;
         } else if file_type.is_file() || file_type.is_symlink() {
             if path.strip_prefix(root).is_err() {
                 return Err(SpecLoopError::Workflow(format!(

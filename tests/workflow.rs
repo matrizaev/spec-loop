@@ -499,6 +499,7 @@ fn dry_run_reports_actions_without_invoking_agents_or_commands() {
     assert!(stdout.contains("Action on_review_success"));
     assert!(stdout.contains("Action on_finish"));
     assert!(stdout.contains("archive/001.md"));
+    assert!(stdout.contains("Maximum calls per role: 2"));
     assert!(!fixture.agent_events.exists());
     assert!(!fixture.events.exists());
     assert!(!fixture.root.join("generated.txt").exists());
@@ -1395,6 +1396,23 @@ fn lifecycle_action_failure_preserves_archive_and_skips_later_actions() {
     let events = fs::read_to_string(&fixture.events).expect("action events");
     assert!(events.contains("review-success|"));
     assert!(!events.contains("finish|"));
+}
+
+#[test]
+fn plan_continue_does_not_process_specs_before_requested_spec() {
+    let fixture = Fixture::new(false, true);
+    let profile_path = fixture.root.join(".spec-loop.toml");
+    let profile = fs::read_to_string(&profile_path).expect("read profile");
+    fs::write(
+        &profile_path,
+        profile.replace("selection = \"next\"", "selection = \"any\""),
+    )
+    .expect("allow selecting later specs");
+    let output = fixture.run(&["--plan", "--spec", "002", "--continue"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Skipping spec 002"));
+    assert!(!stdout.contains("Skipping spec 001"));
 }
 
 #[test]
