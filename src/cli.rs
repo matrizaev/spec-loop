@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
+use crate::output::ColorMode;
+
 /// Command-line options for the generic specification workflow.
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -7,7 +9,7 @@ use clap::{Args, Parser, Subcommand};
     version,
     about = "Implement repository specs through a guarded agent loop",
     long_about = "Run the workflow from the current directory, which must contain `.spec-loop.toml`. Specs are discovered from configured filesystem globs; Git is not required. Schema v3 defaults to the built-in OpenAI Responses backend, which requires `agent.model` and `spec-loop auth login`; it uses ChatGPT OAuth and one automatic POSIX shell tool. Set `agent.backend = \"pi\"` to use Pi and preserve its effective resources. Repository instructions and selected specification remain authoritative.",
-    after_help = "Generic role retries and process timeouts are unlimited by default; `completion.max_passes` configures the generic role retry cap, while built-in provider retries are limited to three per request. Built-in shell runs automatically with same-user permissions and is not sandboxed; commands may access or transmit available credentials and secrets. Checks and lifecycle actions use argv arrays, never a shell. Review-context commands run through selected-backend tools; default is `git diff`. Run logs remain outside the project directory and may contain sensitive shell output."
+    after_help = "Workflow role results are readable validated summaries: implementation shows status and summary; plan author shows readiness; reviews show findings; audits show classifications; clarifications show citations. Text previews are limited to 160 Unicode scalar values. `--verbose` shows every validated typed field without truncation, never raw JSON or provider transcripts.\n\n`--color <auto|always|never>` defaults to `auto` and styles stdout and stderr independently only when each stream is a terminal, `TERM` is not `dumb`, and `NO_COLOR` is absent or empty. `always` forces styling; `never` disables it. Explicit status labels remain without color. Both options apply only to workflow invocations, not auth.\n\nGeneric role retries and process timeouts are unlimited by default; `completion.max_passes` configures the generic role retry cap, while built-in provider retries are limited to three per request. Built-in shell runs automatically with same-user permissions and is not sandboxed; commands may access or transmit available credentials and secrets. Checks and lifecycle actions use argv arrays, never a shell. Review-context commands run through selected-backend tools; default is `git diff`. Run logs remain outside the project directory and may contain sensitive shell output."
 )]
 pub struct Cli {
     /// Run profile-independent authentication commands.
@@ -26,6 +28,14 @@ pub struct Cli {
 
     #[command(flatten)]
     completion: CompletionOptions,
+
+    /// Show every validated typed role-result field, without truncation or raw JSON.
+    #[arg(long)]
+    verbose: bool,
+
+    /// Control workflow terminal styling (default: auto).
+    #[arg(long, value_enum, value_name = "WHEN")]
+    color: Option<ColorMode>,
 }
 
 #[derive(Args, Clone, Debug, Default)]
@@ -96,6 +106,15 @@ impl Cli {
         Ok(())
     }
 
+    pub fn validate_auth_options(&self) -> crate::error::Result<()> {
+        if self.verbose || self.color.is_some() {
+            return Err(crate::error::SpecLoopError::Config(
+                "--verbose and --color apply to workflow invocations, not auth".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub const fn is_review(&self) -> bool {
         self.mode.review
     }
@@ -110,5 +129,40 @@ impl Cli {
 
     pub const fn continue_requested(&self) -> bool {
         self.completion.continue_run
+    }
+
+    pub const fn verbose(&self) -> bool {
+        self.verbose
+    }
+
+    pub const fn color_mode(&self) -> ColorMode {
+        match self.color {
+            Some(mode) => mode,
+            None => ColorMode::Auto,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+    use crate::output::ColorMode;
+
+    #[test]
+    fn workflow_output_options_parse_and_are_rejected_for_auth() {
+        let workflow = Cli::try_parse_from(["spec-loop", "--verbose", "--color", "always"])
+            .expect("workflow options parse");
+        assert!(workflow.verbose());
+        assert_eq!(workflow.color_mode(), ColorMode::Always);
+
+        let auth = Cli::try_parse_from(["spec-loop", "--color", "auto", "auth", "status"])
+            .expect("auth with workflow option parses for explicit rejection");
+        assert!(auth.validate_auth_options().is_err());
+        let auth_verbose = Cli::try_parse_from(["spec-loop", "--verbose", "auth", "status"])
+            .expect("auth with verbose parses for explicit rejection");
+        assert!(auth_verbose.validate_auth_options().is_err());
+        assert!(Cli::try_parse_from(["spec-loop", "--color", "rainbow"]).is_err());
     }
 }

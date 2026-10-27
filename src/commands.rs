@@ -1,5 +1,5 @@
 use std::ffi::{OsStr, OsString};
-use std::io::{Read, Write};
+use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -57,15 +57,6 @@ struct ReaderWait<'a> {
     started: Instant,
     cancelled: &'a Arc<AtomicBool>,
     termination: &'a mut ProcessTermination,
-}
-
-/// Writes and flushes progress before a potentially long-running stage.
-pub fn report_progress(message: &str) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    writeln!(stdout, "{message}")
-        .and_then(|()| stdout.flush())
-        .map_err(|source| io_error("write workflow progress", "<stdout>", source))
 }
 
 pub fn run_process(

@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::config::{AgentBackendKind, Profile};
 use crate::error::{Result, SpecLoopError};
+use crate::output::Output;
 use crate::prompts::PromptRole;
 
 mod builtin;
@@ -110,6 +111,14 @@ pub struct AgentRun {
     pub stderr: Vec<u8>,
 }
 
+/// Invocation settings that carry backend continuation and formatter-only presentation.
+pub struct AgentInvocation<'a> {
+    /// Backend-owned correction state, if the previous response needs repair.
+    pub continuation: Option<BackendContinuation>,
+    /// Workflow formatter used only for terminal diagnostics.
+    pub output: &'a Output,
+}
+
 /// Backend contract consumed by workflow policy without backend-specific parsing.
 pub trait AgentBackend {
     /// Invoke one role-specific agent and return raw logs plus a validated response.
@@ -131,9 +140,9 @@ pub trait AgentBackend {
         prompt: &str,
         role: PromptRole,
         cancelled: &Arc<AtomicBool>,
-        continuation: Option<BackendContinuation>,
+        invocation: AgentInvocation<'_>,
     ) -> Result<AgentRun> {
-        if continuation.is_some() {
+        if invocation.continuation.is_some() {
             return Err(SpecLoopError::Workflow(
                 "selected backend cannot resume a typed-response correction".to_owned(),
             ));

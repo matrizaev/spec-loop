@@ -42,7 +42,7 @@ Pi owns its effective tools, extensions, MCP servers, skills, project trust, con
 ## Usage
 
 ```text
-spec-loop [--spec ID] [--review] [--plan] [--dry-run] [--continue]
+spec-loop [--spec ID] [--review] [--plan] [--dry-run] [--continue] [--verbose] [--color <auto|always|never>]
 ```
 
 - `--spec ID` selects an eligible active specification. Required with `--review` and `--plan`.
@@ -51,10 +51,22 @@ spec-loop [--spec ID] [--review] [--plan] [--dry-run] [--continue]
 - Normal mode requires existing plan at `[plan].path_template` (default `.spec-loop/plans/{spec_id}.md`).
 - `--continue` advances to later eligible specs after successful review and lifecycle actions. No commit authorization is required.
 - `--dry-run` prints resolved spec, plan, checks, review-context argv, and expanded actions without invoking agents or commands.
+- `--verbose` prints every field of each successfully validated typed role result; it does not print raw JSON or provider transcripts.
+- `--color auto|always|never` controls workflow styling and does not affect authentication commands. The default `auto` mode styles stdout and stderr independently only when that stream is a terminal, `TERM` is not `dumb`, and `NO_COLOR` is absent or empty. `always` forces Spec Loop styling; `never` disables it. Explicit status labels remain in all modes.
 - `--commit` is not supported. Configure stage/commit behavior explicitly under `[actions]` if desired.
 - `completion.max_passes = 0` means unlimited generic role calls. Built-in provider retries are separately capped at three retries per request; agent, check, and action timeouts are optional unless configured.
 
 Completed specs remain active if archival is disabled. A later invocation can select them again; repository owners control eligibility through active globs and archive transitions.
+
+### Terminal output
+
+Workflow role results use readable, deterministic summaries instead of compact response JSON. The concise view identifies each role and status: implementation shows its summary (and a blocked reason when blocked); plan author shows readiness or its blocked reason; reviews show finding count and each finding's ID, location, requirement, and violation; audits show finding ID, classification, and actionability; clarifications show finding IDs, citation counts, and citation paths/locations. Empty review and citation collections say `No findings` or `No citations`. Free-text previews are limited to 160 Unicode scalar values and append `… [truncated; use --verbose]` when shortened.
+
+Use `--verbose` for all substantive fields from validated typed results, including review evidence and proposed corrections, audit rationale, and clarification excerpts and relevance. This is still structured human-readable output, not raw JSON or provider transcripts. Invalid responses are not presented as results; diagnostics identify the validation retry and exact retained final-response log path.
+
+Workflow headings and outcomes use explicit labels such as `[RUNNING]`, `[PASS]`, `[BLOCKED]`, `[RETRY]`, `[WARN]`, `[FAIL]`, and `[ERROR]`. Styling uses a consistent semantic palette: cyan stages, green pass, yellow blocked/retry/warning, red failure/error, and dim secondary metadata. `--color auto` (the default) detects stdout and stderr separately and styles a stream only if it is a terminal, `TERM` is not `dumb`, and `NO_COLOR` is unset or empty. `--color always` forces styling; `--color never` disables it. Redirected output in auto mode is plain text, and labels always communicate status without color. These workflow options do not change authentication command output.
+
+Displayed agent-supplied text and child-output excerpts have terminal-control sequences stripped; line feeds and tabs remain readable and other control characters are visibly escaped. Child output captured and retained in logs, provider transcripts, and raw final-response files are not rewritten by terminal formatting.
 
 ## Profile schema v3
 
@@ -69,6 +81,8 @@ Version 1 and 2 profiles require manual migration to `schema_version = 3`; no au
 Built-in authentication uses the official OpenAI Sign in with ChatGPT flow for eligible ChatGPT-plan use and is intended for the Responses API. It does not accept API keys, use `OPENAI_API_KEY`, or fall back to API-key billing or another provider. Login requires `chatgpt.tokens.use.direct`; missing permission stops authorization. Subscription access and usage limits are provider-controlled; ChatGPT authorization does not promise unlimited usage.
 
 Run `spec-loop auth login`, then configure a profile with non-empty global `agent.model` (stage-specific model settings override it). Login attempts to open authorization URL and always prints it for manual use. Flow requires reachable localhost callback; remote/SSH users must arrange loopback reachability, for example port forwarding. No device-code fallback exists. With multiple saved registrations, use `auth login --account REGISTRATION_ID` to reauthorize one, or `--new-account` to create distinct registration. `auth status` does not display tokens. `auth logout [--account REGISTRATION_ID]` removes only Spec Loop's local credentials; it does not revoke upstream grant.
+
+Before each new built-in Responses request, Spec Loop checks stored access-token expiry and refreshes it when five minutes or less remain, saving any rotated refresh token. So an overnight pause alone should not require login. A rejected or revoked refresh token, or lost direct-use permission, still requires `spec-loop auth login`. Refresh happens between model requests, not per streamed event; existing 401/403 responses remain fatal without replay.
 
 OAuth credentials must stay outside the worktree and run logs, in an operating-system credential store where available or an owner-only platform credential file otherwise. The file fallback is plaintext at rest, not encrypted by Spec Loop. Expected fallback paths are `$XDG_CONFIG_HOME/spec-loop/auth.json` (or `$HOME/.config/spec-loop/auth.json`) on Linux, `~/Library/Application Support/Spec Loop/auth.json` on macOS, and `%APPDATA%\Spec Loop\auth.json` on Windows. File permissions must be restricted where supported.
 

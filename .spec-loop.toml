@@ -19,8 +19,9 @@ name = "make check"
 argv = ["make", "check"]
 
 [agent]
-backend = "pi"
-executable = "pi"
+backend = "builtin"
+model = "gpt-6-luna"
+thinking = "xhigh"
 
 [completion]
 max_passes = 0

@@ -50,9 +50,16 @@ impl AgentBackend for BuiltinBackend {
         prompt: &str,
         role: PromptRole,
         cancelled: &Arc<AtomicBool>,
-        continuation: Option<BackendContinuation>,
+        invocation: super::AgentInvocation<'_>,
     ) -> Result<AgentRun> {
-        Self::run_continued(root, profile, prompt, role, cancelled, continuation)
+        Self::run_continued(
+            root,
+            profile,
+            prompt,
+            role,
+            cancelled,
+            invocation.continuation,
+        )
     }
 }
 
@@ -72,7 +79,7 @@ impl BuiltinBackend {
         let mut transcript = Vec::new();
         let mut completed_conversation = None;
         let response = runtime::block_on(run_role_with_auth(
-            auth::active_access_token(false, cancelled),
+            || auth::active_access_token(false, cancelled),
             RoleTask {
                 root,
                 profile,
@@ -128,15 +135,16 @@ struct RoleTask<'a> {
     endpoint: &'a str,
 }
 
-async fn run_role_with_auth<F>(
-    token_future: F,
+async fn run_role_with_auth<F, Fut>(
+    token_provider: F,
     task: RoleTask<'_>,
     continuation: Option<BuiltinConversation>,
     completed_conversation: &mut Option<BuiltinConversation>,
     transcript: &mut Vec<u8>,
 ) -> Result<AgentResponse>
 where
-    F: Future<Output = Result<String>>,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<String>>,
 {
     let RoleTask {
         root,
@@ -147,9 +155,8 @@ where
         deadline,
         endpoint,
     } = task;
-    run_after_shell_preflight(Path::new("/bin/sh"), cfg!(unix), || async {
-        let token = await_limited(token_future, deadline, cancelled).await??;
-        run_role_with_continuation(
+    run_after_shell_preflight(Path::new("/bin/sh"), cfg!(unix), || async move {
+        run_role_with_token_provider(
             RoleInput {
                 root,
                 profile,
@@ -158,9 +165,11 @@ where
                 cancelled,
                 deadline,
                 endpoint,
-                token: &token,
+                #[cfg(test)]
+                token: "",
             },
             continuation,
+            token_provider,
             completed_conversation,
             transcript,
         )
@@ -223,6 +232,7 @@ struct RoleInput<'a> {
     cancelled: &'a Arc<AtomicBool>,
     deadline: Option<Instant>,
     endpoint: &'a str,
+    #[cfg(test)]
     token: &'a str,
 }
 
@@ -234,12 +244,38 @@ async fn run_role_with_access_token(
     run_role_with_continuation(input, None, &mut None, transcript).await
 }
 
+#[cfg(test)]
 async fn run_role_with_continuation(
     input: RoleInput<'_>,
     continuation: Option<BuiltinConversation>,
     completed_conversation: &mut Option<BuiltinConversation>,
     transcript: &mut Vec<u8>,
 ) -> Result<AgentResponse> {
+    let token = input.token.to_owned();
+    run_role_with_token_provider(
+        input,
+        continuation,
+        move || {
+            let token = token.clone();
+            async move { Ok(token) }
+        },
+        completed_conversation,
+        transcript,
+    )
+    .await
+}
+
+async fn run_role_with_token_provider<F, Fut>(
+    input: RoleInput<'_>,
+    continuation: Option<BuiltinConversation>,
+    mut token_provider: F,
+    completed_conversation: &mut Option<BuiltinConversation>,
+    transcript: &mut Vec<u8>,
+) -> Result<AgentResponse>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<String>>,
+{
     let correction_only = continuation.is_some();
     let RoleInput {
         root,
@@ -249,7 +285,7 @@ async fn run_role_with_continuation(
         cancelled,
         deadline,
         endpoint,
-        token,
+        ..
     } = input;
     let model = profile
         .agent
@@ -287,8 +323,9 @@ async fn run_role_with_continuation(
         if let Some(thinking) = profile.agent.thinking_for(stage_for_role(role)) {
             request["reasoning"] = json!({"effort": thinking.provider_values().1});
         }
+        let token = await_limited(token_provider(), deadline, cancelled).await??;
         let response =
-            request_with_retries(&client, endpoint, token, &request, deadline, cancelled).await?;
+            request_with_retries(&client, endpoint, &token, &request, deadline, cancelled).await?;
         let output = completed_output(&response)?;
         let (calls, final_text) = parse_output_items(&output)?;
         if calls.is_empty() {
@@ -1295,7 +1332,7 @@ model='fixture-model'
         let mut transcript = Vec::new();
         let endpoint = format!("http://{address}/v1/responses");
         let result = crate::runtime::block_on(run_role_with_auth(
-            crate::auth::active_access_token_at(&credential_path, false, cancelled.as_ref()),
+            || crate::auth::active_access_token_at(&credential_path, false, cancelled.as_ref()),
             RoleTask {
                 root: temporary.path(),
                 profile: &profile,
@@ -1900,6 +1937,202 @@ max_tool_calls=1
 
         let request = server.join().expect("join provider fixture");
         assert!(request.starts_with("POST /v1/responses "));
+    }
+
+    fn token_refresh_responses() -> [String; 2] {
+        let tool_response = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call-once",
+                    "name": "spec_loop.shell",
+                    "arguments": serde_json::to_string(&json!({
+                        "command": "printf x >> shell-invocations"
+                    }))
+                    .expect("serialize shell command")
+                }]
+            }
+        });
+        let final_response = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "model": "fixture-model",
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "final after fresh token"
+                    }]
+                }]
+            }
+        });
+        [
+            completed_sse(&tool_response),
+            completed_sse(&final_response),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_access_token_again_after_shell_tool_before_followup_request() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+        let address = listener.local_addr().expect("provider fixture address");
+        let temporary = TempDir::new().expect("create built-in project root");
+        let bodies = token_refresh_responses();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept provider request");
+                requests.push(read_http_request(&mut stream));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write provider response");
+            }
+            requests
+        });
+        let profile = builtin_test_profile();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let mut completed_conversation = None;
+        let mut transcript = Vec::new();
+        let endpoint = format!("http://{address}/v1/responses");
+        let result = crate::runtime::block_on(run_role_with_auth(
+            move || {
+                let call = observed_calls.fetch_add(1, Ordering::Relaxed);
+                async move { Ok(format!("fixture-access-token-{call}")) }
+            },
+            RoleTask {
+                root: temporary.path(),
+                profile: &profile,
+                prompt: "request a command, then finish",
+                role: PromptRole::Implementation,
+                cancelled: &cancelled,
+                deadline: None,
+                endpoint: &endpoint,
+            },
+            None,
+            &mut completed_conversation,
+            &mut transcript,
+        ))
+        .expect("construct runtime")
+        .expect("run role with refreshed request credentials");
+
+        assert_eq!(result.response, "final after fresh token");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            std::fs::read_to_string(temporary.path().join("shell-invocations"))
+                .expect("read completed shell effect"),
+            "x"
+        );
+        let requests = server.join().expect("join provider fixture");
+        assert_eq!(requests.len(), 2);
+        let authorization = requests
+            .iter()
+            .map(|request| {
+                request
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then_some(value.trim())
+                    })
+                    .expect("authorization header")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            authorization,
+            [
+                "Bearer fixture-access-token-0",
+                "Bearer fixture-access-token-1"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_refresh_failure_preserves_completed_shell_effect_without_replay() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+        let address = listener.local_addr().expect("provider fixture address");
+        let temporary = TempDir::new().expect("create built-in project root");
+        let first_body = token_refresh_responses()
+            .into_iter()
+            .next()
+            .expect("tool response body");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            let request = read_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first_body}",
+                first_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write tool response");
+            request
+        });
+        let profile = builtin_test_profile();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = Arc::clone(&calls);
+        let mut completed_conversation = None;
+        let mut transcript = Vec::new();
+        let endpoint = format!("http://{address}/v1/responses");
+        let result = crate::runtime::block_on(run_role_with_auth(
+            move || {
+                let call = observed_calls.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    if call == 0 {
+                        Ok("fixture-access-token".to_owned())
+                    } else {
+                        Err(crate::error::SpecLoopError::Workflow(
+                            "fixture refresh failure".to_owned(),
+                        ))
+                    }
+                }
+            },
+            RoleTask {
+                root: temporary.path(),
+                profile: &profile,
+                prompt: "request a command, then finish",
+                role: PromptRole::Implementation,
+                cancelled: &cancelled,
+                deadline: None,
+                endpoint: &endpoint,
+            },
+            None,
+            &mut completed_conversation,
+            &mut transcript,
+        ))
+        .expect("construct runtime");
+
+        let error = result.expect_err("follow-up credential refresh must stop role");
+        assert!(error.to_string().contains("fixture refresh failure"));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            std::fs::read_to_string(temporary.path().join("shell-invocations"))
+                .expect("read completed shell effect"),
+            "x"
+        );
+        assert!(
+            server
+                .join()
+                .expect("join provider fixture")
+                .starts_with("POST /v1/responses ")
+        );
     }
 
     #[cfg(unix)]
@@ -2999,7 +3232,7 @@ model='fixture-model'
             let mut transcript = Vec::new();
             let endpoint = format!("http://{address}/v1/responses");
             let result = crate::runtime::block_on(run_role_with_auth(
-                async { Ok("fixture-access-token".to_owned()) },
+                || async { Ok("fixture-access-token".to_owned()) },
                 RoleTask {
                     root: temporary.path(),
                     profile: &profile,

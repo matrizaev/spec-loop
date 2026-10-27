@@ -7,10 +7,11 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{AgentBackend, AgentResponse, AgentRun, BackendFailure};
+use super::{AgentBackend, AgentInvocation, AgentResponse, AgentRun, BackendFailure};
 use crate::commands::{ProcessTermination, run_process, status_success};
 use crate::config::{AgentConfig, AgentStage, Profile};
 use crate::error::{Result, SpecLoopError, io_error};
+use crate::output::Output;
 use crate::prompts::PromptRole;
 
 /// Pi's machine-readable subprocess backend.
@@ -25,41 +26,69 @@ impl AgentBackend for PiBackend {
         role: PromptRole,
         cancelled: &Arc<AtomicBool>,
     ) -> Result<AgentRun> {
-        let args = arguments(&profile.agent, role, prompt);
-        let timeout = profile.agent.timeout_seconds.map(Duration::from_secs);
-        let cwd = PathBuf::from(root);
-        let executable = resolve_executable(root, &profile.agent.executable)?;
-        let mut command_argv = vec![executable.display().to_string()];
-        command_argv.extend(display_arguments(&args).into_iter().map(str::to_owned));
-        crate::commands::report_progress(&format!(
-            "Command argv: {command_argv:?}\nWorking directory: {}",
-            cwd.display()
-        ))?;
-        let output = run_process(&executable, &args, &cwd, timeout, cancelled)?;
-        let outcome = if output.termination == ProcessTermination::Interrupted {
-            Err(SpecLoopError::Interrupted)
-        } else if output.termination == ProcessTermination::TimedOut {
-            Err(SpecLoopError::Timeout(
-                "Pi agent call exceeded configured timeout".to_owned(),
-            ))
-        } else if !status_success(&output) {
-            let status = output
-                .status
-                .map_or_else(|| "unknown status".to_owned(), |status| status.to_string());
-            Err(SpecLoopError::Agent(format!(
-                "Pi exited with {status}; stderr: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )))
-        } else {
-            parse_jsonl(&output.stdout)
-        };
-        Ok(AgentRun {
-            outcome: outcome.map_err(BackendFailure::retryable),
-            continuation: None,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        run_agent(root, profile, prompt, role, cancelled, &Output::plain())
     }
+
+    fn run_with_continuation(
+        &self,
+        root: &Path,
+        profile: &Profile,
+        prompt: &str,
+        role: PromptRole,
+        cancelled: &Arc<AtomicBool>,
+        invocation: AgentInvocation<'_>,
+    ) -> Result<AgentRun> {
+        if invocation.continuation.is_some() {
+            return Err(SpecLoopError::Workflow(
+                "Pi backend cannot resume a typed-response correction".to_owned(),
+            ));
+        }
+        run_agent(root, profile, prompt, role, cancelled, invocation.output)
+    }
+}
+
+fn run_agent(
+    root: &Path,
+    profile: &Profile,
+    prompt: &str,
+    role: PromptRole,
+    cancelled: &Arc<AtomicBool>,
+    output_formatter: &Output,
+) -> Result<AgentRun> {
+    let args = arguments(&profile.agent, role, prompt);
+    let timeout = profile.agent.timeout_seconds.map(Duration::from_secs);
+    let cwd = PathBuf::from(root);
+    let executable = resolve_executable(root, &profile.agent.executable)?;
+    let mut command_argv = vec![executable.display().to_string()];
+    command_argv.extend(display_arguments(&args).into_iter().map(str::to_owned));
+    output_formatter.stdout(&format!(
+        "  Pi command argv: {command_argv:?}\n  Working directory: {}\n",
+        cwd.display()
+    ))?;
+    let output = run_process(&executable, &args, &cwd, timeout, cancelled)?;
+    let outcome = if output.termination == ProcessTermination::Interrupted {
+        Err(SpecLoopError::Interrupted)
+    } else if output.termination == ProcessTermination::TimedOut {
+        Err(SpecLoopError::Timeout(
+            "Pi agent call exceeded configured timeout".to_owned(),
+        ))
+    } else if !status_success(&output) {
+        let status = output
+            .status
+            .map_or_else(|| "unknown status".to_owned(), |status| status.to_string());
+        Err(SpecLoopError::Agent(format!(
+            "Pi exited with {status}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    } else {
+        parse_jsonl(&output.stdout)
+    };
+    Ok(AgentRun {
+        outcome: outcome.map_err(BackendFailure::retryable),
+        continuation: None,
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
 }
 
 fn display_arguments(args: &[String]) -> Vec<&str> {

@@ -15,6 +15,7 @@ use crate::config::{ActionConfig, AgentBackendKind, CheckConfig, Profile};
 use crate::discovery::{self, SpecCandidate};
 use crate::error::{Result, SpecLoopError, io_error};
 use crate::integrity::InputIntegrity;
+use crate::output::{Output, TypedResult};
 use crate::paths::{self, expand_template, resolve_optional};
 use crate::prompts::{self, PromptContext, PromptRole};
 use crate::protocol::{
@@ -36,6 +37,7 @@ struct WorkflowContext<'a> {
     log_index: usize,
     integrity: InputIntegrity,
     backend: Box<dyn AgentBackend>,
+    output: Output,
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +59,7 @@ struct CandidateFiles {
 struct CheckReport {
     passed: bool,
     summary: String,
+    display_summary: String,
 }
 
 #[derive(Clone, Copy)]
@@ -105,7 +108,11 @@ fn run_at(
     cli.validate()?;
     let prepared = prepare_run(cli, root)?;
     if cli.is_dry_run() {
-        print_dry_run(cli, &prepared);
+        print_dry_run(
+            cli,
+            &prepared,
+            &Output::new(cli.color_mode(), cli.verbose()),
+        )?;
         return Ok(None);
     }
     let root = prepared.root;
@@ -134,8 +141,12 @@ fn run_at(
         log_index: 0,
         integrity: prepared.integrity,
         backend,
+        output: Output::new(cli.color_mode(), cli.verbose()),
     };
-    println!("Run logs: {}", run_dir.root.display());
+    context.output.stdout(&format!(
+        "[RUNNING] Workflow started\nRun logs: {}\n",
+        run_dir.root.display()
+    ))?;
     if cli.is_plan() {
         run_plan_workflow(&mut context, cli, candidate, files)?;
         return Ok(Some(run_dir.root.clone()));
@@ -164,7 +175,9 @@ fn run_at(
             break;
         }
         let Some(next) = discovery::select_spec(&root, &profile, None, &completed)? else {
-            println!("No further eligible specifications.");
+            context
+                .output
+                .stdout("[PASS] No further eligible specifications.\n")?;
             break;
         };
         files = prepare_candidate_files(&root, &profile, &next, false)?;
@@ -173,7 +186,10 @@ fn run_at(
         candidate = next;
         review_resume = false;
     }
-    println!("Run logs retained at {}", run_dir.root.display());
+    context.output.stdout(&format!(
+        "[PASS] Run logs retained at {}\n",
+        run_dir.root.display()
+    ))?;
     Ok(Some(run_dir.root.clone()))
 }
 
@@ -469,38 +485,21 @@ fn archive_destination(
     Ok(Some(destination))
 }
 
-fn print_dry_run(cli: &Cli, prepared: &PreparedRun) {
-    println!("Project root: {}", prepared.root.display());
-    println!(
-        "Profile: {}",
-        prepared.root.join(".spec-loop.toml").display()
-    );
-    println!(
-        "Spec: {} ({})",
+fn print_dry_run(cli: &Cli, prepared: &PreparedRun, output: &Output) -> Result<()> {
+    output.stage("Dry run — resolved work")?;
+    output.stdout(&format!(
+        "Project root: {}\nProfile: {}\nSpec: {} ({})\nMode: {}\nReview-context argv: {:?}\nReview-context working directory: {}\nPlan: {}\n",
+        prepared.root.display(),
+        prepared.root.join(".spec-loop.toml").display(),
         prepared.candidate.id,
-        prepared.candidate.path.display()
-    );
-    println!(
-        "Mode: {}",
-        if cli.is_plan() {
-            "plan"
-        } else if cli.is_review() {
-            "review"
-        } else {
-            "implementation"
-        }
-    );
-    println!(
-        "Review-context argv: {:?}",
-        prepared.profile.review.context.argv
-    );
-    println!(
-        "Review-context working directory: {}",
-        prepared.root.display()
-    );
-    println!("Plan: {}", prepared.files.plan_path.display());
+        prepared.candidate.path.display(),
+        if cli.is_plan() { "plan" } else if cli.is_review() { "review" } else { "implementation" },
+        prepared.profile.review.context.argv,
+        prepared.root.display(),
+        prepared.files.plan_path.display()
+    ))?;
     if let Some(path) = &prepared.files.archive_path {
-        println!("Archive destination: {}", path.display());
+        output.stdout(&format!("Archive destination: {}\n", path.display()))?;
     }
     for check in &prepared.profile.checks {
         let argv = expand_argv(
@@ -509,12 +508,12 @@ fn print_dry_run(cli: &Cli, prepared: &PreparedRun) {
             &prepared.candidate.path,
             &prepared.files.plan_path,
         );
-        println!(
-            "Check {:?}: argv={argv:?}, cwd={}, timeout={}",
+        output.stdout(&format!(
+            "Check {:?}: argv={argv:?}, cwd={}, timeout={}\n",
             check.name,
             prepared.root.display(),
             timeout_description(check.timeout_seconds)
-        );
+        ))?;
     }
     for (label, actions) in [
         (
@@ -535,8 +534,8 @@ fn print_dry_run(cli: &Cli, prepared: &PreparedRun) {
                 spec_path,
                 &prepared.files.plan_path,
             );
-            println!(
-                "Action {label} {:?}: argv={argv:?}, cwd={}, timeout={}{}",
+            output.stdout(&format!(
+                "Action {label} {:?}: argv={argv:?}, cwd={}, timeout={}{}\n",
                 action.name,
                 prepared.root.display(),
                 timeout_description(action.timeout_seconds),
@@ -545,14 +544,11 @@ fn print_dry_run(cli: &Cli, prepared: &PreparedRun) {
                 } else {
                     ""
                 }
-            );
+            ))?;
         }
     }
-    println!(
-        "Maximum calls per Pi role: {} (0 means unlimited)",
-        prepared.profile.completion.max_passes
-    );
-    println!("Dry run: no agents, checks, or actions invoked.");
+    output.stdout(&format!("Maximum calls per Pi role: {} (0 means unlimited)\n[PASS] Dry run: no agents, checks, or actions invoked.\n", prepared.profile.completion.max_passes))?;
+    Ok(())
 }
 
 fn expand_argv(argv: &[String], spec_id: &str, spec_path: &Path, plan_path: &Path) -> Vec<String> {
@@ -575,11 +571,17 @@ fn run_plan_workflow(
     loop {
         if cli.continue_requested() && files.has_plan {
             context.integrity.verify(context.root)?;
-            println!("Skipping spec {}: plan already exists.", candidate.id);
+            context.output.stdout(&format!(
+                "[WARN] Skipping spec {}: plan already exists.\n",
+                candidate.id
+            ))?;
         } else {
             run_plan_loop(context, &candidate, &files.plan_path)?;
             context.integrity.verify(context.root)?;
-            println!("Plan approved for spec {}.", candidate.id);
+            context.output.stdout(&format!(
+                "[PASS] Plan approved for spec {}.\n",
+                candidate.id
+            ))?;
         }
         if !cli.continue_requested() {
             return Ok(());
@@ -587,7 +589,9 @@ fn run_plan_workflow(
         completed.insert(candidate.id.clone());
         let Some(next) = discovery::select_spec(context.root, context.profile, None, &completed)?
         else {
-            println!("No further specifications need plans.");
+            context
+                .output
+                .stdout("[PASS] No further specifications need plans.\n")?;
             return Ok(());
         };
         let next_files = prepare_candidate_files(context.root, context.profile, &next, true)?;
@@ -653,16 +657,16 @@ fn run_plan_loop(
                 )?;
                 let findings = disposition(findings, &report)?;
                 if !findings.unsupported.is_empty() {
-                    println!(
-                        "Plan auditor classified findings unsupported: {}",
+                    context.output.stdout(&format!(
+                        "[WARN] Plan auditor classified findings unsupported: {}\n",
                         ids(&findings.unsupported)
-                    );
+                    ))?;
                 }
                 if !findings.not_actionable.is_empty() {
-                    println!(
-                        "Plan auditor found no required correction for findings: {}",
+                    context.output.stdout(&format!(
+                        "[WARN] Plan auditor found no required correction for findings: {}\n",
                         ids(&findings.not_actionable)
-                    );
+                    ))?;
                 }
                 if !findings.ambiguous.is_empty() {
                     return Err(SpecLoopError::Workflow(format!(
@@ -762,11 +766,21 @@ fn run_implementation_workflow(
         let mut transition = format!("Stage: automated checks for spec {}", candidate.id);
         if let Some(summary) = implementation_summary {
             transition.push_str("\nImplementation summary: ");
-            transition.push_str(&summary);
+            transition.push_str(&Output::display_text(&summary, 160));
         }
-        commands::report_progress(&transition)?;
+        context.output.stage(&transition)?;
         let checks = run_checks(context, candidate, plan_path)?;
-        println!("{}", checks.summary);
+        context.output.stdout(&format!(
+            "[{}] Check summary\n{}\n",
+            if context.profile.checks.is_empty() {
+                "WARN"
+            } else if checks.passed {
+                "PASS"
+            } else {
+                "FAIL"
+            },
+            checks.display_summary
+        ))?;
         if !checks.passed {
             feedback = Some(format!(
                 "Configured checks failed. Fix reported failures, then return ready_for_review.\n{}",
@@ -837,10 +851,10 @@ fn review_implementation(
             )?;
             let findings = disposition(findings, &report)?;
             if !findings.not_actionable.is_empty() {
-                println!(
-                    "Review auditor found no required correction for findings: {}",
+                context.output.stdout(&format!(
+                    "[WARN] Review auditor found no required correction for findings: {}\n",
                     ids(&findings.not_actionable)
-                );
+                ))?;
             }
             if findings.actionable.is_empty() && findings.ambiguous.is_empty() {
                 return Ok(ReviewDisposition::Approved);
@@ -1125,11 +1139,14 @@ fn complete_spec(
     context.integrity.verify(context.root)?;
     let mut completed_candidate = candidate.clone();
     if let Some(destination) = archive_path {
-        archive_spec(context.root, candidate, destination)?;
+        archive_spec(context, candidate, destination)?;
         context.integrity.relocate_spec(context.root, destination)?;
         completed_candidate.path = destination.to_path_buf();
     }
-    println!("Review approved for spec {}.", candidate.id);
+    context.output.stdout(&format!(
+        "[PASS] Review approved for spec {}.\n",
+        candidate.id
+    ))?;
     run_actions(
         context,
         &context.profile.actions.on_review_success,
@@ -1150,8 +1167,13 @@ fn complete_spec(
     Ok(())
 }
 
-fn archive_spec(root: &Path, candidate: &SpecCandidate, destination: &Path) -> Result<()> {
-    commands::report_progress(&format!(
+fn archive_spec(
+    context: &WorkflowContext<'_>,
+    candidate: &SpecCandidate,
+    destination: &Path,
+) -> Result<()> {
+    let root = context.root;
+    context.output.stage(&format!(
         "Stage: archive spec {} ({} -> {})",
         candidate.id,
         candidate.path.display(),
@@ -1175,11 +1197,11 @@ fn archive_spec(root: &Path, candidate: &SpecCandidate, destination: &Path) -> R
             error,
         )
     })?;
-    println!(
-        "Archived spec: {} -> {}",
+    context.output.stdout(&format!(
+        "[PASS] Archived spec: {} -> {}\n",
         candidate.path.display(),
         destination.display()
-    );
+    ))?;
     Ok(())
 }
 
@@ -1238,7 +1260,7 @@ fn run_action(
     };
     let program = PathBuf::from(program_text);
     let arguments = &argv[1..];
-    commands::report_progress(&format!(
+    context.output.stage(&format!(
         "Action {:?}\nCommand argv: {argv:?}\nWorking directory: {}",
         action.name,
         context.root.display()
@@ -1282,12 +1304,14 @@ fn run_action(
     log.extend_from_slice(&stderr);
     let log_name = format!("action-{:04}.log", context.next_log_index()?);
     let log_path = context.run_dir.write_log(&log_name, &log)?;
-    println!(
-        "Action {:?}: {} (log: {})",
+    context.output.stdout(&format!(
+        "[{}] Action {:?}: {}\n  Log: {}\n{}",
+        if success { "PASS" } else { "FAIL" },
         action.name,
-        if success { "completed" } else { "FAILED" },
-        log_path.display()
-    );
+        if success { "completed" } else { "failed" },
+        log_path.display(),
+        display_output_excerpt(&stdout, &stderr)
+    ))?;
     if termination == Some(ProcessTermination::Interrupted) {
         return Err(SpecLoopError::Interrupted);
     }
@@ -1313,8 +1337,10 @@ fn run_checks(
 ) -> Result<CheckReport> {
     let mut all_passed = true;
     let mut summary = String::new();
+    let mut display_summary = String::new();
     if context.profile.checks.is_empty() {
         summary.push_str("No automated checks ran (profile has no configured checks).\n");
+        display_summary.push_str("No automated checks ran (profile has no configured checks).\n");
     }
     for check in &context.profile.checks {
         context.integrity.verify(context.root)?;
@@ -1323,10 +1349,13 @@ fn run_checks(
         all_passed &= result.0;
         summary.push_str(&result.1);
         summary.push('\n');
+        display_summary.push_str(&result.2);
+        display_summary.push('\n');
     }
     Ok(CheckReport {
         passed: all_passed,
         summary,
+        display_summary,
     })
 }
 
@@ -1335,8 +1364,10 @@ fn run_check(
     candidate: &SpecCandidate,
     plan_path: &Path,
     check: &CheckConfig,
-) -> Result<(bool, String)> {
-    commands::report_progress(&format!("Stage: check {}", check.name))?;
+) -> Result<(bool, String, String)> {
+    context
+        .output
+        .stage(&format!("Stage: check {}", check.name))?;
     let argv = expand_argv(&check.argv, &candidate.id, &candidate.path, plan_path);
     let Some(program_text) = argv.first() else {
         return Err(SpecLoopError::Config(format!(
@@ -1346,7 +1377,7 @@ fn run_check(
     };
     let program = PathBuf::from(program_text);
     let arguments = &argv[1..];
-    commands::report_progress(&format!(
+    context.output.metadata(&format!(
         "Command argv: {argv:?}\nWorking directory: {}",
         context.root.display()
     ))?;
@@ -1389,43 +1420,70 @@ fn run_check(
     log.extend_from_slice(&stderr);
     let log_name = format!("check-{:04}.log", context.next_log_index()?);
     let log_path = context.run_dir.write_log(&log_name, &log)?;
-    println!(
-        "Check {}: {} (log: {})",
+    context.output.stdout(&format!(
+        "[{}] Check {}: {}\n  Log: {}\n",
+        if success { "PASS" } else { "FAIL" },
         check.name,
-        if success { "passed" } else { "FAILED" },
+        if success { "passed" } else { "failed" },
         log_path.display()
-    );
+    ))?;
     if termination == Some(ProcessTermination::Interrupted) {
         return Err(SpecLoopError::Interrupted);
     }
-    let summary = format!(
-        "Check: {}\nCommand argv: {argv:?}\nStatus: {status}{}\nLog: {}\n{}",
+    let summary_prefix = format!(
+        "Check: {}\nCommand argv: {argv:?}\nStatus: {status}{}\nLog: {}\n",
         check.name,
         termination.map_or_else(String::new, |value| match value {
             ProcessTermination::TimedOut => " (timed out)".to_owned(),
             ProcessTermination::Interrupted => " (interrupted)".to_owned(),
             ProcessTermination::Exited => String::new(),
         }),
-        log_path.display(),
-        output_excerpt(&stdout, &stderr)
+        log_path.display()
     );
-    Ok((success, summary))
+    let summary = format!("{summary_prefix}{}", output_excerpt(&stdout, &stderr));
+    let display_summary = format!(
+        "{summary_prefix}{}",
+        display_output_excerpt(&stdout, &stderr)
+    );
+    Ok((success, summary, display_summary))
 }
 
 fn output_excerpt(stdout: &[u8], stderr: &[u8]) -> String {
+    output_excerpt_with_line_endings(stdout, stderr, false)
+}
+
+fn display_output_excerpt(stdout: &[u8], stderr: &[u8]) -> String {
+    output_excerpt_with_line_endings(stdout, stderr, true)
+}
+
+fn output_excerpt_with_line_endings(
+    stdout: &[u8],
+    stderr: &[u8],
+    preserve_carriage_returns: bool,
+) -> String {
     let mut summary = String::new();
-    append_output_excerpt(&mut summary, "stdout", stdout);
-    append_output_excerpt(&mut summary, "stderr", stderr);
+    append_output_excerpt(&mut summary, "stdout", stdout, preserve_carriage_returns);
+    append_output_excerpt(&mut summary, "stderr", stderr, preserve_carriage_returns);
     summary
 }
 
-fn append_output_excerpt(summary: &mut String, stream: &str, output: &[u8]) {
+fn append_output_excerpt(
+    summary: &mut String,
+    stream: &str,
+    output: &[u8],
+    preserve_carriage_returns: bool,
+) {
     const MAX_LINES: usize = 4;
     const MAX_LINE_CHARS: usize = 300;
 
     let decoded = String::from_utf8_lossy(output);
-    let lines: Vec<&str> = decoded
-        .lines()
+    let lines: Vec<&str> = if preserve_carriage_returns {
+        decoded.split_terminator('\n').collect()
+    } else {
+        decoded.lines().collect()
+    };
+    let lines: Vec<&str> = lines
+        .into_iter()
         .filter(|line| !line.trim().is_empty())
         .collect();
     if lines.is_empty() {
@@ -1455,7 +1513,7 @@ fn call_typed<T>(
     mut validate: impl FnMut(&T) -> Result<()>,
 ) -> Result<T>
 where
-    T: serde::de::DeserializeOwned + JsonSchema + ResponseFields,
+    T: serde::de::DeserializeOwned + JsonSchema + ResponseFields + TypedResult,
 {
     let mut validation_feedback = request.validation_feedback.map(str::to_owned);
     let mut continuation = None;
@@ -1465,7 +1523,7 @@ where
             validation_feedback: validation_feedback.as_deref(),
             ..request
         };
-        let (response, next_continuation) = call_agent(
+        let (response, next_continuation, response_log) = call_agent(
             context,
             attempt,
             continuation.take(),
@@ -1475,11 +1533,15 @@ where
             validate(&parsed)?;
             Ok(parsed)
         }) {
-            Ok(parsed) => return Ok(parsed),
+            Ok(parsed) => {
+                context.output.role_result(&parsed)?;
+                return Ok(parsed);
+            }
             Err(error) => {
-                commands::report_progress(&format!(
-                    "Agent {} response failed validation ({error}); retrying same role.",
-                    role_display(request.role)
+                context.output.progress(&format!(
+                    "[RETRY] Agent {} response failed validation: {error}; retrying same role. Final response log: {}",
+                    role_display(request.role),
+                    response_log.as_deref().map_or_else(|| "unavailable".to_owned(), |path| path.display().to_string())
                 ))?;
                 if next_continuation.is_some() {
                     continuation = next_continuation;
@@ -1507,7 +1569,11 @@ fn call_agent(
     request: AgentRequest<'_>,
     mut continuation: Option<backend::BackendContinuation>,
     correction_prompt: Option<&str>,
-) -> Result<(String, Option<backend::BackendContinuation>)> {
+) -> Result<(
+    String,
+    Option<backend::BackendContinuation>,
+    Option<PathBuf>,
+)> {
     let role = request.role;
     let mut retry_feedback: Option<String> = None;
     loop {
@@ -1531,15 +1597,21 @@ fn call_agent(
         let attempt = context.role_calls.get(&role).copied().ok_or_else(|| {
             SpecLoopError::Workflow(format!("missing attempt count for {}", role_display(role)))
         })?;
-        commands::report_progress(&format!(
+        context.output.stage(&format!(
             "Stage: agent {} (attempt {attempt}; spec {})",
             role_display(role),
             request.candidate.id
         ))?;
-        let (outcome, next_continuation) =
+        let agent_run =
             invoke_and_log_agent(context, call_index, role, &prompt, continuation.take())?;
-        match outcome {
-            Ok(response) => return Ok((response.response, next_continuation)),
+        match agent_run.outcome {
+            Ok(response) => {
+                return Ok((
+                    response.response,
+                    agent_run.continuation,
+                    agent_run.response_log,
+                ));
+            }
             Err(failure) => {
                 let fatal = failure.kind() == backend::BackendFailureKind::Fatal;
                 let error = failure.into_error();
@@ -1549,7 +1621,10 @@ fn call_agent(
                 if fatal {
                     return Err(error);
                 }
-                println!("Agent {} attempt failed: {error}", role_display(role));
+                context.output.progress(&format!(
+                    "[RETRY] Agent {} attempt failed: {error}",
+                    role_display(role)
+                ))?;
                 retry_feedback = Some(format!(
                     "Previous {} attempt failed: {error}. Retry same task; preserve repository changes.",
                     role_display(role)
@@ -1604,59 +1679,73 @@ fn build_role_prompt(context: &WorkflowContext<'_>, request: AgentRequest<'_>) -
     )
 }
 
+struct LoggedAgentRun {
+    outcome: std::result::Result<AgentResponse, BackendFailure>,
+    continuation: Option<backend::BackendContinuation>,
+    response_log: Option<PathBuf>,
+}
+
 fn invoke_and_log_agent(
     context: &mut WorkflowContext<'_>,
     call_index: usize,
     role: PromptRole,
     prompt: &str,
     continuation: Option<backend::BackendContinuation>,
-) -> Result<(
-    std::result::Result<AgentResponse, BackendFailure>,
-    Option<backend::BackendContinuation>,
-)> {
+) -> Result<LoggedAgentRun> {
     let outcome = match context.backend.run_with_continuation(
         context.root,
         context.profile,
         prompt,
         role,
         &context.cancelled,
-        continuation,
+        backend::AgentInvocation {
+            continuation,
+            output: &context.output,
+        },
     ) {
         Ok(run) => {
             let stdout_name = format!("agent-{call_index:04}-{}.stdout.jsonl", role_display(role));
             let stderr_name = format!("agent-{call_index:04}-{}.stderr.log", role_display(role));
             context.run_dir.write_log(&stdout_name, &run.stdout)?;
             context.run_dir.write_log(&stderr_name, &run.stderr)?;
-            println!(
-                "Agent {} logs: {}, {}",
+            context.output.stdout(&format!(
+                "  Agent {} logs:\n    stdout: {}\n    stderr: {}\n",
                 role_display(role),
                 context.run_dir.log_path(&stdout_name).display(),
                 context.run_dir.log_path(&stderr_name).display()
-            );
-            match &run.outcome {
+            ))?;
+            let response_log = match &run.outcome {
                 Ok(response) => {
                     if let Some(model) = &response.selected_model {
-                        println!("Agent {} selected model: {model}", role_display(role));
+                        context
+                            .output
+                            .stdout(&format!("  Selected model: {model}\n"))?;
                     }
                     if let Some(model) = &response.response_model {
-                        println!(
-                            "Agent {} provider-reported model: {model}",
-                            role_display(role)
-                        );
+                        context
+                            .output
+                            .stdout(&format!("  Provider-reported model: {model}\n"))?;
                     }
-                    context.run_dir.write_log(
-                        &format!("agent-{call_index:04}-{}.response.json", role_display(role)),
-                        response.response.as_bytes(),
-                    )?;
-                    println!(
-                        "--- Agent {} final response ---\n{}",
-                        role_display(role),
-                        response.response
-                    );
+                    let response_name =
+                        format!("agent-{call_index:04}-{}.response.json", role_display(role));
+                    context
+                        .run_dir
+                        .write_log(&response_name, response.response.as_bytes())?;
+                    Some(context.run_dir.log_path(&response_name))
                 }
-                Err(error) => println!("Agent {} diagnostics: {error}", role_display(role)),
+                Err(error) => {
+                    context.output.progress(&format!(
+                        "[RETRY] Agent {} diagnostics: {error}",
+                        role_display(role)
+                    ))?;
+                    None
+                }
+            };
+            LoggedAgentRun {
+                outcome: run.outcome,
+                continuation: run.continuation,
+                response_log,
             }
-            (run.outcome, run.continuation)
         }
         Err(error) => {
             let failure = if context.profile.agent.backend == AgentBackendKind::Builtin {
@@ -1664,7 +1753,11 @@ fn invoke_and_log_agent(
             } else {
                 BackendFailure::retryable(error)
             };
-            (Err(failure), None)
+            LoggedAgentRun {
+                outcome: Err(failure),
+                continuation: None,
+                response_log: None,
+            }
         }
     };
     context
@@ -1706,8 +1799,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CandidateFiles, archive_destination, is_executable_file, run_at,
-        validate_action_executables, validate_check_executables,
+        CandidateFiles, archive_destination, display_output_excerpt, is_executable_file,
+        output_excerpt, run_at, validate_action_executables, validate_check_executables,
     };
     use crate::backend::{
         AgentBackend, AgentResponse, AgentRun, BackendContinuation, BackendFailure,
@@ -1826,9 +1919,9 @@ mod tests {
             prompt: &str,
             role: PromptRole,
             cancelled: &Arc<std::sync::atomic::AtomicBool>,
-            continuation: Option<BackendContinuation>,
+            invocation: crate::backend::AgentInvocation<'_>,
         ) -> Result<AgentRun> {
-            if let Some(continuation) = continuation {
+            if let Some(continuation) = invocation.continuation {
                 assert_eq!(
                     continuation.into_state::<u8>().expect("continuation state"),
                     17
@@ -2175,6 +2268,31 @@ max_passes = 4
         drop(calls);
         fs::remove_dir_all(observed_run_dir.expect("blocked workflow retained its log path"))
             .expect("remove blocked workflow logs");
+    }
+
+    #[test]
+    fn child_output_excerpt_keeps_last_four_nonempty_lines_and_bounds_lines() {
+        let stdout = format!("first\n\nsecond\nthird\nfourth\n{}\n", "x".repeat(301));
+        let excerpt = output_excerpt(stdout.as_bytes(), b"stderr line\n");
+        assert!(excerpt.contains("... 1 earlier lines omitted ..."));
+        assert!(!excerpt.contains("first"));
+        assert!(excerpt.contains("second\nthird\nfourth\n"));
+        assert!(excerpt.contains(&format!("{} ... [line truncated]", "x".repeat(300))));
+        assert!(excerpt.contains("stderr excerpt:\nstderr line\n"));
+    }
+
+    #[test]
+    fn display_child_output_excerpt_preserves_crlf_carriage_return() {
+        let raw = b"child output\r\nnext line\n";
+        let prompt_excerpt = output_excerpt(raw, b"");
+        let display_excerpt = display_output_excerpt(raw, b"");
+
+        assert_eq!(prompt_excerpt, "stdout excerpt:\nchild output\nnext line\n");
+        assert_eq!(
+            display_excerpt,
+            "stdout excerpt:\nchild output\r\nnext line\n"
+        );
+        assert_eq!(raw, b"child output\r\nnext line\n");
     }
 
     #[test]

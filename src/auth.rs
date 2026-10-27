@@ -34,6 +34,7 @@ const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 const DIRECT_SCOPE: &str = "chatgpt.tokens.use.direct";
+const TOKEN_REFRESH_SKEW_SECONDS: u64 = 300;
 const KEYRING_SERVICE: &str = "spec-loop-chatgpt";
 type ConfiguredCoreClient = CoreClient<
     EndpointSet,
@@ -955,7 +956,7 @@ async fn exchange_authorization_code(
 fn refresh_is_due(credential: &Credential, now_unix: u64) -> bool {
     credential
         .expires_at_unix
-        .is_none_or(|expires_at| expires_at <= now_unix.saturating_add(60))
+        .is_none_or(|expires_at| expires_at <= now_unix.saturating_add(TOKEN_REFRESH_SKEW_SECONDS))
 }
 
 fn unix_time_now() -> Result<u64> {
@@ -3432,6 +3433,34 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_credentials_are_persisted_before_reuse() {
+        let temporary = TempDir::new().expect("create credential fixture");
+        let path = temporary.path().join("spec-loop/auth.json");
+        write_test_credentials(&path, vec![DIRECT_SCOPE.to_owned()])
+            .expect("write credential fixture");
+        let (mut registry, registration, _) =
+            super::load_active_credential(&path).expect("load fixture credential");
+        let refreshed = Credential {
+            access_token: "persisted-new-access".to_owned(),
+            refresh_token: Some("persisted-new-refresh".to_owned()),
+            id_token: "fixture-id-token".to_owned(),
+            scopes: vec![DIRECT_SCOPE.to_owned()],
+            expires_at_unix: Some(u64::MAX),
+        };
+
+        super::store_refreshed_credential(&path, &mut registry, &registration, refreshed)
+            .expect("persist refreshed file credential");
+
+        let (_, _, persisted) =
+            super::load_active_credential(&path).expect("reload refreshed credential");
+        assert_eq!(persisted.access_token, "persisted-new-access");
+        assert_eq!(
+            persisted.refresh_token.as_deref(),
+            Some("persisted-new-refresh")
+        );
+    }
+
+    #[test]
     fn refreshed_token_rotates_credentials_and_requires_direct_permission() {
         let current = Credential {
             access_token: "old-access".to_owned(),
@@ -3466,8 +3495,8 @@ mod tests {
             scopes: vec!["chatgpt.tokens.use.direct".to_owned()],
             expires_at_unix: Some(1_100),
         };
-        assert!(refresh_is_due(&credential, 1_040));
-        assert!(!refresh_is_due(&credential, 1_039));
+        assert!(refresh_is_due(&credential, 800));
+        assert!(!refresh_is_due(&credential, 799));
         assert!(refresh_is_due(
             &Credential {
                 expires_at_unix: None,

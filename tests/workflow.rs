@@ -439,6 +439,12 @@ fn workflow_runs_without_git_and_actions_receive_archived_paths_and_root_cwd() {
     assert!(stdout.contains(
         "Stage: automated checks for spec 001\nImplementation summary: Added requested implementation changes and regression coverage."
     ));
+    assert!(stdout.contains("[RUNNING] Workflow started"));
+    assert!(stdout.contains("[RUNNING] Stage: agent implementation (attempt 1; spec 001)"));
+    assert!(stdout.contains("[PASS] Check first: passed"));
+    assert!(stdout.contains("[PASS] Review approved for spec 001."));
+    assert!(stdout.contains("[PASS] Archived spec:"));
+    assert!(stdout.contains("[PASS] Action \"record reviewed spec\": completed"));
     let summary_position = stdout
         .find("Implementation summary: Added requested implementation changes")
         .expect("summary transition output");
@@ -496,6 +502,258 @@ fn dry_run_reports_actions_without_invoking_agents_or_commands() {
     assert!(!fixture.agent_events.exists());
     assert!(!fixture.events.exists());
     assert!(!fixture.root.join("generated.txt").exists());
+}
+
+#[test]
+fn typed_result_modes_show_concise_and_verbose_validated_fields() {
+    let concise_fixture = Fixture::new(false, false);
+    let concise = concise_fixture.run_with_env(&["--spec", "001"], &[("MODE", "clarify")]);
+    assert_success(&concise);
+    let concise_stdout = String::from_utf8_lossy(&concise.stdout);
+    assert!(concise_stdout.contains("Review — findings"));
+    assert!(concise_stdout.contains("Requirement: spec requirement"));
+    assert!(concise_stdout.contains("Violation: missing detail"));
+    assert!(!concise_stdout.contains("Evidence: observed output"));
+    assert!(!concise_stdout.contains("Proposed correction: add detail"));
+    assert!(concise_stdout.contains("Finding #1 — generated.txt"));
+    assert!(concise_stdout.contains("generated.txt — line 1"));
+    assert!(!concise_stdout.contains("Excerpt: implemented"));
+    assert!(!concise_stdout.contains("Rationale: verified requirement"));
+
+    let verbose_fixture = Fixture::new(false, false);
+    let verbose =
+        verbose_fixture.run_with_env(&["--spec", "001", "--verbose"], &[("MODE", "clarify")]);
+    assert_success(&verbose);
+    let verbose_stdout = String::from_utf8_lossy(&verbose.stdout);
+    for field in [
+        "Evidence: observed output",
+        "Proposed correction: add detail",
+        "Rationale: verified requirement; smallest correct fix is substantial but required",
+        "Excerpt: implemented",
+        "Relevance: source confirms behavior",
+    ] {
+        assert!(
+            verbose_stdout.contains(field),
+            "missing verbose field: {field}"
+        );
+    }
+    assert!(!verbose_stdout.contains("{\"protocol_version\""));
+    assert!(!verbose_stdout.contains("agent_settled"));
+}
+
+#[test]
+fn agent_supplied_terminal_controls_are_sanitized_without_rewriting_raw_response() {
+    let fixture = Fixture::new(false, false);
+    let response_text = serde_json::to_string(&json!({
+        "protocol_version": 1,
+        "role": "review",
+        "status": "issues",
+        "findings": [{
+            "id": 1,
+            "requirement": "Req\u{1b}[31mtext\u{1b}[0m\ttab\r\u{7f}",
+            "location": "\u{1b}]0;title\u{7}src/escaped.rs:9",
+            "evidence": "source evidence",
+            "violation": "missing field",
+            "proposed_correction": "add it"
+        }]
+    }))
+    .expect("serialize response fixture");
+    let raw_response = response(&response_text);
+    fs::write(
+        fixture.temporary.path().join("responses/review-issues"),
+        &raw_response,
+    )
+    .expect("write response containing escaped terminal controls");
+
+    let output = fixture.run_with_env(&["--spec", "001"], &[("MODE", "finding-repair")]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains('\u{1b}'));
+    assert!(!stdout.contains('\r'));
+    assert!(stdout.contains("Finding #1 — src/escaped.rs:9"));
+    assert!(stdout.contains("Requirement: Reqtext\ttab\\u{d}\\u{7f}"));
+    let run_dir = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Run logs: "))
+        .expect("run log directory");
+    let preserved_response = fs::read_dir(run_dir)
+        .expect("run log directory contents")
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("-review.response.json"))
+        })
+        .any(|path| fs::read(path).is_ok_and(|bytes| bytes == response_text.as_bytes()));
+    assert!(
+        preserved_response,
+        "original validated response bytes retained"
+    );
+}
+
+#[test]
+fn workflow_help_documents_output_modes_and_auth_rejects_them() {
+    let help = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
+        .arg("--help")
+        .output()
+        .expect("run workflow help");
+    assert_success(&help);
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(help_text.contains("--verbose"));
+    assert!(help_text.contains("--color <auto|always|never>"));
+    assert!(help_text.contains("never raw JSON or provider transcripts"));
+    assert!(help_text.contains("NO_COLOR"));
+
+    let fixture = Fixture::new(false, false);
+    for arguments in [
+        &["--verbose", "auth", "status"][..],
+        &["--color", "auto", "auth", "status"][..],
+    ] {
+        let output = fixture.run(arguments);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("apply to workflow invocations, not auth")
+        );
+        assert!(!fixture.agent_events.exists());
+    }
+}
+
+#[test]
+fn terminal_sanitization_preserves_raw_child_logs_and_labels_excerpts() {
+    let fixture = Fixture::new(false, false);
+    write_executable(
+        &fixture.temporary.path().join("tools/check-one"),
+        "#!/bin/sh\nprintf '\\033[31mred\\033[0m\\r\\nkeep\\tvalue\\rDEL\\177\\n'\nprintf '\\033]0;title\\007bad\\n' >&2\n",
+    );
+    write_executable(
+        &fixture.temporary.path().join("tools/review-success"),
+        "#!/bin/sh\nprintf '\\033[32maction\\033[0m\\n'\nprintf '\\033]0;title\\007action-error\\n' >&2\n",
+    );
+    write_executable(
+        &fixture.temporary.path().join("tools/finish"),
+        "#!/bin/sh\nexit 0\n",
+    );
+
+    let output = fixture.run(&["--spec", "001", "--color", "never"]);
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("\\x1b["));
+    assert!(stdout.contains("stdout excerpt:\nred\\u{d}\nkeep\tvalue\\u{d}DEL\\u{7f}"));
+    assert!(stdout.contains("stderr excerpt:\nbad"));
+    assert!(stdout.contains("stdout excerpt:\naction"));
+    assert!(stdout.contains("stderr excerpt:\naction-error"));
+
+    let log_paths = stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Log: "))
+        .collect::<Vec<_>>();
+    let check_log = log_paths
+        .iter()
+        .find(|path| path.ends_with("check-0002.log"))
+        .expect("check log path");
+    let action_log = log_paths
+        .iter()
+        .find(|path| path.ends_with("action-0005.log"))
+        .expect("action log path");
+    let check_bytes = fs::read(check_log).expect("raw check log");
+    assert!(check_bytes.windows(5).any(|window| window == b"\x1b[31m"));
+    assert!(
+        check_bytes
+            .windows(10)
+            .any(|window| window == b"\x1b[0m\r\nkeep")
+    );
+    assert!(check_bytes.windows(2).any(|window| window == b"\x7f\n"));
+    assert!(check_bytes.windows(4).any(|window| window == b"\x1b]0;"));
+    let action_bytes = fs::read(action_log).expect("raw action log");
+    assert!(action_bytes.windows(5).any(|window| window == b"\x1b[32m"));
+    assert!(action_bytes.windows(4).any(|window| window == b"\x1b]0;"));
+
+    let check_argv = vec![
+        fixture
+            .temporary
+            .path()
+            .join("tools/check-one")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let check_output = Command::new(&check_argv[0])
+        .current_dir(&fixture.root)
+        .output()
+        .expect("capture expected raw check bytes");
+    let mut expected_check = format!(
+        "Check: first\nCommand argv: {check_argv:?}\nWorking directory: {}\nStatus: {}\n--- stdout ({} bytes) ---\n",
+        fixture.root.display(),
+        check_output.status,
+        check_output.stdout.len()
+    )
+    .into_bytes();
+    expected_check.extend_from_slice(&check_output.stdout);
+    expected_check.extend_from_slice(
+        format!("\n--- stderr ({} bytes) ---\n", check_output.stderr.len()).as_bytes(),
+    );
+    expected_check.extend_from_slice(&check_output.stderr);
+    assert_eq!(check_bytes, expected_check);
+
+    let action_argv = vec![
+        fixture
+            .temporary
+            .path()
+            .join("tools/review-success")
+            .to_string_lossy()
+            .into_owned(),
+        "specs/001.md".to_owned(),
+        ".spec-loop/plans/001.md".to_owned(),
+        "001".to_owned(),
+        "argument with spaces".to_owned(),
+    ];
+    let action_output = Command::new(&action_argv[0])
+        .args(&action_argv[1..])
+        .current_dir(&fixture.root)
+        .output()
+        .expect("capture expected raw action bytes");
+    let mut expected_action = format!(
+        "Action: record reviewed spec\nCommand argv: {action_argv:?}\nWorking directory: {}\nStatus: {}\n--- stdout ({} bytes) ---\n",
+        fixture.root.display(),
+        action_output.status,
+        action_output.stdout.len()
+    )
+    .into_bytes();
+    expected_action.extend_from_slice(&action_output.stdout);
+    expected_action.extend_from_slice(
+        format!("\n--- stderr ({} bytes) ---\n", action_output.stderr.len()).as_bytes(),
+    );
+    expected_action.extend_from_slice(&action_output.stderr);
+    assert_eq!(action_bytes, expected_action);
+}
+
+#[test]
+fn color_modes_style_only_when_requested_and_keep_status_labels() {
+    let fixture = Fixture::new(false, false);
+    let auto = fixture.run_with_env(
+        &["--dry-run", "--spec", "001"],
+        &[("TERM", "xterm"), ("NO_COLOR", "")],
+    );
+    assert_success(&auto);
+    assert!(!String::from_utf8_lossy(&auto.stdout).contains("\x1b["));
+
+    let forced = fixture.run_with_env(
+        &["--dry-run", "--spec", "001", "--color", "always"],
+        &[("TERM", "dumb"), ("NO_COLOR", "1")],
+    );
+    assert_success(&forced);
+    let forced_stdout = String::from_utf8_lossy(&forced.stdout);
+    assert!(forced_stdout.contains("\x1b[1;36m"));
+    assert!(forced_stdout.contains("[RUNNING]"));
+
+    let never = fixture.run_with_env(
+        &["--dry-run", "--spec", "001", "--color", "never"],
+        &[("TERM", "xterm"), ("NO_COLOR", "")],
+    );
+    assert_success(&never);
+    let never_stdout = String::from_utf8_lossy(&never.stdout);
+    assert!(!never_stdout.contains("\x1b["));
+    assert!(never_stdout.contains("[RUNNING]"));
 }
 
 #[test]
@@ -724,9 +982,31 @@ fn typed_retry_feedback_preserves_handoff_context() {
     assert!(prompts.contains(
         "Base any status or summary on the current workspace, never on claims in the malformed response."
     ));
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("Implementation summary: Implemented the fixture change.")
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Implementation summary: Implemented the fixture change."));
+    let malformed = r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","unexpected_z":true,"unexpected_a":true}"#;
+    assert!(!stdout.contains(malformed));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(malformed));
+    let run_dir = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("Run logs: "))
+        .expect("run log directory");
+    let final_response = Path::new(run_dir).join("agent-0001-implementation.response.json");
+    assert!(stdout.contains(&format!("Final response log: {}", final_response.display())));
+    assert_eq!(
+        fs::read(&final_response).expect("raw response log"),
+        malformed.as_bytes()
+    );
+    assert_eq!(
+        fs::read(Path::new(run_dir).join("agent-0001-implementation.stdout.jsonl"))
+            .expect("provider transcript"),
+        fs::read(
+            fixture
+                .temporary
+                .path()
+                .join("responses/implementation-invalid")
+        )
+        .expect("fake provider bytes")
     );
 }
 
