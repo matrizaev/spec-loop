@@ -1,4 +1,6 @@
+use std::iter::Peekable;
 use std::path::Path;
+use std::str::Chars;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -198,23 +200,64 @@ pub(super) fn render_captured_streams(
     stderr: &[u8],
     max_output_bytes: usize,
 ) -> (String, String, bool, bool) {
-    let stdout_limit = max_output_bytes / 2 + max_output_bytes % 2;
-    let stderr_limit = max_output_bytes / 2;
-    let (stdout, stdout_truncated) = render_captured_stream(stdout, stdout_limit);
-    let (stderr, stderr_truncated) = render_captured_stream(stderr, stderr_limit);
-    (stdout, stderr, stdout_truncated, stderr_truncated)
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
+    let mut stdout_chars = stdout.chars().peekable();
+    let mut stderr_chars = stderr.chars().peekable();
+    let mut stdout_output = String::new();
+    let mut stderr_output = String::new();
+    let mut remaining = max_output_bytes;
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
+    let mut next_stdout = true;
+
+    while !stdout_done || !stderr_done {
+        let render_stdout = if stdout_done {
+            false
+        } else if stderr_done {
+            true
+        } else {
+            next_stdout
+        };
+        let (done, truncated) = if render_stdout {
+            append_rendered_character(&mut stdout_chars, &mut stdout_output, &mut remaining)
+        } else {
+            append_rendered_character(&mut stderr_chars, &mut stderr_output, &mut remaining)
+        };
+        if render_stdout {
+            stdout_done = done;
+            stdout_truncated |= truncated;
+        } else {
+            stderr_done = done;
+            stderr_truncated |= truncated;
+        }
+        next_stdout = !render_stdout;
+    }
+
+    (
+        stdout_output,
+        stderr_output,
+        stdout_truncated,
+        stderr_truncated,
+    )
 }
 
-fn render_captured_stream(bytes: &[u8], limit: usize) -> (String, bool) {
-    let rendered = String::from_utf8_lossy(bytes);
-    if rendered.len() <= limit {
-        return (rendered.into_owned(), false);
+fn append_rendered_character(
+    characters: &mut Peekable<Chars<'_>>,
+    output: &mut String,
+    remaining: &mut usize,
+) -> (bool, bool) {
+    match characters.next() {
+        None => (true, false),
+        Some(character) if character.len_utf8() <= *remaining => {
+            output.push(character);
+            *remaining -= character.len_utf8();
+            (false, false)
+        }
+        Some(_) => (true, true),
     }
-    let mut end = limit;
-    while !rendered.is_char_boundary(end) {
-        end -= 1;
-    }
-    (rendered[..end].to_owned(), true)
 }
 
 pub(super) fn run_shell(

@@ -5,7 +5,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -29,13 +29,13 @@ pub enum ProcessTermination {
 pub struct ChildOutput {
     /// Child exit status, when the process was waited successfully.
     pub status: Option<ExitStatus>,
-    /// Captured stdout, bounded only for built-in tool invocations.
+    /// Captured stdout bytes, bounded by the invocation's shared output allowance.
     pub stdout: Vec<u8>,
-    /// Captured stderr, bounded only for built-in tool invocations.
+    /// Captured stderr bytes, bounded by the invocation's shared output allowance.
     pub stderr: Vec<u8>,
-    /// Whether stdout exceeded its assigned capture allowance.
+    /// Whether bytes from stdout were discarded by the shared capture allowance.
     pub stdout_truncated: bool,
-    /// Whether stderr exceeded its assigned capture allowance.
+    /// Whether bytes from stderr were discarded by the shared capture allowance.
     pub stderr_truncated: bool,
     /// Why process supervision stopped; captured output is retained for every outcome.
     pub termination: ProcessTermination,
@@ -184,11 +184,10 @@ fn run_process_with_options(
             program.display()
         )));
     };
-    let (stdout_limit, stderr_limit) = max_output_bytes.map_or((None, None), |limit| {
-        (Some(limit / 2 + limit % 2), Some(limit / 2))
-    });
-    let stdout_reader = thread::spawn(move || read_captured(stdout, stdout_limit));
-    let stderr_reader = thread::spawn(move || read_captured(stderr, stderr_limit));
+    let capture_budget = max_output_bytes.map(CaptureBudget::new).map(Arc::new);
+    let stdout_budget = capture_budget.as_ref().map(Arc::clone);
+    let stdout_reader = thread::spawn(move || read_captured(stdout, stdout_budget.as_deref()));
+    let stderr_reader = thread::spawn(move || read_captured(stderr, capture_budget.as_deref()));
     let (status, mut termination) =
         wait_for_child(&mut child, program, timeout, deadline, started, cancelled)?;
     wait_for_readers(ReaderWait {
@@ -348,7 +347,46 @@ struct CapturedOutput {
     truncated: bool,
 }
 
-fn read_captured(mut reader: impl Read, limit: Option<usize>) -> std::io::Result<CapturedOutput> {
+struct CaptureBudget {
+    limit: usize,
+    retained: AtomicUsize,
+}
+
+impl CaptureBudget {
+    const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            retained: AtomicUsize::new(0),
+        }
+    }
+
+    fn claim(&self, requested: usize) -> std::io::Result<usize> {
+        let mut retained = self.retained.load(Ordering::Relaxed);
+        loop {
+            let remaining = self.limit.checked_sub(retained).ok_or_else(|| {
+                std::io::Error::other("captured output exceeded its configured limit")
+            })?;
+            let claimed = requested.min(remaining);
+            let updated = retained
+                .checked_add(claimed)
+                .ok_or_else(|| std::io::Error::other("captured output byte count overflowed"))?;
+            match self.retained.compare_exchange_weak(
+                retained,
+                updated,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(claimed),
+                Err(observed) => retained = observed,
+            }
+        }
+    }
+}
+
+fn read_captured(
+    mut reader: impl Read,
+    budget: Option<&CaptureBudget>,
+) -> std::io::Result<CapturedOutput> {
     let mut output = Vec::new();
     let mut truncated = false;
     let mut buffer = [0_u8; 8192];
@@ -357,17 +395,11 @@ fn read_captured(mut reader: impl Read, limit: Option<usize>) -> std::io::Result
         if read == 0 {
             break;
         }
-        let retained = match limit {
-            Some(limit) => {
-                let remaining = limit.checked_sub(output.len()).ok_or_else(|| {
-                    std::io::Error::other("captured output exceeded its configured limit")
-                })?;
-                let retained = read.min(remaining);
-                truncated |= retained < read;
-                retained
-            }
+        let retained = match budget {
+            Some(budget) => budget.claim(read)?,
             None => read,
         };
+        truncated |= retained < read;
         output
             .try_reserve(retained)
             .map_err(std::io::Error::other)?;

@@ -22,6 +22,7 @@ timeout_seconds = 1800
 [agent]
 # Omitted backend selects built-in OpenAI Responses; set model before use.
 # Omitting max_tool_calls means no Spec Loop shell-call count ceiling.
+# max_tool_output_bytes defaults to a combined 1,048,576-byte stdout/stderr payload cap per built-in shell call; neither stream has a reserved share.
 model = "your-chatgpt-model"
 timeout_seconds = 3600
 

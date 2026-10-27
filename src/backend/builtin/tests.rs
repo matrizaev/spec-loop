@@ -635,10 +635,24 @@ max_tool_output_bytes=6
             .get("output")
             .and_then(Value::as_str)
             .expect("shell output string");
-        assert!(text.contains("stdout:\n123"));
-        assert!(text.contains("stderr:\n567"));
-        assert!(text.contains("tool output truncated at configured byte limit"));
+        let (_, streams) = text.split_once("stdout:\n").expect("stdout payload");
+        let (stdout, stderr) = streams.split_once("\nstderr:\n").expect("stderr payload");
+        let (stderr, _) = stderr
+            .split_once("\n[tool output truncated at configured byte limit]")
+            .expect("truncation marker");
+        assert!(stdout.len() + stderr.len() <= 6, "{text:?}");
+        assert!(text.contains("exit_status=0"));
+        assert!(!text.contains("command exited unsuccessfully"));
     }
+    let transcript = String::from_utf8_lossy(&transcript);
+    assert_eq!(
+        transcript
+            .matches("[tool output truncated at configured byte limit]")
+            .count(),
+        51
+    );
+    assert_eq!(transcript.matches("exit_status=0").count(), 51);
+    assert!(!transcript.contains("command exited unsuccessfully"));
 }
 
 #[cfg(unix)]

@@ -8,4 +8,5 @@ id_regex = '^specs/(?P<id>[0-9]+)\.md$'
 backend = "builtin"
 model = "your-chatgpt-model"
 # Positive limit applies per built-in role; Pi does not accept this field.
+# max_tool_output_bytes defaults to a combined 1,048,576-byte stdout/stderr payload cap per shell call; neither stream has a reserved share.
 max_tool_calls = 100

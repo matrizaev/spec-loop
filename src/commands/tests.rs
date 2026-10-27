@@ -15,26 +15,125 @@ use super::{
 #[test]
 fn bounded_capture_drains_both_streams_and_marks_truncation() {
     let temporary = TempDir::new().expect("create temporary directory");
-    let args = [
-        "-c".to_owned(),
-        "head -c 65536 /dev/zero; head -c 65536 /dev/zero >&2".to_owned(),
-    ];
-
-    let output = run_process_until(
-        Path::new("/bin/sh"),
-        &args,
+    let output = run_bounded_capture(
         temporary.path(),
-        Some(Instant::now() + Duration::from_secs(5)),
-        Some(6),
-        &Arc::new(AtomicBool::new(false)),
-    )
-    .expect("run bounded process");
+        "head -c 65536 /dev/zero & head -c 65536 /dev/zero >&2 & wait",
+        6,
+    );
 
     assert!(output.status.is_some_and(|status| status.success()));
-    assert_eq!(output.stdout, [0; 3]);
-    assert_eq!(output.stderr, [0; 3]);
+    assert!(output.stdout.len() + output.stderr.len() <= 6);
     assert!(output.stdout_truncated);
     assert!(output.stderr_truncated);
+}
+
+#[test]
+fn bounded_capture_uses_all_capacity_for_either_single_stream() {
+    let temporary = TempDir::new().expect("create temporary directory");
+    for (stderr_only, expected_length, expected_truncated) in [
+        (false, 5, false),
+        (false, 6, false),
+        (false, 6, true),
+        (true, 5, false),
+        (true, 6, false),
+        (true, 6, true),
+    ] {
+        let produced = if expected_truncated {
+            7
+        } else {
+            expected_length
+        };
+        let (stdout_size, stderr_size) = if stderr_only {
+            (0, produced)
+        } else {
+            (produced, 0)
+        };
+        let output = run_capture_sizes(temporary.path(), stdout_size, stderr_size, 6);
+        let captured = if stderr_only {
+            &output.stderr
+        } else {
+            &output.stdout
+        };
+        assert_eq!(captured.len(), expected_length);
+        assert_eq!(output.stdout_truncated, !stderr_only && expected_truncated);
+        assert_eq!(output.stderr_truncated, stderr_only && expected_truncated);
+        assert!(output.stdout.len() + output.stderr.len() <= 6);
+    }
+}
+
+#[test]
+fn bounded_capture_single_stream_retains_800_kib_at_1_mib_limit() {
+    let temporary = TempDir::new().expect("create temporary directory");
+    for stderr_only in [false, true] {
+        let output = if stderr_only {
+            run_capture_sizes(temporary.path(), 0, 819_200, 1_048_576)
+        } else {
+            run_capture_sizes(temporary.path(), 819_200, 0, 1_048_576)
+        };
+        assert_eq!(output.stdout.len(), if stderr_only { 0 } else { 819_200 });
+        assert_eq!(output.stderr.len(), if stderr_only { 819_200 } else { 0 });
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
+        assert!(output.status.is_some_and(|status| status.success()));
+    }
+}
+
+#[test]
+fn bounded_capture_marks_only_omitted_bytes_at_boundaries() {
+    let temporary = TempDir::new().expect("create temporary directory");
+    for (stdout_size, stderr_size) in [(2, 3), (3, 3), (4, 4)] {
+        let output = run_capture_sizes(temporary.path(), stdout_size, stderr_size, 6);
+        assert!(output.stdout.len() + output.stderr.len() <= 6);
+        if stdout_size + stderr_size <= 6 {
+            assert_eq!(output.stdout.len(), stdout_size);
+            assert_eq!(output.stderr.len(), stderr_size);
+            assert!(!output.stdout_truncated);
+            assert!(!output.stderr_truncated);
+        } else {
+            assert_eq!(output.stdout_truncated, output.stdout.len() < stdout_size);
+            assert_eq!(output.stderr_truncated, output.stderr.len() < stderr_size);
+        }
+    }
+}
+
+#[test]
+fn uncapped_process_capture_retains_both_streams() {
+    let temporary = TempDir::new().expect("create temporary directory");
+    let output = run_process(
+        Path::new("/bin/sh"),
+        &["-c".to_owned(), "printf abc; printf def >&2".to_owned()],
+        temporary.path(),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .expect("run uncapped process");
+
+    assert_eq!(output.stdout, b"abc");
+    assert_eq!(output.stderr, b"def");
+    assert!(!output.stdout_truncated);
+    assert!(!output.stderr_truncated);
+}
+
+fn run_capture_sizes(
+    root: &Path,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    limit: usize,
+) -> super::ChildOutput {
+    let command = format!("head -c {stdout_bytes} /dev/zero; head -c {stderr_bytes} /dev/zero >&2");
+    run_bounded_capture(root, &command, limit)
+}
+
+fn run_bounded_capture(root: &Path, command: &str, limit: usize) -> super::ChildOutput {
+    run_process_until(
+        Path::new("/bin/sh"),
+        &["-c".to_owned(), command.to_owned()],
+        root,
+        Some(Instant::now() + Duration::from_secs(5)),
+        Some(limit),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .expect("run bounded process")
 }
 
 #[test]

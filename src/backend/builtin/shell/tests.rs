@@ -114,24 +114,97 @@ fn shell_runs_from_project_root_and_bounds_combined_output() {
     )
     .expect("run bounded shell tool");
     assert!(result.tool_output.contains("exit_status=7"));
-    assert!(result.tool_output.contains("stdout:\n123"));
-    assert!(result.tool_output.contains("stderr:\n56"));
+    let (_, streams) = result
+        .tool_output
+        .split_once("stdout:\n")
+        .expect("stdout payload");
+    let (stdout, stderr) = streams.split_once("\nstderr:\n").expect("stderr payload");
+    let (stderr, _) = stderr
+        .split_once("\n[tool output truncated at configured byte limit]")
+        .expect("truncation marker");
+    assert!(stdout.len() + stderr.len() <= 6);
     assert!(result.tool_output.contains("tool output truncated"));
     assert!(result.tool_output.contains("command exited unsuccessfully"));
+
+    let exact = run_shell(
+        temporary.path(),
+        "printf 123456",
+        6,
+        None,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .expect("run exactly fitting shell tool");
+    assert!(exact.tool_output.contains("stdout:\n123456\nstderr:\n"));
+    assert!(!exact.tool_output.contains("tool output truncated"));
 }
 
 #[test]
 fn lossy_stream_rendering_respects_combined_output_byte_limit() {
-    let invalid_utf8 = [0xff; 6];
+    let invalid_stdout = [0xff; 3];
+    let invalid_stderr = [0xfe; 3];
 
     let (stdout, stderr, stdout_truncated, stderr_truncated) =
-        render_captured_streams(&invalid_utf8, &invalid_utf8, 6);
+        render_captured_streams(&invalid_stdout, &invalid_stderr, 6);
 
-    assert!(stdout.len() + stderr.len() <= 6);
+    assert_eq!(stdout.len() + stderr.len(), 6);
+    assert!(stdout.is_char_boundary(stdout.len()));
+    assert!(stderr.is_char_boundary(stderr.len()));
     assert_eq!(stdout, "�");
     assert_eq!(stderr, "�");
     assert!(stdout_truncated);
     assert!(stderr_truncated);
+}
+
+#[test]
+fn rendering_uses_full_capacity_and_marks_only_omitted_payload() {
+    for stderr_only in [false, true] {
+        for (input_length, expected_truncated) in [(5, false), (6, false), (7, true)] {
+            let input = vec![b'x'; input_length];
+            let (stdout, stderr, stdout_truncated, stderr_truncated) = if stderr_only {
+                render_captured_streams(&[], &input, 6)
+            } else {
+                render_captured_streams(&input, &[], 6)
+            };
+            let rendered = if stderr_only { &stderr } else { &stdout };
+            assert_eq!(rendered.len(), input_length.min(6));
+            assert_eq!(stdout.len() + stderr.len(), input_length.min(6));
+            assert_eq!(stdout_truncated, !stderr_only && expected_truncated);
+            assert_eq!(stderr_truncated, stderr_only && expected_truncated);
+        }
+    }
+
+    for (stdout_length, stderr_length) in [(2, 3), (3, 3), (4, 4)] {
+        let stdout_input = vec![b'o'; stdout_length];
+        let stderr_input = vec![b'e'; stderr_length];
+        let (stdout, stderr, stdout_truncated, stderr_truncated) =
+            render_captured_streams(&stdout_input, &stderr_input, 6);
+        assert!(stdout.len() + stderr.len() <= 6);
+        if stdout_length + stderr_length <= 6 {
+            assert_eq!(stdout.len(), stdout_length);
+            assert_eq!(stderr.len(), stderr_length);
+            assert!(!stdout_truncated);
+            assert!(!stderr_truncated);
+        } else {
+            assert_eq!(stdout_truncated, stdout.len() < stdout_length);
+            assert_eq!(stderr_truncated, stderr.len() < stderr_length);
+        }
+    }
+}
+
+#[test]
+fn rendering_retains_800_kib_from_either_single_stream() {
+    let payload = vec![0_u8; 819_200];
+    for stderr_only in [false, true] {
+        let (stdout, stderr, stdout_truncated, stderr_truncated) = if stderr_only {
+            render_captured_streams(&[], &payload, 1_048_576)
+        } else {
+            render_captured_streams(&payload, &[], 1_048_576)
+        };
+        assert_eq!(stdout.len(), if stderr_only { 0 } else { 819_200 });
+        assert_eq!(stderr.len(), if stderr_only { 819_200 } else { 0 });
+        assert!(!stdout_truncated);
+        assert!(!stderr_truncated);
+    }
 }
 
 #[cfg(unix)]

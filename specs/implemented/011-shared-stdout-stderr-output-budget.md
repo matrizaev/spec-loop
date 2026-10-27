@@ -1,6 +1,6 @@
 # Spec 011: Shared Stdout/Stderr Output Budget
 
-**Status:** Active
+**Status:** Complete
 
 ## Goal
 
