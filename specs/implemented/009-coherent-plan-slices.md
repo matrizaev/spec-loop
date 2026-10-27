@@ -1,6 +1,6 @@
 # Spec 009: Coherent Plan Slices
 
-**Status:** Active
+**Status:** Complete
 
 ## Goal
 

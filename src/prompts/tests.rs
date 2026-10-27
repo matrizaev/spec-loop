@@ -63,6 +63,17 @@ fn plan_roles_require_research_complete_executable_handoffs() {
     assert!(author.contains("Run relevant safe baselines, probes, or benchmarks"));
     assert!(author.contains("Do not defer research, consequential design choices"));
     assert!(author.contains("map every acceptance criterion to ordered changes and tests"));
+    assert!(author.contains("ordered sequence of coherent, bounded slices"));
+    assert!(author.contains("For each slice, state its intended outcome, relevant work and tests"));
+    assert!(author.contains("dependencies on earlier slices"));
+    assert!(author.contains("every acceptance criterion and required repository instruction"));
+    assert!(author.contains("A small or naturally indivisible change may use one slice"));
+    assert!(
+        author.contains(
+            "do not invent extra slices or split work into incomplete placeholder behavior"
+        )
+    );
+    assert!(author.contains("not a required plan format or schema"));
     assert!(author.contains("Research belongs to the PlanAuthor"));
     assert!(author.contains("never return `blocked` because research"));
     assert!(author.contains("Only a genuinely unavailable external input, access, or approval"));
@@ -75,12 +86,68 @@ fn plan_roles_require_research_complete_executable_handoffs() {
     let implementation = build(PromptRole::Implementation);
     assert!(implementation.contains("A plan's use of words such as `blocked`"));
     assert!(implementation.contains("Do not stop solely because the plan labels work blocked"));
-    assert!(implementation.contains("ready_for_review` means the current workspace"));
+    assert!(implementation.contains("`ready_for_review` means the current changes are ready"));
     assert!(implementation.contains("resume from the current workspace and preserve prior work"));
     assert!(implementation.contains(
         "Unfinished work, its size, or the fact that a finding remains is not by itself a blocker"
     ));
     assert!(implementation.contains("Approved plans are proposed guidance"));
+    assert!(implementation.contains("selected specification remains the full authoritative scope"));
+    assert!(implementation.contains("approved plan is read-only"));
+}
+
+#[test]
+fn coherent_slice_guidance_is_role_scoped_and_preserves_full_review_scope() {
+    let profile: Profile = toml::from_str(
+            "schema_version = 3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='pi'\n",
+        )
+        .expect("profile");
+    let build = |role| {
+        build_prompt(
+            Path::new("/project"),
+            &profile,
+            PromptContext {
+                role,
+                spec_id: "1",
+                spec_path: Path::new("specs/1.md"),
+                plan_path: Some(Path::new(".spec-loop/plans/1.md")),
+                feedback: None,
+                validation_feedback: None,
+                checks: "",
+            },
+        )
+        .expect("build role prompt")
+    };
+
+    let author = build(PromptRole::PlanAuthor);
+    assert!(author.contains("ordered sequence of coherent, bounded slices"));
+    assert!(author.contains("every acceptance criterion and required repository instruction"));
+
+    let implementation = build(PromptRole::Implementation);
+    assert!(implementation.contains("next uncompleted coherent slice in plan order"));
+    assert!(implementation.contains("only prerequisites necessary for that slice"));
+    assert!(implementation.contains("Do not implement all remaining slices at once"));
+    assert!(implementation.contains("or jump ahead to later independent slices"));
+    assert!(implementation.contains("address those before advancing"));
+    assert!(implementation.contains("later slices remain required"));
+    assert!(implementation.contains("current changes are ready for configured checks and independent review, even if later slices remain"));
+    assert!(implementation.contains("selected specification remains the full authoritative scope"));
+    assert!(implementation.contains("approved plan is read-only"));
+
+    let review = build(PromptRole::Review);
+    assert!(review.contains("full selected specification and full approved plan"));
+    assert!(review.contains("Slice boundaries guide implementation order only"));
+    assert!(review.contains("do not narrow review scope or excuse unmet acceptance criteria"));
+
+    for role in [
+        PromptRole::PlanReview,
+        PromptRole::PlanAudit,
+        PromptRole::PlanClarification,
+        PromptRole::ReviewAudit,
+        PromptRole::ReviewClarification,
+    ] {
+        assert!(!build(role).contains("slice"));
+    }
 }
 
 #[test]
