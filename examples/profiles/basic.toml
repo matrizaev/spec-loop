@@ -21,6 +21,7 @@ timeout_seconds = 1800
 
 [agent]
 # Omitted backend selects built-in OpenAI Responses; set model before use.
+# Omitting max_tool_calls means no Spec Loop shell-call count ceiling.
 model = "your-chatgpt-model"
 timeout_seconds = 3600
 

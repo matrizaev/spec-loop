@@ -55,9 +55,11 @@ existing strict typed role protocol.
   override global `agent.thinking`, matching Pi precedence. Preserve Pi's
   current behavior. Validate the Pi executable only when Pi is selected.
 - Add positive `[agent]` limits `max_tool_calls` and `max_tool_output_bytes`
-  for the built-in backend. Defaults are 50 shell calls per role and 1,048,576
-  combined stdout/stderr bytes returned per shell call. Reject zero values and
-  reject these fields when Pi is selected rather than silently ignoring them.
+  for the built-in backend. At the time of Spec 004, defaults were 50 shell
+  calls per role and 1,048,576 combined stdout/stderr bytes returned per shell
+  call. Spec 008 supersedes the implicit call-count default: omission now means
+  no Spec Loop call-count ceiling. Reject zero values and reject these fields
+  when Pi is selected rather than silently ignoring them.
 - Update the checked-in profile to schema version 3 and retain its explicit Pi
   backend. Update valid profile examples to schema version 3; include an
   example of the built-in defaults and examples of explicit Pi selection.

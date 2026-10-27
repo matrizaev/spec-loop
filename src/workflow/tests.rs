@@ -165,7 +165,7 @@ impl AgentBackend for FatalToolLimitBackend {
             .lock()
             .expect("lock fatal backend calls")
             .push(role);
-        assert_eq!(profile.agent.max_tool_calls(), 1);
+        assert_eq!(profile.agent.max_tool_calls, Some(1));
         Ok(AgentRun {
             outcome: Err(BackendFailure::fatal(SpecLoopError::Workflow(
                 self.diagnostic.clone(),
@@ -424,6 +424,44 @@ fn builtin_workflow_fatal_tool_limit_does_not_retry_role() {
     );
     fs::remove_dir_all(run_dir_observer.expect("fatal run retains logs"))
         .expect("remove fatal workflow logs");
+}
+
+#[test]
+fn invalid_shell_call_limits_fail_before_agent_invocation() {
+    for (backend, limit, expected_diagnostic) in [
+        ("builtin", 0, "must be positive when set"),
+        ("pi", 1, "only valid for the built-in backend"),
+    ] {
+        let (_temporary, root) = builtin_workflow_fixture();
+        fs::write(
+            root.join(".spec-loop.toml"),
+            format!(
+                "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[plan]\npath_template = '.spec-loop/plans/{{spec_id}}.md'\n[agent]\nbackend = '{backend}'\nmodel = 'fixture-model'\nmax_tool_calls = {limit}\n"
+            ),
+        )
+        .expect("write invalid call-limit profile");
+        let cli = crate::cli::Cli::try_parse_from(["spec-loop", "--spec", "001"])
+            .expect("parse workflow arguments");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let result = run_at(
+            &cli,
+            root,
+            Some(Box::new(FakeBuiltinBackend {
+                responses: Mutex::new(VecDeque::new()),
+                observed: Arc::clone(&observed),
+            })),
+            false,
+            None,
+        );
+        let error = result.expect_err("invalid shell call limit must fail profile validation");
+        assert!(error.to_string().contains(expected_diagnostic));
+        assert!(
+            observed
+                .lock()
+                .expect("lock backend observations")
+                .is_empty()
+        );
+    }
 }
 
 #[test]

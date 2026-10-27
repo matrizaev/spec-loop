@@ -1,0 +1,11 @@
+schema_version = 3
+
+[specs]
+active_globs = ["specs/*.md"]
+id_regex = '^specs/(?P<id>[0-9]+)\.md$'
+
+[agent]
+backend = "builtin"
+model = "your-chatgpt-model"
+# Positive limit applies per built-in role; Pi does not accept this field.
+max_tool_calls = 100

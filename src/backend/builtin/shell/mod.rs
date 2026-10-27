@@ -25,15 +25,18 @@ pub(super) fn execute_shell_calls(
 ) -> Result<()> {
     for call in calls {
         ensure_active(deadline, cancelled)?;
-        if conversation.tool_calls >= profile.agent.max_tool_calls() {
-            return Err(SpecLoopError::Workflow(format!(
-                "built-in agent reached agent.max_tool_calls={} before executing another shell call; role stopped without replay",
-                profile.agent.max_tool_calls()
-            )));
+        if let (Some(tool_calls), Some(limit)) =
+            (&mut conversation.tool_calls, profile.agent.max_tool_calls)
+        {
+            if *tool_calls >= limit {
+                return Err(SpecLoopError::Workflow(format!(
+                    "built-in agent reached agent.max_tool_calls={limit} before executing another shell call; role stopped without replay"
+                )));
+            }
+            *tool_calls = tool_calls.checked_add(1).ok_or_else(|| {
+                SpecLoopError::Workflow("built-in shell call counter overflowed".to_owned())
+            })?;
         }
-        conversation.tool_calls = conversation.tool_calls.checked_add(1).ok_or_else(|| {
-            SpecLoopError::Workflow("built-in shell call counter overflowed".to_owned())
-        })?;
         let result = run_shell(
             root,
             &call.command,

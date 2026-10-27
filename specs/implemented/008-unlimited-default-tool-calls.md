@@ -1,6 +1,6 @@
 # Spec 008: Unlimited Default Tool Calls
 
-**Status:** Active
+**Status:** Complete
 
 ## Goal
 

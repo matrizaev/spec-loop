@@ -25,6 +25,7 @@ fn profile_load_reports_manual_migration_for_legacy_versions() {
 fn documented_profiles_parse_and_validate() {
     for example in [
         include_str!("../../examples/profiles/basic.toml"),
+        include_str!("../../examples/profiles/builtin-call-limit.toml"),
         include_str!("../../examples/profiles/planned-archive.toml"),
         include_str!("../../examples/profiles/status-update.toml"),
         include_str!("../../.spec-loop.toml"),
@@ -58,7 +59,7 @@ fn documented_profiles_parse_and_validate() {
 }
 
 #[test]
-fn builtin_backend_defaults_limits_and_requires_explicit_model() {
+fn builtin_backend_omits_call_limit_and_requires_explicit_model() {
     let missing_model: Profile = toml::from_str(
         "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n",
     )
@@ -74,8 +75,17 @@ fn builtin_backend_defaults_limits_and_requires_explicit_model() {
         )
         .expect("parse built-in profile");
     configured.validate().expect("valid built-in profile");
-    assert_eq!(configured.agent.max_tool_calls(), 50);
+    assert_eq!(configured.agent.max_tool_calls, None);
     assert_eq!(configured.agent.max_tool_output_bytes(), 1_048_576);
+
+    let explicitly_limited: Profile = toml::from_str(
+        "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'model-name'\nmax_tool_calls = 3\n",
+    )
+    .expect("parse explicit call limit");
+    explicitly_limited
+        .validate()
+        .expect("positive explicit call limit is valid");
+    assert_eq!(explicitly_limited.agent.max_tool_calls, Some(3));
 }
 
 #[test]
@@ -85,7 +95,10 @@ fn validates_backend_specific_tool_limits() {
                 "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'model-name'\n{field} = {value}\n"
             ))
             .expect("parse zero builtin limit");
-        assert!(profile.validate().is_err());
+        let error = profile
+            .validate()
+            .expect_err("zero built-in limits must be rejected");
+        assert!(error.to_string().contains("must be positive when set"));
 
         let pi_profile: Profile = toml::from_str(&format!(
                 "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\n{field} = 1\n"
@@ -100,6 +113,12 @@ fn validates_backend_specific_tool_limits() {
                 .contains("only valid for the built-in backend")
         );
     }
+}
+
+#[test]
+fn rejects_unknown_agent_call_limit_field() {
+    let profile = "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'model-name'\nmax_tool_callz = 1\n";
+    assert!(toml::from_str::<Profile>(profile).is_err());
 }
 
 #[test]

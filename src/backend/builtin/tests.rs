@@ -420,8 +420,8 @@ fn configured_shell_call_limit_stops_after_permitted_calls_without_replay() {
     let address = listener.local_addr().expect("provider fixture address");
     let temporary = TempDir::new().expect("create built-in project root");
     let marker = temporary.path().join("shell-invocations");
-    let first_command = "printf x >> shell-invocations";
-    let second_command = "printf y >> shell-invocations";
+    let first_command = "printf x >> shell-invocations; printf prior-effect > prior-effect";
+    let second_command = "printf y >> shell-invocations; printf over-limit > over-limit-effect";
     let tool_response = json!({
         "type": "response.completed",
         "response": {
@@ -495,10 +495,270 @@ max_tool_calls=1
         std::fs::read_to_string(marker).expect("read permitted shell side effect"),
         "x"
     );
-    assert!(String::from_utf8_lossy(&run.stdout).contains("exit_status=0"));
+    assert_eq!(
+        std::fs::read_to_string(temporary.path().join("prior-effect"))
+            .expect("read permitted command effect"),
+        "prior-effect"
+    );
+    assert!(!temporary.path().join("over-limit-effect").exists());
+    let transcript = String::from_utf8_lossy(&run.stdout);
+    assert!(transcript.contains(first_command));
+    assert!(!transcript.contains(second_command));
+    assert!(transcript.contains("exit_status=0"));
 
     let request = server.join().expect("join provider fixture");
     assert!(request.starts_with("POST /v1/responses "));
+}
+
+#[cfg(unix)]
+#[test]
+fn omitted_call_limit_allows_more_than_fifty_shell_calls() {
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let temporary = TempDir::new().expect("create built-in project root");
+    let calls = (0..51)
+        .map(|index| {
+            json!({
+                "type": "function_call",
+                "call_id": format!("call-{index}"),
+                "name": "spec_loop.shell",
+                "arguments": serde_json::to_string(&json!({
+                    "command": "printf x >> shell-call-count; printf 1234; printf 5678 >&2"
+                }))
+                .expect("serialize shell command")
+            })
+        })
+        .collect::<Vec<_>>();
+    let tool_response = json!({
+        "type": "response.completed",
+        "response": {"status": "completed", "output": calls}
+    });
+    let final_text = r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Completed 51 shell calls"}"#;
+    let final_response = json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "model": "fixture-model",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": final_text}]
+            }]
+        }
+    });
+    let bodies = [
+        completed_sse(&tool_response),
+        completed_sse(&final_response),
+    ];
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for body in bodies {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            requests.push(read_http_request(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write provider response");
+        }
+        requests
+    });
+    let profile: Profile = toml::from_str(
+        r"schema_version=3
+[specs]
+active_globs=['specs/*.md']
+id_regex='^specs/(?P<id>[0-9]+)\.md$'
+[agent]
+backend='builtin'
+model='fixture-model'
+max_tool_output_bytes=6
+",
+    )
+    .expect("parse built-in profile without a call limit");
+    profile.validate().expect("validate built-in profile");
+    assert_eq!(profile.agent.max_tool_calls, None);
+    let mut transcript = Vec::new();
+    let response = crate::runtime::block_on(run_role_with_access_token(
+        RoleInput {
+            root: temporary.path(),
+            profile: &profile,
+            prompt: "run more than fifty calls",
+            role: PromptRole::Implementation,
+            cancelled: &Arc::new(AtomicBool::new(false)),
+            deadline: None,
+            endpoint: &format!("http://{address}/v1/responses"),
+            token: "fixture-access-token",
+        },
+        &mut transcript,
+    ))
+    .expect("construct runtime")
+    .expect("run role after 51 successful commands");
+    crate::protocol::parse::<crate::protocol::ImplementationResponse>(
+        &response.response,
+        PromptRole::Implementation.protocol_name(),
+    )
+    .expect("validate final implementation response");
+    assert_eq!(
+        std::fs::read_to_string(temporary.path().join("shell-call-count"))
+            .expect("read all shell effects"),
+        "x".repeat(51)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&transcript)
+            .matches("$ printf")
+            .count(),
+        51
+    );
+
+    let requests = server.join().expect("join provider fixture");
+    assert_eq!(requests.len(), 2);
+    let second_request = requests
+        .get(1)
+        .expect("second provider request after tool calls");
+    let (_, payload) = second_request
+        .split_once("\r\n\r\n")
+        .expect("second provider request body");
+    let payload: Value = serde_json::from_str(payload).expect("parse second request");
+    let outputs = payload
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("provider input items")
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+        .collect::<Vec<_>>();
+    assert_eq!(outputs.len(), 51);
+    for output in outputs {
+        let text = output
+            .get("output")
+            .and_then(Value::as_str)
+            .expect("shell output string");
+        assert!(text.contains("stdout:\n123"));
+        assert!(text.contains("stderr:\n567"));
+        assert!(text.contains("tool output truncated at configured byte limit"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn configured_shell_call_limit_resets_for_each_role() {
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let temporary = TempDir::new().expect("create built-in project root");
+    let role_responses = [
+        (
+            PromptRole::Implementation,
+            "i",
+            r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Implementation complete"}"#,
+        ),
+        (
+            PromptRole::Review,
+            "r",
+            r#"{"protocol_version":1,"role":"review","status":"no_issues","findings":[]}"#,
+        ),
+    ];
+    let mut bodies = Vec::new();
+    for (index, (_, marker, final_text)) in role_responses.iter().enumerate() {
+        let tool_response = json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "output": [{
+                "type": "function_call",
+                "call_id": format!("call-role-{index}"),
+                "name": "spec_loop.shell",
+                "arguments": serde_json::to_string(&json!({
+                    "command": format!("printf {marker} >> role-call-count")
+                }))
+                .expect("serialize role shell command")
+            }]}
+        });
+        let final_response = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "model": "fixture-model",
+                "output": [{"type": "message", "content": [{
+                    "type": "output_text",
+                    "text": final_text
+                }]}]
+            }
+        });
+        bodies.push(completed_sse(&tool_response));
+        bodies.push(completed_sse(&final_response));
+    }
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for body in bodies {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            requests.push(read_http_request(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write provider response");
+        }
+        requests
+    });
+    let profile: Profile = toml::from_str(
+        r"schema_version=3
+[specs]
+active_globs=['specs/*.md']
+id_regex='^specs/(?P<id>[0-9]+)\.md$'
+[agent]
+backend='builtin'
+model='fixture-model'
+max_tool_calls=1
+",
+    )
+    .expect("parse limited built-in profile");
+    profile.validate().expect("validate limited profile");
+
+    for (role, _, _) in role_responses {
+        let mut transcript = Vec::new();
+        let response = crate::runtime::block_on(run_role_with_access_token(
+            RoleInput {
+                root: temporary.path(),
+                profile: &profile,
+                prompt: "run one command for this role",
+                role,
+                cancelled: &Arc::new(AtomicBool::new(false)),
+                deadline: None,
+                endpoint: &format!("http://{address}/v1/responses"),
+                token: "fixture-access-token",
+            },
+            &mut transcript,
+        ))
+        .expect("construct runtime")
+        .expect("one limited shell call should succeed per role");
+        match role {
+            PromptRole::Implementation => {
+                crate::protocol::parse::<crate::protocol::ImplementationResponse>(
+                    &response.response,
+                    role.protocol_name(),
+                )
+                .expect("validate implementation response");
+            }
+            PromptRole::Review => {
+                crate::protocol::parse::<crate::protocol::ImplementationReviewResponse>(
+                    &response.response,
+                    role.protocol_name(),
+                )
+                .expect("validate review response");
+            }
+            _ => unreachable!(),
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(temporary.path().join("role-call-count"))
+            .expect("read role effects"),
+        "ir"
+    );
+    assert_eq!(server.join().expect("join provider fixture").len(), 4);
 }
 
 fn token_refresh_responses() -> [String; 2] {

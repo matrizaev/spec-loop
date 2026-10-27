@@ -9,7 +9,6 @@ use crate::error::{Result, SpecLoopError, io_error};
 #[cfg(test)]
 mod tests;
 const SCHEMA_VERSION: u32 = 3;
-const DEFAULT_MAX_TOOL_CALLS: usize = 50;
 const DEFAULT_MAX_TOOL_OUTPUT_BYTES: usize = 1_048_576;
 const SPEC_ID_PLACEHOLDER: &str = "{spec_id}";
 const SPEC_PATH_PLACEHOLDER: &str = "{spec_path}";
@@ -251,14 +250,6 @@ pub enum AgentStage {
 }
 
 impl AgentConfig {
-    /// Returns configured or specification-default shell calls per built-in role.
-    pub const fn max_tool_calls(&self) -> usize {
-        match self.max_tool_calls {
-            Some(value) => value,
-            None => DEFAULT_MAX_TOOL_CALLS,
-        }
-    }
-
     /// Returns configured or specification-default retained output bytes per shell call.
     pub const fn max_tool_output_bytes(&self) -> usize {
         match self.max_tool_output_bytes {
@@ -385,7 +376,7 @@ fn validate_agent(agent: &AgentConfig) -> Result<()> {
                         .to_owned(),
                 ));
             }
-            if agent.max_tool_calls() == 0 {
+            if agent.max_tool_calls == Some(0) {
                 return Err(SpecLoopError::Config(
                     "agent.max_tool_calls must be positive when set".to_owned(),
                 ));

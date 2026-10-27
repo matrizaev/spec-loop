@@ -29,7 +29,7 @@ pub(super) struct BuiltinBackend;
 
 struct BuiltinConversation {
     input: Vec<Value>,
-    tool_calls: usize,
+    tool_calls: Option<usize>,
 }
 
 impl AgentBackend for BuiltinBackend {
@@ -307,7 +307,7 @@ where
         }
         None => BuiltinConversation {
             input: vec![json!({"role": "user", "content": prompt})],
-            tool_calls: 0,
+            tool_calls: profile.agent.max_tool_calls.map(|_| 0),
         },
     };
     loop {
