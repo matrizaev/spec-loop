@@ -25,8 +25,8 @@ lint:
 	$(CARGO) clippy --locked --all-targets --all-features -- $(CLIPPY_DENY)
 
 test:
-	$(CARGO) test --locked --all-targets --all-features
-	$(CARGO) test --locked --doc --all-features
+	$(CARGO) test -q --locked --all-targets --all-features
+	$(CARGO) test -q --locked --doc --all-features
 
 doc:
 	RUSTDOCFLAGS="$(RUSTDOCFLAGS)" $(CARGO) doc --locked --all-features --no-deps

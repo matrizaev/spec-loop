@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 #![deny(warnings, clippy::pedantic, clippy::nursery)]
 
+use std::process::ExitCode;
+
+use clap::Parser;
+
+use crate::cli::{AuthSubcommand, Cli, CliCommand};
+
 mod auth;
 mod backend;
 mod cli;
@@ -17,11 +23,6 @@ mod run_dir;
 mod runtime;
 mod workflow;
 
-use std::process::ExitCode;
-
-use clap::Parser;
-
-use crate::cli::{AuthSubcommand, Cli, CliCommand};
 /// Parses CLI arguments and runs one configured workflow or auth command.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
@@ -45,14 +46,14 @@ pub fn run() -> ExitCode {
                         AuthSubcommand::Login {
                             account,
                             new_account,
-                        } => auth::AuthCommand::Login {
-                            account,
-                            new_account,
-                        },
-                        AuthSubcommand::Status => auth::AuthCommand::Status,
-                        AuthSubcommand::Logout { account } => auth::AuthCommand::Logout { account },
+                        } => auth::RegistrationTarget::from_options(account, new_account)
+                            .map(|target| auth::AuthCommand::Login { target }),
+                        AuthSubcommand::Status => Ok(auth::AuthCommand::Status),
+                        AuthSubcommand::Logout { account } => {
+                            Ok(auth::AuthCommand::Logout { account })
+                        }
                     };
-                    auth::run(command, &cancelled)
+                    command.and_then(|command| auth::run(command, &cancelled))
                 }
                 Err(error) => Err(error::SpecLoopError::Process(format!(
                     "install interrupt handler: {error}"

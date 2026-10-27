@@ -23,9 +23,11 @@ Every rule in this section is mandatory. No exceptions, suppressions, or local o
 - Prohibit production `unwrap()`, `expect()`, `panic!`, `unreachable!`, `todo!`, and `unimplemented!`. Return typed errors with operation, path, and causal context. Never discard errors or use fallback values to hide failure. Tests may use assertions and panic-based failure reporting.
 - Eliminate every compiler warning and Clippy warning. Deny all warnings, `clippy::pedantic`, and `clippy::nursery` across all targets and features. Do not add lint allowances, warning suppressions, or lint exceptions. Fix the underlying issue.
 - Format only with nightly `rustfmt`. Maintain `rustfmt.toml` with `group_imports = "StdExternalCrate"` and `reorder_imports = true`; stable rustfmt silently ignores `group_imports`. Pin exact nightly date in CI and formatting scripts. Commit no formatting deviations.
-- Group imports in standard-library, external-crate, and crate-local groups. Use explicit imports; prohibit glob imports in production. Put module imports first, child-module declarations next, and remaining items after them. Use `self::` for sibling-module imports.
+- Enforce architecture limits for every first-party Rust file, including `src/`, `tests/`, `examples/`, `benches/`, build scripts, and other repository locations: production files have at most 1,598 physical lines; files named `tests.rs` and Rust files under `tests/` have at most 2,098. Count blank lines, comments, and an unterminated final line. Exclude only root `.git/` metadata, root `target/` build output, and exact generated/vendored files listed with provenance in `tests/architecture-exclusions.txt`; never infer exclusions from directory names or generated markers.
+- Group imports in standard-library (`std`, `core`, `alloc`), external-crate, and crate-local groups, in that order. Keep each category in a separate `use` tree/group; use explicit imports and prohibit glob imports in production and test code. Put imports first, out-of-line child-module declarations next, and remaining module-level items after them. A `macro_rules!` declaration may precede a child declaration only when that child or its descendant invokes it. Use `self::` for sibling-module imports.
+- Give every module its own filesystem-backed source file. A module with child modules, including an out-of-line test module, uses `module/mod.rs` as its root and stores children in that directory; a childless leaf may use `module.rs`. Do not combine both root forms for one module. Unit tests are out-of-line child modules in `module/tests.rs`. Inline module bodies are forbidden everywhere, and `#[path]` relocation is forbidden.
 - Use checked conversions and arithmetic for values influenced by files, configuration, processes, or users. Do not use lossy casts, unchecked indexing, or assumptions about external data.
-- Keep functions focused, types explicit, and state transitions represented with enums rather than boolean combinations or stringly typed values. Validate data at boundaries and maintain validated types after parsing.
+- Keep functions focused, types explicit, and mutually exclusive lifecycle/workflow choices represented with enums or state-specific types rather than independent booleans. Keep booleans for genuinely independent options and facts. Convert external representations into validated semantic values at boundaries; add newtypes and encapsulation only for concrete invariants or prevention of meaningful type confusion, not for appearance.
 - Document every public item and every non-obvious invariant, security boundary, state transition, and error contract. Write comments that explain rationale and constraints, not syntax.
 - Add no dependency without a demonstrated requirement and a review of maintenance status, feature surface, MSRV, license, transitive dependencies, and supply-chain impact. Disable unused default features. Commit `Cargo.lock` and review every lockfile change.
 - Keep declared `rust-version`, CI toolchains, and dependency MSRVs exactly consistent. Reject dependencies that exceed the declared MSRV. Never infer finalized versions or MSRV from proposed plans.
@@ -56,14 +58,14 @@ Do not add arbitrary shell hooks, dynamic shell expansion, project-specific defa
 
 ## Testing and quality gates
 
-Use focused tests while iterating. Before handoff for code or configuration changes, run `make check` from the repository root after the final change; this gate is mandatory. For documentation-only changes, skip `make check` and run relevant lightweight validation such as `git diff --check`. If an external blocker prevents a passing required check, report the task as incomplete and name the exact blocker and failing gate. Once the Cargo project and scripts exist, expected Rust checks are:
+During iteration, run only targeted tests, using quiet output such as `cargo test -q <test-filter>` (add package/target selectors as needed). Do not run the full test suite until the final required `make check`. Quiet flags reduce successful-test output; they must not hide failures or replace inspecting failure diagnostics. Before handoff for code or configuration changes, run `make check` from the repository root after the final change; this gate is mandatory. For documentation-only changes, skip `make check` and run relevant lightweight validation such as `git diff --check`. If an external blocker prevents a passing required check, report the task as incomplete and name the exact blocker and failing gate. Once the Cargo project and scripts exist, expected Rust checks are:
 
 ```text
 cargo +nightly-<pinned-date> fmt --all -- --check
 cargo check --locked --all-targets --all-features
 cargo clippy --locked --all-targets --all-features -- -D warnings -D clippy::pedantic -D clippy::nursery
-cargo test --locked --all-targets --all-features
-cargo test --locked --doc --all-features
+cargo test -q --locked --all-targets --all-features
+cargo test -q --locked --doc --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 ```
 

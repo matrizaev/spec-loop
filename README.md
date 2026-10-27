@@ -119,6 +119,8 @@ Pi resource availability is controlled only by user's Pi configuration; Spec Loo
 
 ## Self-hosting
 
+Spec Loop is built with Spec Loop itself: this repository's specifications are planned, implemented, checked, and reviewed through the CLI.
+
 The checked-in `.spec-loop.toml` runs `make check`, defaults review context to `git diff`, and archives approved specs under `specs/implemented`. It has no lifecycle actions. Add an active spec matching configured `specs.active_globs` and `specs.id_regex`, then create and approve its plan:
 
 ```sh

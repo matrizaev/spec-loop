@@ -2,6 +2,9 @@ use clap::{Args, Parser, Subcommand};
 
 use crate::output::ColorMode;
 
+#[cfg(test)]
+mod tests;
+
 /// Command-line options for the generic specification workflow.
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -96,9 +99,31 @@ pub enum AuthSubcommand {
     },
 }
 
+/// Mutually exclusive workflow operation selected by CLI options.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowMode {
+    /// Run implementation and its configured review workflow.
+    Implement,
+    /// Review the selected specification against the current workspace.
+    Review,
+    /// Author and review a plan for the selected specification.
+    Plan,
+}
+
+impl WorkflowMode {
+    /// Returns the user-facing label used in dry-run output.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Implement => "implementation",
+            Self::Review => "review",
+            Self::Plan => "plan",
+        }
+    }
+}
+
 impl Cli {
     pub fn validate(&self) -> crate::error::Result<()> {
-        if (self.is_review() || self.is_plan()) && self.spec.is_none() {
+        if !matches!(self.workflow_mode()?, WorkflowMode::Implement) && self.spec.is_none() {
             return Err(crate::error::SpecLoopError::Config(
                 "--review and --plan require --spec ID".to_owned(),
             ));
@@ -115,12 +140,15 @@ impl Cli {
         Ok(())
     }
 
-    pub const fn is_review(&self) -> bool {
-        self.mode.review
-    }
-
-    pub const fn is_plan(&self) -> bool {
-        self.mode.plan
+    pub fn workflow_mode(&self) -> crate::error::Result<WorkflowMode> {
+        match (self.mode.review, self.mode.plan) {
+            (false, false) => Ok(WorkflowMode::Implement),
+            (true, false) => Ok(WorkflowMode::Review),
+            (false, true) => Ok(WorkflowMode::Plan),
+            (true, true) => Err(crate::error::SpecLoopError::Config(
+                "--review and --plan cannot be used together".to_owned(),
+            )),
+        }
     }
 
     pub const fn is_dry_run(&self) -> bool {
@@ -140,29 +168,5 @@ impl Cli {
             Some(mode) => mode,
             None => ColorMode::Auto,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use clap::Parser;
-
-    use super::Cli;
-    use crate::output::ColorMode;
-
-    #[test]
-    fn workflow_output_options_parse_and_are_rejected_for_auth() {
-        let workflow = Cli::try_parse_from(["spec-loop", "--verbose", "--color", "always"])
-            .expect("workflow options parse");
-        assert!(workflow.verbose());
-        assert_eq!(workflow.color_mode(), ColorMode::Always);
-
-        let auth = Cli::try_parse_from(["spec-loop", "--color", "auto", "auth", "status"])
-            .expect("auth with workflow option parses for explicit rejection");
-        assert!(auth.validate_auth_options().is_err());
-        let auth_verbose = Cli::try_parse_from(["spec-loop", "--verbose", "auth", "status"])
-            .expect("auth with verbose parses for explicit rejection");
-        assert!(auth_verbose.validate_auth_options().is_err());
-        assert!(Cli::try_parse_from(["spec-loop", "--color", "rainbow"]).is_err());
     }
 }

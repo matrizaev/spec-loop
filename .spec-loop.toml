@@ -22,6 +22,7 @@ argv = ["make", "check"]
 backend = "builtin"
 model = "gpt-6-luna"
 thinking = "xhigh"
+max_tool_calls = 500
 
 [completion]
 max_passes = 0

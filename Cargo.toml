@@ -33,6 +33,7 @@ webbrowser = { version = "1.2.5", default-features = false }
 
 [dev-dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+syn = { version = "=2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
 
 [lints.rust]
 warnings = "deny"

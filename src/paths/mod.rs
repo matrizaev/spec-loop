@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, SpecLoopError, io_error};
 
+#[cfg(test)]
+mod tests;
 const SPEC_ID_PLACEHOLDER: &str = "{spec_id}";
 const SPEC_PATH_PLACEHOLDER: &str = "{spec_path}";
 const PLAN_PATH_PLACEHOLDER: &str = "{plan_path}";
@@ -87,24 +89,4 @@ pub fn path_to_utf8(path: &Path, field: &str) -> Result<String> {
     path.to_str().map(str::to_owned).ok_or_else(|| {
         SpecLoopError::Config(format!("{field} is not valid UTF-8: {}", path.display()))
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::Path;
-
-    use super::expand_template;
-
-    #[test]
-    fn substituted_values_are_not_reinterpreted_as_placeholders() {
-        assert_eq!(
-            expand_template(
-                "{spec_id}|{spec_path}|{plan_path}",
-                "001{spec_path}",
-                Path::new("specs/{plan_path}.md"),
-                Some(Path::new("plans/{spec_id}.md")),
-            ),
-            "001{spec_path}|specs/{plan_path}.md|plans/{spec_id}.md"
-        );
-    }
 }

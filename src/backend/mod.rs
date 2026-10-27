@@ -9,6 +9,9 @@ use crate::error::{Result, SpecLoopError};
 use crate::output::Output;
 use crate::prompts::PromptRole;
 
+#[cfg(test)]
+mod tests;
+
 mod builtin;
 pub mod pi;
 
@@ -164,24 +167,5 @@ pub fn validate_prerequisites(profile: &Profile) -> Result<()> {
     match profile.agent.backend {
         AgentBackendKind::Builtin => builtin::validate_shell_prerequisites(),
         AgentBackendKind::Pi => Ok(()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{BackendFailure, BackendFailureKind};
-    use crate::error::SpecLoopError;
-
-    #[test]
-    fn retryable_backend_failure_preserves_original_error() {
-        let retryable = BackendFailure::retryable(SpecLoopError::Agent("retry".to_owned()));
-        assert_eq!(retryable.kind(), BackendFailureKind::Retryable);
-        assert!(matches!(retryable.into_error(), SpecLoopError::Agent(_)));
-    }
-
-    #[test]
-    fn backend_interruption_remains_interruption() {
-        let retryable = BackendFailure::retryable(SpecLoopError::Interrupted);
-        assert!(matches!(retryable.into_error(), SpecLoopError::Interrupted));
     }
 }
