@@ -1,6 +1,6 @@
 # Spec 010: Configurable Built-in Authentication Directory
 
-**Status:** Active
+**Status:** Complete
 
 ## Goal
 

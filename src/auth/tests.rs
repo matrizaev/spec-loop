@@ -31,8 +31,9 @@ use super::{
     credential_store_unavailable, expiry_timestamp, login_with_services, manual_authorization_url,
     parse_callback, persist_registration_with, present_authorization_url, project_boundary,
     refresh_credential, refresh_is_due, refreshed_credential, registration_id,
-    registry_path_for_config_dir, select_registration, validate_callback, validate_credential,
-    validate_external_registry_path, write_test_credentials,
+    registry_path_for_auth_dir, registry_path_for_config_dir, select_registration,
+    validate_callback, validate_credential, validate_external_registry_path,
+    write_test_credentials,
 };
 use crate::error::{Result, SpecLoopError};
 
@@ -106,6 +107,22 @@ fn run_fake_login_in(
     cancel_at_callback: bool,
 ) -> FakeLoginRun {
     let path = temporary.path().join("spec-loop/auth.json");
+    run_fake_login_at(
+        temporary,
+        path,
+        token_response,
+        expected_state,
+        cancel_at_callback,
+    )
+}
+
+fn run_fake_login_at(
+    temporary: TempDir,
+    path: std::path::PathBuf,
+    token_response: FakeTokenResponse,
+    expected_state: bool,
+    cancel_at_callback: bool,
+) -> FakeLoginRun {
     let authorization = Arc::new(Mutex::new(None));
     let expected_requests = usize::from(expected_state && !cancel_at_callback) + 2;
     let (issuer, server) = start_fake_issuer(
@@ -148,7 +165,7 @@ fn run_fake_login_in(
                 )
             },
             save_registration: move |registry: &mut Registry,
-                                     _path: &Path,
+                                     path: &Path,
                                      issuer: String,
                                      subject: String,
                                      client_id: String,
@@ -157,6 +174,7 @@ fn run_fake_login_in(
                 assert_eq!(issuer, expected_issuer);
                 save_test_registration(FakeRegistrationSave {
                     registry,
+                    path,
                     issuer,
                     subject,
                     client_id,
@@ -262,6 +280,7 @@ fn fake_callback(
 
 struct FakeRegistrationSave<'a> {
     registry: &'a mut Registry,
+    path: &'a Path,
     issuer: String,
     subject: String,
     client_id: String,
@@ -273,6 +292,7 @@ struct FakeRegistrationSave<'a> {
 fn save_test_registration(save: FakeRegistrationSave<'_>) -> Result<()> {
     let FakeRegistrationSave {
         registry,
+        path,
         issuer,
         subject,
         client_id,
@@ -297,6 +317,13 @@ fn save_test_registration(save: FakeRegistrationSave<'_>) -> Result<()> {
     };
     registry.registrations.push(registration.clone());
     registry.active_registration_id = Some(id);
+    let mut persisted = registry.clone();
+    if let Some(stored) = persisted.registrations.last_mut() {
+        stored.issuer = super::ISSUER.to_owned();
+        stored.id = registration_id(&stored.issuer, &stored.subject, &stored.client_id)?;
+        persisted.active_registration_id = Some(stored.id.clone());
+    }
+    persisted.save(path)?;
     *capture.lock().expect("lock saved registration") = Some(registration);
     Ok(())
 }
@@ -555,6 +582,39 @@ fn login_exchanges_code_and_validates_pkce_state_and_signed_identity_offline() {
             .as_ref()
             .is_some_and(|credential| credential.scopes.iter().any(|scope| scope == DIRECT_SCOPE))
     );
+}
+
+#[test]
+fn successful_fake_login_persists_at_resolved_auth_directory() {
+    let temporary = TempDir::new().expect("create custom auth directory fixture");
+    let auth_dir = temporary.path().join("selected-auth");
+    let path = registry_path_for_auth_dir(&auth_dir, None).expect("resolve override directory");
+    let decoy = temporary.path().join("xdg/spec-loop/auth.json");
+    let FakeLoginRun {
+        result,
+        server,
+        temporary: _temporary,
+        ..
+    } = run_fake_login_at(
+        temporary,
+        path.clone(),
+        FakeTokenResponse::Login {
+            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
+            nonce_override: None,
+            issuer_override: None,
+        },
+        true,
+        false,
+    );
+    result.expect("complete fake OAuth login at custom path");
+    assert_eq!(server.join().expect("join fake OIDC server").len(), 3);
+    assert!(path.is_file());
+    assert_eq!(path, auth_dir.join("auth.json"));
+    assert!(!auth_dir.join("spec-loop/auth.json").exists());
+    assert!(!decoy.exists());
+    let persisted = Registry::load(&path).expect("reload custom auth registry");
+    assert_eq!(persisted.registrations.len(), 1);
+    assert!(persisted.active_registration_id.is_some());
 }
 
 #[test]
@@ -1401,6 +1461,36 @@ fn registry_activation_failure_restores_existing_keyring_credential() {
     );
 }
 
+#[test]
+fn auth_directory_override_resolves_direct_auth_json_and_validates_project_boundary() {
+    let temporary = TempDir::new().expect("create auth directory fixture");
+    let selected = temporary.path().join("chosen");
+    let expected = selected.join("auth.json");
+    assert_eq!(
+        registry_path_for_auth_dir(&selected, None).expect("resolve selected auth directory"),
+        expected
+    );
+    assert!(!selected.exists());
+
+    let project = TempDir::new().expect("create project boundary");
+    std::fs::write(project.path().join(".spec-loop.toml"), "").expect("mark project boundary");
+    let inside = project.path().join("credentials");
+    let error = registry_path_for_auth_dir(&inside, Some(project.path()))
+        .expect_err("reject custom path inside project");
+    assert!(error.to_string().contains("outside the project directory"));
+    assert!(!inside.exists());
+}
+
+#[test]
+fn auth_directory_override_rejects_empty_and_relative_paths() {
+    for directory in [Path::new(""), Path::new("relative-auth")] {
+        let error = registry_path_for_auth_dir(directory, None)
+            .expect_err("reject invalid authentication directory");
+        assert!(error.to_string().contains("SPEC_LOOP_AUTH_DIR"));
+        assert!(error.to_string().contains("absolute"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn unsafe_relative_xdg_config_home_cannot_write_file_fallback() {
@@ -1456,7 +1546,8 @@ fn fallback_registry_permissions_are_owner_only() {
     use std::os::unix::fs::PermissionsExt;
 
     let temporary = TempDir::new().expect("create auth temp directory");
-    let path = temporary.path().join("nested/auth.json");
+    let path = registry_path_for_auth_dir(&temporary.path().join("custom"), None)
+        .expect("resolve custom auth directory");
     Registry::empty().save(&path).expect("save auth registry");
     let directory_mode = std::fs::metadata(path.parent().expect("parent"))
         .expect("read auth directory metadata")
@@ -1475,7 +1566,8 @@ fn fallback_registry_permissions_are_owner_only() {
 #[test]
 fn refreshed_credentials_are_persisted_before_reuse() {
     let temporary = TempDir::new().expect("create credential fixture");
-    let path = temporary.path().join("spec-loop/auth.json");
+    let auth_dir = temporary.path().join("selected-auth");
+    let path = registry_path_for_auth_dir(&auth_dir, None).expect("resolve custom auth directory");
     write_test_credentials(&path, vec![DIRECT_SCOPE.to_owned()]).expect("write credential fixture");
     let (mut registry, registration, _) =
         super::load_active_credential(&path).expect("load fixture credential");

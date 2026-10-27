@@ -1,6 +1,6 @@
 # Generic Spec Loop
 
-**Status:** Active
+**Status:** Complete
 
 ## Goal
 

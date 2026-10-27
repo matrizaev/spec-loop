@@ -784,6 +784,7 @@ fn auth_status_and_help_work_without_project_profile() {
     let status = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
         .args(["auth", "status"])
         .current_dir(temporary.path())
+        .env_remove("SPEC_LOOP_AUTH_DIR")
         .env("XDG_CONFIG_HOME", &config)
         .output()
         .expect("run auth status");
@@ -793,7 +794,11 @@ fn auth_status_and_help_work_without_project_profile() {
     assert!(!temporary.path().join(".spec-loop.toml").exists());
     assert!(!config.exists());
 
-    let auth_directory = config.join("spec-loop");
+    fs::create_dir_all(config.join("spec-loop"))
+        .expect("create conflicting XDG registry directory");
+    fs::write(config.join("spec-loop/auth.json"), b"{invalid-json")
+        .expect("write conflicting XDG registry");
+    let auth_directory = config_root.path().join("selected-auth");
     fs::create_dir_all(&auth_directory).expect("create auth registry directory");
     let registry_path = auth_directory.join("auth.json");
     fs::write(
@@ -823,6 +828,7 @@ fn auth_status_and_help_work_without_project_profile() {
     let status = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
         .args(["auth", "status"])
         .current_dir(temporary.path())
+        .env("SPEC_LOOP_AUTH_DIR", &auth_directory)
         .env("XDG_CONFIG_HOME", &config)
         .output()
         .expect("run configured auth status");
@@ -841,6 +847,7 @@ fn auth_status_and_help_work_without_project_profile() {
             "324c1466308102826b42e39df00686baf739944a4b5290423a7d7ad11300783c",
         ])
         .current_dir(temporary.path())
+        .env("SPEC_LOOP_AUTH_DIR", &auth_directory)
         .env("XDG_CONFIG_HOME", &config)
         .output()
         .expect("run auth logout");
@@ -858,9 +865,7 @@ fn auth_status_and_help_work_without_project_profile() {
         .output()
         .expect("run top-level help");
     assert_success(&help);
-    assert!(
-        String::from_utf8_lossy(&help.stdout).contains("Manage `OpenAI` `ChatGPT` authorization")
-    );
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Authentication commands do not load"));
 }
 
 #[test]
@@ -869,6 +874,7 @@ fn auth_login_rejects_relative_xdg_config_home_before_storage_or_network() {
     let output = Command::new(env!("CARGO_BIN_EXE_spec-loop"))
         .args(["auth", "login", "--new-account"])
         .current_dir(temporary.path())
+        .env_remove("SPEC_LOOP_AUTH_DIR")
         .env("XDG_CONFIG_HOME", ".")
         .output()
         .expect("run login with unsafe XDG_CONFIG_HOME");

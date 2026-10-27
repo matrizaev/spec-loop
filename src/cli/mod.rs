@@ -69,6 +69,10 @@ struct CompletionOptions {
 #[derive(Clone, Debug, Subcommand)]
 pub enum CliCommand {
     /// Manage `OpenAI` `ChatGPT` authorization without loading a project profile.
+    #[command(
+        about = r"Authentication commands do not load a repository profile. Set SPEC_LOOP_AUTH_DIR to an absolute directory that directly contains auth.json; it takes precedence over platform defaults and XDG_CONFIG_HOME. When unset, Linux and other non-macOS/non-Windows systems use $XDG_CONFIG_HOME/spec-loop (or $HOME/.config/spec-loop), macOS uses ~/Library/Application Support/Spec Loop, and Windows uses %APPDATA%\Spec Loop. Empty and relative overrides are rejected, and the directory must remain outside the active project. Changing locations does not migrate credentials. If the operating-system credential store is unavailable, auth.json may contain plaintext credentials; a custom location does not encrypt them or isolate them from same-user processes.",
+        long_about = r"Authentication commands do not load a repository profile. Set SPEC_LOOP_AUTH_DIR to an absolute directory that directly contains auth.json; it takes precedence over platform defaults and XDG_CONFIG_HOME. When unset, Linux and other non-macOS/non-Windows systems use $XDG_CONFIG_HOME/spec-loop (or $HOME/.config/spec-loop), macOS uses ~/Library/Application Support/Spec Loop, and Windows uses %APPDATA%\Spec Loop. Empty and relative overrides are rejected, and the directory must remain outside the active project. Changing locations does not migrate credentials. If the operating-system credential store is unavailable, auth.json may contain plaintext credentials; a custom location does not encrypt them or isolate them from same-user processes."
+    )]
     Auth(AuthArgs),
 }
 
@@ -81,6 +85,9 @@ pub struct AuthArgs {
 #[derive(Clone, Debug, Subcommand)]
 pub enum AuthSubcommand {
     /// Authorize Spec Loop with `ChatGPT` in a browser.
+    #[command(
+        long_about = "Authorize with ChatGPT. SPEC_LOOP_AUTH_DIR may select the absolute directory directly containing auth.json; it must remain outside the active project. When unset, platform defaults apply. A custom location does not encrypt credentials or isolate them from same-user processes; the file fallback may contain plaintext credentials."
+    )]
     Login {
         /// Reauthorize a saved registration ID.
         #[arg(long, conflicts_with = "new_account", value_name = "REGISTRATION_ID")]
@@ -90,8 +97,14 @@ pub enum AuthSubcommand {
         new_account: bool,
     },
     /// Show local authorization and direct-use permission state.
+    #[command(
+        long_about = "Show local authorization state without loading a project profile. The registry path is selected by SPEC_LOOP_AUTH_DIR when set, otherwise by platform defaults. Custom storage must remain outside the active project; a file fallback may contain plaintext credentials and is not isolated from same-user processes."
+    )]
     Status,
     /// Remove selected or active Spec Loop credentials.
+    #[command(
+        long_about = "Remove credentials only from the selected local registry. SPEC_LOOP_AUTH_DIR selects the absolute directory directly containing auth.json; when unset, platform defaults apply. Storage must remain outside the active project. A custom location does not encrypt credentials or isolate them from same-user processes."
+    )]
     Logout {
         /// Opaque registration ID to remove locally.
         #[arg(long, value_name = "REGISTRATION_ID")]

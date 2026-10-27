@@ -1,6 +1,6 @@
 # Spec 005: Refresh ChatGPT OAuth Access Tokens Per Request
 
-**Status:** Implemented
+**Status:** Complete
 
 ## Goal
 

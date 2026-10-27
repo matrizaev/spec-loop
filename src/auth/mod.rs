@@ -28,7 +28,8 @@ use self::callback::{Callback, await_callback, callback_listener, validate_callb
 use self::registry::{normalize_host_id, registry_path, restrict_directory, restrict_file};
 #[cfg(test)]
 use self::registry::{
-    project_boundary, registry_path_for_config_dir, validate_external_registry_path,
+    project_boundary, registry_path_for_auth_dir, registry_path_for_config_dir,
+    validate_external_registry_path,
 };
 use crate::error::{Result, SpecLoopError, io_error};
 use crate::runtime;

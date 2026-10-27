@@ -8,6 +8,8 @@ use uuid::Uuid;
 
 use crate::error::{Result, SpecLoopError, io_error};
 
+const AUTH_DIRECTORY_ENV: &str = "SPEC_LOOP_AUTH_DIR";
+
 pub(super) fn normalize_host_id(host_id: &str) -> Option<String> {
     let uuid_text = host_id.strip_prefix("urn:uuid:").unwrap_or(host_id);
     let uuid = Uuid::parse_str(uuid_text).ok()?;
@@ -117,6 +119,9 @@ pub(super) fn registry_path() -> Result<PathBuf> {
         )
     })?;
     let project_root = project_boundary(&current_dir)?;
+    if let Some(auth_dir) = env::var_os(AUTH_DIRECTORY_ENV) {
+        return registry_path_for_auth_dir(Path::new(&auth_dir), project_root.as_deref());
+    }
     #[cfg(target_os = "macos")]
     let path = {
         let home = env::var_os("HOME").ok_or_else(|| {
@@ -165,6 +170,18 @@ pub(super) fn project_boundary(current_dir: &Path) -> Result<Option<PathBuf>> {
         }
     }
     Ok(None)
+}
+
+pub(super) fn registry_path_for_auth_dir(
+    auth_dir: &Path,
+    project_root: Option<&Path>,
+) -> Result<PathBuf> {
+    if auth_dir.as_os_str().is_empty() || !auth_dir.is_absolute() {
+        return Err(SpecLoopError::Config(format!(
+            "{AUTH_DIRECTORY_ENV} must be a non-empty absolute directory outside the active project; it directly contains auth.json"
+        )));
+    }
+    validate_external_registry_path(&auth_dir.join("auth.json"), project_root)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

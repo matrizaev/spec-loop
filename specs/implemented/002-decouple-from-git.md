@@ -1,6 +1,6 @@
 # Spec 002: Decouple Spec Loop from Git
 
-**Status:** Active
+**Status:** Complete
 
 ## Goal
 
