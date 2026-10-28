@@ -317,3 +317,167 @@ fn spawn_observer_counts_only_successful_process_spawns() {
     assert!(failed.is_err());
     assert_eq!(spawned.load(Ordering::Relaxed), 1);
 }
+
+#[test]
+fn relative_timeouts_convert_once_and_fail_closed_before_spawn() {
+    let temporary = TempDir::new().expect("process fixture");
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let arguments = ["-c".to_owned(), "touch must-not-run".to_owned()];
+    for timeout in [Duration::ZERO, Duration::MAX] {
+        let ordinary = run_process(
+            Path::new("/bin/sh"),
+            &arguments,
+            temporary.path(),
+            Some(timeout),
+            &cancelled,
+        );
+        let os_args = run_process_with_os_args(
+            Path::new("/bin/sh"),
+            &arguments,
+            temporary.path(),
+            Some(timeout),
+            &[],
+            &cancelled,
+        );
+        for result in [ordinary, os_args] {
+            if timeout.is_zero() {
+                assert_eq!(
+                    result.expect("expired duration").termination,
+                    ProcessTermination::TimedOut
+                );
+            } else {
+                assert_eq!(
+                    result.expect_err("overflow").to_string(),
+                    "configuration error: process timeout exceeds monotonic clock range"
+                );
+            }
+        }
+        assert!(!temporary.path().join("must-not-run").exists());
+    }
+    let observed = AtomicUsize::new(0);
+    let deadline = Some(
+        Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("past deadline"),
+    );
+    let output = run_process_until_with_spawn_observer(
+        Path::new("/bin/sh"),
+        &arguments,
+        temporary.path(),
+        deadline,
+        None,
+        &cancelled,
+        || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+    )
+    .expect("past deadline");
+    assert_eq!(output.termination, ProcessTermination::TimedOut);
+    assert_eq!(observed.load(Ordering::Relaxed), 0);
+    cancelled.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        run_process_until(
+            Path::new("/bin/sh"),
+            &arguments,
+            temporary.path(),
+            deadline,
+            None,
+            &cancelled
+        ),
+        Err(crate::error::SpecLoopError::Interrupted)
+    ));
+}
+
+#[test]
+fn nonzero_exit_preserves_status_and_both_streams() {
+    let temporary = TempDir::new().expect("process fixture");
+    let output = run_process(
+        Path::new("/bin/sh"),
+        &[
+            "-c".to_owned(),
+            "printf out; printf err >&2; exit 7".to_owned(),
+        ],
+        temporary.path(),
+        Some(Duration::from_secs(2)),
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .expect("run process");
+    assert_eq!(output.termination, ProcessTermination::Exited);
+    assert_eq!(output.status.and_then(|status| status.code()), Some(7));
+    assert_eq!(output.stdout, b"out");
+    assert_eq!(output.stderr, b"err");
+}
+
+#[test]
+fn cancellation_after_spawn_terminates_running_and_pipe_holding_children() {
+    for direct_child_exits in [false, true] {
+        let temporary = TempDir::new().expect("process fixture");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::clone(&cancelled);
+        let root = temporary.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            run_process(
+                Path::new("/bin/sh"),
+                &[
+                    "-c".to_owned(),
+                    format!(
+                        "echo $$ > direct-pid; sleep 30 & echo $! > child-pid; printf started > marker; {}",
+                        if direct_child_exits { "exit 0" } else { "wait" }
+                    ),
+                ],
+                &root,
+                Some(Duration::from_secs(5)),
+                &cancellation,
+            )
+        });
+        let bound = Instant::now() + Duration::from_secs(2);
+        while !temporary.path().join("marker").exists() && Instant::now() < bound {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let spawned = temporary.path().join("marker").exists();
+        if spawned && direct_child_exits {
+            let pid = fs::read_to_string(temporary.path().join("direct-pid"))
+                .expect("direct pid")
+                .trim()
+                .parse()
+                .expect("parse direct pid");
+            assert_process_terminated(pid);
+        }
+        cancelled.store(true, Ordering::Relaxed);
+        let output = worker
+            .join()
+            .expect("join process worker")
+            .expect("supervise cancelled process");
+        assert!(spawned, "fixture child must start");
+        assert_eq!(output.termination, ProcessTermination::Interrupted);
+        let pid = fs::read_to_string(temporary.path().join("child-pid"))
+            .expect("descendant pid")
+            .trim()
+            .parse()
+            .expect("parse pid");
+        assert_process_terminated(pid);
+    }
+}
+
+#[test]
+fn spawn_observer_failure_terminates_and_waits_for_child() {
+    let temporary = TempDir::new().expect("process fixture");
+    let started = Instant::now();
+    let error = run_process_until_with_spawn_observer(
+        Path::new("/bin/sh"),
+        &["-c".to_owned(), "sleep 30".to_owned()],
+        temporary.path(),
+        Some(started + Duration::from_secs(2)),
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        || {
+            Err(crate::error::SpecLoopError::Workflow(
+                "observer failed".to_owned(),
+            ))
+        },
+    )
+    .expect_err("observer failure propagates");
+    assert!(error.to_string().contains("observer failed"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}

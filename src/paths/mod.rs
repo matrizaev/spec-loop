@@ -65,28 +65,16 @@ pub fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-pub fn resolve_existing(root: &Path, relative: &Path, field: &str) -> Result<PathBuf> {
+pub fn validate_regular_file(root: &Path, relative: &Path, field: &str) -> Result<()> {
     let path = root.join(relative);
-    fs::metadata(&path).map_err(|source| {
+    let metadata = fs::metadata(&path).map_err(|source| {
         io_error(
             "inspect configured path",
             format!("{field}: {}", path.display()),
             source,
         )
     })?;
-    Ok(path)
-}
-
-pub fn resolve_optional(root: &Path, relative: &Path) -> PathBuf {
-    root.join(relative)
-}
-
-pub fn validate_regular_file(root: &Path, relative: &Path, field: &str) -> Result<()> {
-    let path = resolve_existing(root, relative, field)?;
-    if !fs::metadata(&path)
-        .map_err(|source| io_error("inspect configured file", &path, source))?
-        .is_file()
-    {
+    if !metadata.is_file() {
         return Err(SpecLoopError::Config(format!(
             "{field} is not a regular file: {}",
             path.display()

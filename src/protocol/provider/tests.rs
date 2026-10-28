@@ -38,6 +38,56 @@ fn provider_schemas_are_mechanical_closed_nested_status_projections_for_every_ro
 }
 
 #[test]
+fn provider_references_strip_annotations_but_reject_sibling_constraints() {
+    let canonical = json!({
+        "$defs":{"Payload":{"type":"string","description":"Referenced type documentation"}},
+        "oneOf":[{"type":"object","properties":{
+            "status":{"const":"ready","type":"string"},
+            "payload":{"$ref":"#/$defs/Payload","description":"Field documentation"}
+        },"required":["status","payload"],"additionalProperties":false}]
+    });
+    let projected = project_schema(&canonical).expect("annotation-only reference");
+    assert_eq!(
+        projected["properties"]["response"]["anyOf"][0]["properties"]["payload"],
+        json!({"$ref":"#/$defs/Payload"})
+    );
+    assert_eq!(
+        canonical["oneOf"][0]["properties"]["payload"]["description"],
+        "Field documentation"
+    );
+    assert_eq!(
+        projected["$defs"]["Payload"]["description"],
+        "Referenced type documentation"
+    );
+    for (keyword, value) in [
+        ("minimum", json!(1)),
+        ("minLength", json!(1)),
+        ("enum", json!(["restricted"])),
+        ("unknown", json!(true)),
+    ] {
+        let mut invalid = canonical.clone();
+        invalid["oneOf"][0]["properties"]["payload"]
+            .as_object_mut()
+            .expect("reference object")
+            .insert(keyword.to_owned(), value);
+        assert!(
+            project_schema(&invalid)
+                .expect_err("never drop a reference constraint")
+                .to_string()
+                .contains("unsupported keyword")
+        );
+    }
+    for (keyword, value) in [("$ref", json!(12)), ("description", json!(false))] {
+        let mut invalid = canonical.clone();
+        invalid["oneOf"][0]["properties"]["payload"][keyword] = value;
+        assert!(
+            project_schema(&invalid).is_err(),
+            "invalid {keyword} must fail closed"
+        );
+    }
+}
+
+#[test]
 fn provider_projection_fails_closed_on_unrecognized_canonical_keywords() {
     let schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -66,6 +116,27 @@ fn provider_projection_requires_status_discriminators_to_be_disjoint() {
 }
 
 #[test]
+fn nested_outcome_projection_rejects_overlapping_or_missing_discriminators() {
+    for other in [
+        json!({"outcome":{"const":"same"}}),
+        json!({"different":{"const":"different"}}),
+    ] {
+        let canonical = json!({
+            "oneOf":[{
+                "type":"object","properties":{
+                    "status":{"const":"adjudicated"},
+                    "adjudication":{"oneOf":[
+                        {"type":"object","properties":{"outcome":{"const":"same"}},"required":["outcome"],"additionalProperties":false},
+                        {"type":"object","properties":other,"required":["outcome"],"additionalProperties":false}
+                    ]}
+                },"required":["status","adjudication"],"additionalProperties":false
+            }]
+        });
+        assert!(project_schema(&canonical).is_err());
+    }
+}
+
+#[test]
 fn transport_normalization_accepts_only_exact_wrapper_and_object_value() {
     let canonical =
         json!({"protocol_version": 1, "role": "implementation", "status": "ready_for_review"});
@@ -87,6 +158,9 @@ fn transport_normalization_accepts_only_exact_wrapper_and_object_value() {
 fn assert_provider_objects_are_closed_and_required(value: &Value) {
     match value {
         Value::Object(object) => {
+            if object.contains_key("$ref") {
+                assert_eq!(object.len(), 1, "provider references cannot have siblings");
+            }
             if object.get("type").and_then(Value::as_str) == Some("object") {
                 assert_eq!(
                     object.get("additionalProperties"),
@@ -237,6 +311,9 @@ fn validate_audit_result(
         crate::protocol::AuditResult::Blocked { reason } => {
             crate::protocol::validate_text(reason, "blocked reason")
         }
+        crate::protocol::AuditResult::Adjudicated { .. } => Err(
+            crate::error::SpecLoopError::Agent("expected finding classifications".to_owned()),
+        ),
     }
 }
 

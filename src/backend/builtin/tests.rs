@@ -1,4 +1,3 @@
-use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,128 +7,17 @@ use std::thread;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use super::provider::request_with_retries;
+use super::test_support::{
+    ProviderServer, RESPONSE_STARTED, Reply, builtin_test_profile, completed_sse, serve_responses,
+    sse_event,
+};
 use super::{
-    RoleInput, RoleTask, classify_agent_run, run_after_shell_preflight, run_role_with_access_token,
+    RoleInput, classify_agent_run, run_after_shell_preflight, run_role_with_access_token,
     run_role_with_auth,
 };
 use crate::backend::BackendFailureKind;
 use crate::config::{AgentStage, Profile};
 use crate::prompts::PromptRole;
-
-pub(super) const RESPONSE_STARTED: &str = concat!(
-    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fixture\",\"status\":\"in_progress\"}}\n\n",
-    "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_fixture\",\"status\":\"in_progress\"}}\n\n"
-);
-
-pub(super) fn sse_event(event_type: &str, event: &Value) -> String {
-    format!("event: {event_type}\ndata: {event}\n\n")
-}
-
-pub(super) fn completed_sse(event: &Value) -> String {
-    format!(
-        "{RESPONSE_STARTED}{}",
-        sse_event("response.completed", event)
-    )
-}
-
-pub(super) fn fake_stream_request(body: String) -> (crate::error::Result<Value>, String) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
-    let address = listener.local_addr().expect("provider fixture address");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write provider response");
-        request
-    });
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("build provider client");
-    let result = crate::runtime::block_on(request_with_retries(
-        &client,
-        &format!("http://{address}/v1/responses"),
-        "fixture-access-token",
-        &json!({"model": "fixture-model", "stream": true}),
-        None,
-        &AtomicBool::new(false),
-    ))
-    .expect("construct provider runtime");
-    (result, server.join().expect("join provider fixture"))
-}
-
-pub(super) fn assert_transient_sse_failure_retries(event_type: &str, event: &Value) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
-    let address = listener.local_addr().expect("provider fixture address");
-    let failure = if event_type == "error" {
-        sse_event(event_type, event)
-    } else {
-        format!("{RESPONSE_STARTED}{}", sse_event(event_type, event))
-    };
-    let success = completed_sse(&json!({
-        "type": "response.completed",
-        "response": {"status": "completed", "output": []}
-    }));
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for body in [failure, success] {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .expect("build provider client");
-    let result = crate::runtime::block_on(request_with_retries(
-        &client,
-        &format!("http://{address}/v1/responses"),
-        "fixture-access-token",
-        &json!({"model": "fixture-model", "stream": true}),
-        None,
-        &AtomicBool::new(false),
-    ))
-    .expect("construct provider runtime")
-    .expect("transient stream error should retry");
-    assert_eq!(result["status"], "completed");
-    let requests = server.join().expect("join provider fixture");
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.starts_with("POST /v1/responses "))
-    );
-}
-
-pub(super) fn builtin_test_profile() -> Profile {
-    let profile: Profile = toml::from_str(
-        r"schema_version=3
-[specs]
-active_globs=['specs/*.md']
-id_regex='^specs/(?P<id>[0-9]+)\\.md$'
-[agent]
-backend='builtin'
-model='fixture-model'
-",
-    )
-    .expect("parse built-in test profile");
-    profile.validate().expect("validate built-in test profile");
-    profile
-}
 
 async fn run_role_with_usage(
     input: RoleInput<'_>,
@@ -141,7 +29,7 @@ async fn run_role_with_usage(
     let token = input.token.to_owned();
     let mut observer = |_: &crate::backend::UsageSnapshot| Ok(());
     super::run_role_with_token_provider_observed(
-        input,
+        input.with_test_deadline(),
         continuation,
         move || {
             let token = token.clone();
@@ -170,22 +58,10 @@ fn response_with_usage(output: &Value, input: u64, output_tokens: u64) -> Value 
     })
 }
 
-fn start_one_response_provider(response: &Value) -> (String, thread::JoinHandle<Vec<String>>) {
+fn start_one_response_provider(response: &Value) -> (String, ProviderServer) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
-    let body = completed_sse(response);
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write provider response");
-        vec![request]
-    });
+    let server = serve_responses(listener, [Reply::sse(completed_sse(response))]);
     (format!("http://{address}/v1/responses"), server)
 }
 
@@ -197,6 +73,22 @@ fn provider_request_payload(request: &str) -> Value {
 }
 
 fn assert_strict_role_format(request: &str, role: PromptRole) {
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("content-type: application/json")
+    );
+    assert!(
+        request.contains(r#""properties":{"status":"#),
+        "choose status before payload on actual provider wire"
+    );
+    if matches!(role, PromptRole::PlanAudit | PromptRole::ReviewAudit) {
+        assert_eq!(
+            request.matches(r#""properties":{"outcome":"#).count(),
+            3,
+            "choose nested outcome before evidence"
+        );
+    }
     let payload = provider_request_payload(request);
     let format = &payload["text"]["format"];
     assert_eq!(format["type"], "json_schema");
@@ -225,7 +117,7 @@ fn assert_blocked_usage(response: &super::AgentResponse, usage: &crate::backend:
         Some(30)
     );
     let report = usage.format_report("implementation", "fixture-model", 0, None);
-    assert!(report.contains("∑ Observed completed-response usage: 60 in · 8 out · 68 total"));
+    assert!(report.contains("∑ Observed completed-response usage\n  60 in · 8 out · 68 total"));
 }
 
 #[cfg(unix)]
@@ -265,21 +157,7 @@ fn multiple_tool_turns_and_blocked_handoff_preserve_role_usage_without_replay() 
     ];
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for body in responses {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+    let server = serve_responses(listener, responses.into_iter().map(Reply::sse));
     let profile = builtin_test_profile();
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut transcript = Vec::new();
@@ -335,18 +213,7 @@ fn failed_provider_response_preserves_attempt_count_without_completion_or_shell_
             })
         )
     );
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write provider failure");
-        request
-    });
+    let server = serve_responses(listener, [Reply::sse(body)]);
     let profile = builtin_test_profile();
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut transcript = Vec::new();
@@ -377,6 +244,8 @@ fn failed_provider_response_preserves_attempt_count_without_completion_or_shell_
         server
             .join()
             .expect("join provider fixture")
+            .first()
+            .expect("provider request")
             .starts_with("POST ")
     );
 }
@@ -487,7 +356,7 @@ fn missing_local_direct_permission_sends_zero_responses_requests() {
     let endpoint = format!("http://{address}/v1/responses");
     let result = crate::runtime::block_on(run_role_with_auth(
         || crate::auth::active_access_token_at(&credential_path, false, cancelled.as_ref()),
-        RoleTask {
+        RoleInput {
             root: temporary.path(),
             profile: &profile,
             prompt: "original task prompt",
@@ -495,6 +364,7 @@ fn missing_local_direct_permission_sends_zero_responses_requests() {
             cancelled: &cancelled,
             deadline: None,
             endpoint: &endpoint,
+            token: "",
         },
         None,
         &mut completed_conversation,
@@ -575,7 +445,7 @@ fn builtin_backend_accepts_typed_responses_for_every_role_from_fake_provider() {
         PlanClarificationResponse, PlanReviewResponse,
     };
 
-    let roles = [
+    let mut roles = vec![
         (
             PromptRole::PlanAuthor,
             json!({"protocol_version": 1, "role": "plan_author", "status": "ready_for_review"}),
@@ -609,6 +479,21 @@ fn builtin_backend_accepts_typed_responses_for_every_role_from_fake_provider() {
             json!({"protocol_version": 1, "role": "review_clarification", "status": "complete", "evidence": []}),
         ),
     ];
+    let adjudications: Vec<Value> = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/blocker-adjudications.json"
+    ))
+    .expect("typed adjudication fixtures");
+    for role in [PromptRole::PlanAudit, PromptRole::ReviewAudit] {
+        for adjudication in &adjudications {
+            roles.push((
+                role,
+                json!({
+                    "protocol_version":1, "role":role.protocol_name(), "status":"adjudicated",
+                    "adjudication":adjudication,
+                }),
+            ));
+        }
+    }
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
     let address = listener.local_addr().expect("fake provider address");
     let expected_requests = roles
@@ -628,22 +513,12 @@ fn builtin_backend_accepts_typed_responses_for_every_role_from_fake_provider() {
             (prompt, response)
         })
         .collect::<Vec<_>>();
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for (_, response) in expected_requests {
-            let body = completed_sse(&response);
-            let (mut stream, _) = listener.accept().expect("accept fake provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write fake provider response");
-        }
-        requests
-    });
+    let server = serve_responses(
+        listener,
+        expected_requests
+            .iter()
+            .map(|(_, response)| Reply::sse(completed_sse(response))),
+    );
     let profile: Profile = toml::from_str(
         r"schema_version=3
 [specs]
@@ -740,6 +615,7 @@ model='fixture-model'
     let requests = server.join().expect("join fake provider");
     assert_eq!(requests.len(), expected_prompts.len());
     for (request, (expected_prompt, role)) in requests.iter().zip(expected_prompts) {
+        assert_strict_role_format(request, role);
         let (_, payload) = request
             .split_once("\r\n\r\n")
             .expect("provider request body");
@@ -848,18 +724,7 @@ fn configured_shell_call_limit_stops_after_permitted_calls_without_replay() {
         }
     });
     let body = completed_sse(&tool_response);
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write multiple-call response");
-        request
-    });
+    let server = serve_responses(listener, [Reply::sse(body)]);
     let profile: Profile = toml::from_str(
         r"schema_version=3
 [specs]
@@ -909,8 +774,13 @@ max_tool_calls=1
     assert!(!transcript.contains(second_command));
     assert!(transcript.contains("exit_status=0"));
 
-    let request = server.join().expect("join provider fixture");
-    assert!(request.starts_with("POST /v1/responses "));
+    let requests = server.join().expect("join provider fixture");
+    assert!(
+        requests
+            .first()
+            .expect("request")
+            .starts_with("POST /v1/responses ")
+    );
 }
 
 #[cfg(unix)]
@@ -954,21 +824,7 @@ fn omitted_call_limit_allows_more_than_fifty_shell_calls() {
         completed_sse(&tool_response),
         completed_sse(&final_response),
     ];
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for body in bodies {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+    let server = serve_responses(listener, bodies.into_iter().map(Reply::sse));
     let profile: Profile = toml::from_str(
         r"schema_version=3
 [specs]
@@ -1106,21 +962,7 @@ fn configured_shell_call_limit_resets_for_each_role() {
         bodies.push(completed_sse(&tool_response));
         bodies.push(completed_sse(&final_response));
     }
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for body in bodies {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+    let server = serve_responses(listener, bodies.into_iter().map(Reply::sse));
     let profile: Profile = toml::from_str(
         r"schema_version=3
 [specs]
@@ -1223,22 +1065,10 @@ fn resolves_access_token_again_after_shell_tool_before_followup_request() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
     let temporary = TempDir::new().expect("create built-in project root");
-    let bodies = token_refresh_responses();
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for body in bodies {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+    let server = serve_responses(
+        listener,
+        token_refresh_responses().into_iter().map(Reply::sse),
+    );
     let profile = builtin_test_profile();
     let cancelled = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1251,7 +1081,7 @@ fn resolves_access_token_again_after_shell_tool_before_followup_request() {
             let call = observed_calls.fetch_add(1, Ordering::Relaxed);
             async move { Ok(format!("fixture-access-token-{call}")) }
         },
-        RoleTask {
+        RoleInput {
             root: temporary.path(),
             profile: &profile,
             prompt: "request a command, then finish",
@@ -1259,6 +1089,7 @@ fn resolves_access_token_again_after_shell_tool_before_followup_request() {
             cancelled: &cancelled,
             deadline: None,
             endpoint: &endpoint,
+            token: "",
         },
         None,
         &mut completed_conversation,
@@ -1314,18 +1145,7 @@ fn token_refresh_failure_preserves_completed_shell_effect_without_replay() {
         .into_iter()
         .next()
         .expect("tool response body");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first_body}",
-            first_body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write tool response");
-        request
-    });
+    let server = serve_responses(listener, [Reply::sse(first_body)]);
     let profile = builtin_test_profile();
     let cancelled = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1346,7 +1166,7 @@ fn token_refresh_failure_preserves_completed_shell_effect_without_replay() {
                 }
             }
         },
-        RoleTask {
+        RoleInput {
             root: temporary.path(),
             profile: &profile,
             prompt: "request a command, then finish",
@@ -1354,6 +1174,7 @@ fn token_refresh_failure_preserves_completed_shell_effect_without_replay() {
             cancelled: &cancelled,
             deadline: None,
             endpoint: &endpoint,
+            token: "",
         },
         None,
         &mut completed_conversation,
@@ -1373,6 +1194,8 @@ fn token_refresh_failure_preserves_completed_shell_effect_without_replay() {
         server
             .join()
             .expect("join provider fixture")
+            .first()
+            .expect("request")
             .starts_with("POST /v1/responses ")
     );
 }
@@ -1414,32 +1237,14 @@ fn transient_followup_retry_reuses_completed_shell_tool_result() {
             }]
         }
     });
-    let event_body = completed_sse;
-    let server = thread::spawn(move || {
-        let successful_responses = [event_body(&tool_response), event_body(&final_response)];
-        let responses = [
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    successful_responses[0].len(),
-                    successful_responses[0]
-                ),
-                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    successful_responses[1].len(),
-                    successful_responses[1]
-                ),
-            ];
-        let mut requests = Vec::new();
-        for response in responses {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+    let server = serve_responses(
+        listener,
+        [
+            Reply::sse(completed_sse(&tool_response)),
+            Reply::http("429 Too Many Requests", String::new()),
+            Reply::sse(completed_sse(&final_response)),
+        ],
+    );
     let profile: Profile = toml::from_str(
         r"schema_version=3
 [specs]
@@ -1503,9 +1308,7 @@ model='fixture-model'
 }
 
 #[cfg(unix)]
-fn start_malformed_typed_response_provider(
-    command: &str,
-) -> (String, std::thread::JoinHandle<Vec<String>>) {
+fn start_malformed_typed_response_provider(command: &str) -> (String, ProviderServer) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
     let tool_response = response_with_usage(
@@ -1543,21 +1346,7 @@ fn start_malformed_typed_response_provider(
         completed_sse(&malformed_response),
         completed_sse(&corrected_response),
     ];
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for response_body in provider_responses {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+    let server = serve_responses(listener, provider_responses.into_iter().map(Reply::sse));
     (format!("http://{address}/v1/responses"), server)
 }
 
@@ -1583,7 +1372,7 @@ fn assert_correction_usage(
         Some(16)
     );
     let report = cumulative.format_report("implementation", "fixture-model", 0, None);
-    assert!(report.contains("∑ Observed completed-response usage: 33 in · 9 out · 42 total"));
+    assert!(report.contains("∑ Observed completed-response usage\n  33 in · 9 out · 42 total"));
 }
 
 #[cfg(unix)]
@@ -1680,107 +1469,4 @@ fn malformed_typed_response_correction_reuses_completed_shell_state() {
         bodies[2]["input"][4]["content"],
         "Correct malformed typed response only; do not invoke tools."
     );
-}
-
-pub(super) fn read_http_request(stream: &mut std::net::TcpStream) -> String {
-    let mut request = Vec::new();
-    let mut buffer = [0_u8; 2048];
-    loop {
-        let read = stream.read(&mut buffer).expect("read provider request");
-        if read == 0 {
-            break;
-        }
-        request.extend_from_slice(&buffer[..read]);
-        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
-            continue;
-        };
-        let headers = String::from_utf8_lossy(&request[..header_end]);
-        let content_length = headers
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().expect("content length"))
-            })
-            .expect("request content length");
-        if request.len() >= header_end + 4 + content_length {
-            break;
-        }
-    }
-    String::from_utf8(request).expect("provider request is UTF-8")
-}
-
-pub(super) fn run_fake_http_responses(
-    responses: Vec<(&'static str, &'static str)>,
-) -> (Vec<String>, crate::error::Result<Value>) {
-    use std::time::{Duration, Instant};
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake provider");
-    listener
-        .set_nonblocking(true)
-        .expect("make fake provider listener nonblocking");
-    let address = listener.local_addr().expect("fake provider address");
-    let server = std::thread::spawn(move || {
-        let started = Instant::now();
-        let mut last_request = started;
-        let mut requests = Vec::new();
-        while started.elapsed() < Duration::from_secs(3) {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    last_request = Instant::now();
-                    let request = read_http_request(&mut stream);
-                    let response_index = requests.len();
-                    requests.push(request);
-                    let (status, body) = responses.get(response_index).copied().unwrap_or((
-                        "400 Bad Request",
-                        r#"{"error":{"code":"unexpected_request"}}"#,
-                    ));
-                    let retry_after = if status.starts_with("429 ") || status.starts_with("503 ") {
-                        "Retry-After: 0\r\n"
-                    } else {
-                        ""
-                    };
-                    let reply = format!(
-                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream
-                        .write_all(reply.as_bytes())
-                        .expect("write fake provider response");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    if !requests.is_empty() && last_request.elapsed() > Duration::from_millis(200) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("accept fake provider request: {error}"),
-            }
-        }
-        requests
-    });
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("build fake provider client");
-    let request = crate::runtime::block_on(request_with_retries(
-        &client,
-        &format!("http://{address}/v1/responses"),
-        "oauth-only-fixture-token",
-        &json!({"model": "fixture-model", "stream": true}),
-        None,
-        &AtomicBool::new(false),
-    ))
-    .expect("construct provider test runtime");
-    (server.join().expect("join fake provider"), request)
-}
-
-pub(super) fn assert_oauth_only_requests(requests: &[String]) {
-    assert!(requests.iter().all(|request| {
-        request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer oauth-only-fixture-token")
-            && !request.to_ascii_lowercase().contains("x-api-key")
-    }));
 }

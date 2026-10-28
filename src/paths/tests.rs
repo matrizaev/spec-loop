@@ -28,6 +28,25 @@ fn executable_resolution_uses_project_root_for_relative_paths() {
 }
 
 #[test]
+fn regular_file_validation_preserves_operation_path_and_cause() {
+    let temporary = TempDir::new().expect("temporary project");
+    let root = temporary.path();
+    fs::write(root.join("input.md"), "input").expect("write regular file");
+    super::validate_regular_file(root, Path::new("input.md"), "prompts")
+        .expect("regular file passes");
+    let error = super::validate_regular_file(root, Path::new("missing.md"), "prompts")
+        .expect_err("missing file fails");
+    assert!(
+        matches!(error, crate::error::SpecLoopError::Io { operation: "inspect configured path", ref path, ref source }
+        if path.to_string_lossy().contains("prompts:") && path.ends_with("missing.md")
+            && source.kind() == std::io::ErrorKind::NotFound)
+    );
+    let error =
+        super::validate_regular_file(root, Path::new("."), "prompts").expect_err("directory fails");
+    assert!(error.to_string().contains("prompts is not a regular file"));
+}
+
+#[test]
 fn substituted_values_are_not_reinterpreted_as_placeholders() {
     assert_eq!(
         expand_template(

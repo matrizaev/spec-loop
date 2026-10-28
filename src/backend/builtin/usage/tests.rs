@@ -17,6 +17,20 @@ fn valid_usage(input: u64, output: u64, total: u64) -> serde_json::Value {
 }
 
 #[test]
+fn shared_optional_addition_preserves_zero_unknown_and_overflow() {
+    for (left, right, expected) in [
+        (Some(0), Some(0), Some(0)),
+        (Some(1), Some(2), Some(3)),
+        (Some(u64::MAX), Some(1), None),
+        (None, Some(0), None),
+        (Some(0), None, None),
+        (None, None, None),
+    ] {
+        assert_eq!(super::add_options(left, right), expected);
+    }
+}
+
+#[test]
 fn validates_core_and_optional_breakdown_usage() {
     let parsed = ResponseUsage::from_response(&response(&valid_usage(120, 35, 155)));
     assert_eq!(parsed.input, Some(120));
@@ -120,30 +134,26 @@ fn aggregation_tracks_latest_separately_and_propagates_unknown_and_overflow() {
         "total_tokens": 34
     })));
     let report = usage.format_report("implementation", "fixture-model", 65, Some(1000));
-    assert!(report.contains("📊 Built-in · implementation · fixture-model · 65s"));
-    assert!(report.contains("↻ 1 req · ✓ 2 completed · ⚙ 0 shell calls"));
     assert!(
-        report.contains(
-            "🧠 Last response: 30 in · 4 out · 34 total · cache unknown · reasoning unknown · context 3.4% of user limit 1,000"
-        ),
+        report.lines().all(|line| line.chars().count() <= 60),
         "{report}"
     );
-    assert!(report.contains(
-        "∑ Observed completed-response usage: 150 in · 39 out · 189 total · cache unknown · reasoning unknown"
-    ));
+    assert!(report.contains("📊 Built-in · implementation · fixture-model"));
+    assert!(report.contains("↻ 1 req · ✓ 2 completed · ⚙ 0 shell calls · 65s"));
+    assert!(report.contains("🧠 Last response: 30 in · 4 out · 34 total"));
+    assert!(report.contains("Context 3.4% / user limit 1,000"));
+    assert!(report.contains("Cache unknown · reasoning unknown"));
+    assert!(report.contains("∑ Observed completed-response usage\n  150 in · 39 out · 189 total"));
 
     let mut unknown = UsageSnapshot::default();
     unknown.response_completed(&response(&valid_usage(1, 1, 2)));
     unknown.response_completed(&response(&serde_json::Value::Null));
     let report = unknown.format_report("implementation", "fixture-model", 0, Some(100));
+    assert!(report.contains("🧠 Last response: unknown in · unknown out · unknown total"));
+    assert!(report.contains("Context unknown / user limit 100"));
     assert!(report.contains(
-        "🧠 Last response: unknown in · unknown out · unknown total · cache unknown · reasoning unknown · context unknown of user limit 100"
+        "∑ Observed completed-response usage\n  unknown in · unknown out · unknown total"
     ));
-    assert!(
-        report.contains(
-            "∑ Observed completed-response usage: unknown in · unknown out · unknown total"
-        )
-    );
 
     let mut large = UsageSnapshot::default();
     large.response_completed(&response(&json!({
@@ -160,7 +170,8 @@ fn aggregation_tracks_latest_separately_and_propagates_unknown_and_overflow() {
     })));
     let report = large.format_report("implementation", "fixture-model", 0, Some(100));
     assert!(
-        report.contains("∑ Observed completed-response usage: unknown in · 0 out · unknown total")
+        report
+            .contains("∑ Observed completed-response usage\n  unknown in · 0 out · unknown total")
     );
 }
 
@@ -178,7 +189,7 @@ fn merged_role_snapshots_keep_counts_and_last_context_snapshot() {
     let report = merged.format_report("implementation", "fixture-model", 1, Some(100));
     assert!(report.contains("↻ 3 req · ✓ 2 completed · ⚙ 1 shell calls"));
     assert!(report.contains("🧠 Last response: 7 in · 2 out · 9 total"));
-    assert!(report.contains("∑ Observed completed-response usage: 19 in · 5 out · 24 total"));
+    assert!(report.contains("∑ Observed completed-response usage\n  19 in · 5 out · 24 total"));
 }
 
 #[test]
@@ -190,7 +201,7 @@ fn context_percentage_uses_latest_snapshot_and_never_estimates_unavailable_value
     });
     usage.response_completed(&first);
     let report = usage.format_report("implementation", "fixture-model", 0, Some(1000));
-    assert!(report.contains("context 15.5% of user limit 1,000"));
+    assert!(report.contains("Context 15.5% / user limit 1,000"));
     assert!(!report.contains("must not appear"));
 
     usage.response_completed(&response(&json!({
@@ -199,22 +210,20 @@ fn context_percentage_uses_latest_snapshot_and_never_estimates_unavailable_value
         "total_tokens": 34
     })));
     let report = usage.format_report("implementation", "fixture-model", 0, Some(100));
-    assert!(report.contains("context 34.0% of user limit 100"));
+    assert!(report.contains("Context 34.0% / user limit 100"));
 
     let over_limit = usage.format_report("implementation", "fixture-model", 0, Some(10));
-    assert!(over_limit.contains("context 340.0% of user limit 10"));
+    assert!(over_limit.contains("Context 340.0% / user limit 10"));
     let without_limit = usage.format_report("implementation", "fixture-model", 0, None);
     assert!(without_limit.contains("↻ 0 req · ✓ 2 completed"));
     assert!(without_limit.contains("🧠 Last response: 30 in · 4 out · 34 total"));
-    assert!(without_limit.contains("context unknown of user limit unknown"));
+    assert!(without_limit.contains("Context unknown / user limit unknown"));
 
     let no_usage = UsageSnapshot::default().format_report("review", "fixture-model", 0, Some(100));
     assert!(no_usage.contains("↻ 0 req · ✓ 0 completed"));
     assert!(no_usage.contains("🧠 Last response: unknown in · unknown out · unknown total"));
-    assert!(
-        no_usage.contains(
-            "∑ Observed completed-response usage: unknown in · unknown out · unknown total"
-        )
-    );
-    assert!(no_usage.contains("context unknown of user limit 100"));
+    assert!(no_usage.contains(
+        "∑ Observed completed-response usage\n  unknown in · unknown out · unknown total"
+    ));
+    assert!(no_usage.contains("Context unknown / user limit 100"));
 }

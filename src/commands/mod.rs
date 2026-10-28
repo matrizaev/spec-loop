@@ -43,7 +43,6 @@ pub struct ChildOutput {
 
 #[derive(Clone, Copy)]
 struct ProcessOptions<'a> {
-    timeout: Option<Duration>,
     deadline: Option<Instant>,
     max_output_bytes: Option<usize>,
     environment: &'a [(OsString, OsString)],
@@ -55,9 +54,7 @@ struct ReaderWait<'a> {
     stderr: &'a thread::JoinHandle<std::io::Result<CapturedOutput>>,
     child: &'a mut std::process::Child,
     program: &'a Path,
-    timeout: Option<Duration>,
     deadline: Option<Instant>,
-    started: Instant,
     cancelled: &'a Arc<AtomicBool>,
     termination: &'a mut ProcessTermination,
 }
@@ -69,13 +66,7 @@ pub fn run_process(
     timeout: Option<Duration>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<ChildOutput> {
-    let deadline = timeout
-        .map(|duration| {
-            Instant::now().checked_add(duration).ok_or_else(|| {
-                SpecLoopError::Config("process timeout exceeds monotonic clock range".to_owned())
-            })
-        })
-        .transpose()?;
+    let deadline = process_deadline(timeout)?;
     run_process_until(program, args, cwd, deadline, None, cancelled)
 }
 
@@ -114,7 +105,6 @@ pub fn run_process_until_with_spawn_observer(
         args,
         cwd,
         ProcessOptions {
-            timeout: None,
             deadline,
             max_output_bytes,
             environment: &[],
@@ -138,8 +128,7 @@ fn run_process_with_os_args(
         args,
         cwd,
         ProcessOptions {
-            timeout,
-            deadline: None,
+            deadline: process_deadline(timeout)?,
             max_output_bytes: None,
             environment,
             cancelled,
@@ -156,15 +145,13 @@ fn run_process_with_options(
     on_spawn: impl FnOnce() -> Result<()>,
 ) -> Result<ChildOutput> {
     let ProcessOptions {
-        timeout,
         deadline,
         max_output_bytes,
         environment,
         cancelled,
     } = options;
     ensure_not_cancelled(cancelled)?;
-    let started = Instant::now();
-    if deadline.is_some_and(|limit| started >= limit) {
+    if deadline_reached(deadline) {
         return Ok(ChildOutput {
             status: None,
             stdout: Vec::new(),
@@ -223,16 +210,13 @@ fn run_process_with_options(
     let stdout_budget = capture_budget.as_ref().map(Arc::clone);
     let stdout_reader = thread::spawn(move || read_captured(stdout, stdout_budget.as_deref()));
     let stderr_reader = thread::spawn(move || read_captured(stderr, capture_budget.as_deref()));
-    let (status, mut termination) =
-        wait_for_child(&mut child, program, timeout, deadline, started, cancelled)?;
+    let (status, mut termination) = wait_for_child(&mut child, program, deadline, cancelled)?;
     wait_for_readers(ReaderWait {
         stdout: &stdout_reader,
         stderr: &stderr_reader,
         child: &mut child,
         program,
-        timeout,
         deadline,
-        started,
         cancelled,
         termination: &mut termination,
     })?;
@@ -251,15 +235,13 @@ fn run_process_with_options(
 fn wait_for_child(
     child: &mut std::process::Child,
     program: &Path,
-    timeout: Option<Duration>,
     deadline: Option<Instant>,
-    started: Instant,
     cancelled: &AtomicBool,
 ) -> Result<(ExitStatus, ProcessTermination)> {
     loop {
         let termination = if cancelled.load(Ordering::Relaxed) {
             Some(ProcessTermination::Interrupted)
-        } else if deadline_reached(timeout, deadline, started) {
+        } else if deadline_reached(deadline) {
             Some(ProcessTermination::TimedOut)
         } else {
             None
@@ -355,9 +337,7 @@ fn wait_for_readers(wait: ReaderWait<'_>) -> Result<()> {
         stderr,
         child,
         program,
-        timeout,
         deadline,
-        started,
         cancelled,
         termination,
     } = wait;
@@ -366,9 +346,7 @@ fn wait_for_readers(wait: ReaderWait<'_>) -> Result<()> {
             terminate_child(child, program)?;
             *termination = ProcessTermination::Interrupted;
         }
-        if *termination == ProcessTermination::Exited
-            && deadline_reached(timeout, deadline, started)
-        {
+        if *termination == ProcessTermination::Exited && deadline_reached(deadline) {
             terminate_child(child, program)?;
             *termination = ProcessTermination::TimedOut;
         }
@@ -446,13 +424,18 @@ fn read_captured(
     })
 }
 
-fn deadline_reached(
-    timeout: Option<Duration>,
-    deadline: Option<Instant>,
-    started: Instant,
-) -> bool {
+fn process_deadline(timeout: Option<Duration>) -> Result<Option<Instant>> {
+    timeout
+        .map(|duration| {
+            Instant::now().checked_add(duration).ok_or_else(|| {
+                SpecLoopError::Config("process timeout exceeds monotonic clock range".to_owned())
+            })
+        })
+        .transpose()
+}
+
+fn deadline_reached(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|limit| Instant::now() >= limit)
-        || timeout.is_some_and(|limit| started.elapsed() >= limit)
 }
 
 fn join_reader(

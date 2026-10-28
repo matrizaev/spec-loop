@@ -10,12 +10,13 @@ use crate::discovery::{self, SpecCandidate};
 use crate::error::{Result, SpecLoopError, io_error};
 use crate::integrity::InputIntegrity;
 use crate::output::Output;
-use crate::paths::{self, expand_template, resolve_optional};
+use crate::paths::{self, expand_template};
 use crate::prompts::{self, PromptRole};
 use crate::protocol::{Finding, FindingClassification};
 use crate::run_dir::RunDir;
 
 mod agents;
+mod audits;
 mod execution;
 #[cfg(test)]
 mod tests;
@@ -277,18 +278,7 @@ fn prepare_candidate_files(
 }
 
 fn validate_resources(root: &Path, profile: &Profile) -> Result<()> {
-    for path in profile
-        .prompts
-        .plan_author
-        .iter()
-        .chain(&profile.prompts.plan_review)
-        .chain(&profile.prompts.plan_audit)
-        .chain(&profile.prompts.plan_review_clarification)
-        .chain(&profile.prompts.implementation)
-        .chain(&profile.prompts.review)
-        .chain(&profile.prompts.review_audit)
-        .chain(&profile.prompts.review_clarification)
-    {
+    for path in profile.prompts.files() {
         paths::validate_regular_file(root, path, "prompts")?;
     }
     backend::validate_prerequisites(profile)?;
@@ -383,7 +373,7 @@ fn same_path(root: &Path, left: &Path, right: &Path) -> bool {
 }
 
 fn plan_exists(root: &Path, path: &Path) -> Result<bool> {
-    let absolute = resolve_optional(root, path);
+    let absolute = root.join(path);
     match std::fs::metadata(&absolute) {
         Ok(metadata) if metadata.is_file() => Ok(true),
         Ok(_) => Err(SpecLoopError::Config(format!(

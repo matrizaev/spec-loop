@@ -9,22 +9,25 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::{AgentBackend, AgentResponse, AgentRun, BackendContinuation, BackendFailure};
+use super::{
+    AgentBackend, AgentInvocation, AgentResponse, AgentRun, BackendContinuation, BackendFailure,
+};
 use crate::auth;
 use crate::backend::builtin::usage::{UsageReporter, UsageSnapshot};
 use crate::config::Profile;
 use crate::error::{Result, SpecLoopError};
-use crate::output::Output;
-use crate::prompts::PromptRole;
-use crate::protocol::{
-    ImplementationAuditResponse, ImplementationClarificationResponse, ImplementationResponse,
-    ImplementationReviewResponse, PlanAuditResponse, PlanAuthorResponse, PlanClarificationResponse,
-    PlanReviewResponse, provider as protocol_provider,
-};
+use crate::prompts::{self, PromptRole};
+use crate::protocol::provider as protocol_provider;
 use crate::runtime;
 
+#[cfg(test)]
+mod api_probe;
+#[cfg(all(test, unix))]
+mod blocker_tests;
 mod provider;
 mod shell;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 pub mod usage;
@@ -41,71 +44,21 @@ struct BuiltinConversation {
 }
 
 impl AgentBackend for BuiltinBackend {
-    fn run(
+    fn invoke(
         &self,
         root: &Path,
         profile: &Profile,
         prompt: &str,
         role: PromptRole,
         cancelled: &Arc<AtomicBool>,
+        invocation: AgentInvocation<'_>,
     ) -> Result<AgentRun> {
-        let output = Output::plain();
-        let baseline = UsageSnapshot::default();
-        Self::run_continued(
-            root,
-            profile,
-            prompt,
-            role,
-            cancelled,
-            None,
-            InvocationReporting {
-                output: &output,
-                baseline: &baseline,
-            },
-        )
-    }
-
-    fn run_with_continuation(
-        &self,
-        root: &Path,
-        profile: &Profile,
-        prompt: &str,
-        role: PromptRole,
-        cancelled: &Arc<AtomicBool>,
-        invocation: super::AgentInvocation<'_>,
-    ) -> Result<AgentRun> {
-        Self::run_continued(
-            root,
-            profile,
-            prompt,
-            role,
-            cancelled,
-            invocation.continuation,
-            InvocationReporting {
-                output: invocation.output,
-                baseline: &invocation.usage_baseline,
-            },
-        )
-    }
-}
-
-#[derive(Clone, Copy)]
-struct InvocationReporting<'a> {
-    output: &'a Output,
-    baseline: &'a UsageSnapshot,
-}
-
-impl BuiltinBackend {
-    fn run_continued(
-        root: &Path,
-        profile: &Profile,
-        prompt: &str,
-        role: PromptRole,
-        cancelled: &Arc<AtomicBool>,
-        continuation: Option<BackendContinuation>,
-        reporting: InvocationReporting<'_>,
-    ) -> Result<AgentRun> {
-        let InvocationReporting { output, baseline } = reporting;
+        let AgentInvocation {
+            continuation,
+            output,
+            usage_baseline,
+        } = invocation;
+        let baseline = &usage_baseline;
         let started = Instant::now();
         let stage = role.agent_stage();
         let selected_model = profile.agent.model_for(stage).unwrap_or("unknown");
@@ -141,7 +94,7 @@ impl BuiltinBackend {
                 .and_then(|(deadline, continuation)| {
                     runtime::block_on(run_role_with_auth_observed(
                         || auth::active_access_token(false, cancelled),
-                        RoleTask {
+                        RoleInput {
                             root,
                             profile,
                             prompt,
@@ -149,6 +102,8 @@ impl BuiltinBackend {
                             cancelled,
                             deadline,
                             endpoint: RESPONSES_URL,
+                            #[cfg(test)]
+                            token: "",
                         },
                         continuation,
                         &mut completed_conversation,
@@ -194,7 +149,7 @@ fn build_responses_request(
                 "type": "json_schema",
                 "name": role.protocol_name(),
                 "strict": true,
-                "schema": provider_schema(role)?
+                "schema": protocol_provider::project_schema(&prompts::schema_for_role(role)?)?
             }
         }
     });
@@ -217,21 +172,6 @@ fn normalize_structured_role_text(final_text: Option<String>) -> Result<String> 
     serde_json::to_string(&canonical).map_err(|error| {
         SpecLoopError::Agent(format!("serialize normalized role response: {error}"))
     })
-}
-
-fn provider_schema(role: PromptRole) -> Result<Value> {
-    match role {
-        PromptRole::PlanAuthor => protocol_provider::schema::<PlanAuthorResponse>(),
-        PromptRole::PlanReview => protocol_provider::schema::<PlanReviewResponse>(),
-        PromptRole::PlanAudit => protocol_provider::schema::<PlanAuditResponse>(),
-        PromptRole::PlanClarification => protocol_provider::schema::<PlanClarificationResponse>(),
-        PromptRole::Implementation => protocol_provider::schema::<ImplementationResponse>(),
-        PromptRole::Review => protocol_provider::schema::<ImplementationReviewResponse>(),
-        PromptRole::ReviewAudit => protocol_provider::schema::<ImplementationAuditResponse>(),
-        PromptRole::ReviewClarification => {
-            protocol_provider::schema::<ImplementationClarificationResponse>()
-        }
-    }
 }
 
 fn role_deadline(timeout_seconds: Option<u64>) -> Result<Option<Instant>> {
@@ -267,20 +207,10 @@ fn classify_agent_run_with_usage(
     }
 }
 
-struct RoleTask<'a> {
-    root: &'a Path,
-    profile: &'a Profile,
-    prompt: &'a str,
-    role: PromptRole,
-    cancelled: &'a Arc<AtomicBool>,
-    deadline: Option<Instant>,
-    endpoint: &'a str,
-}
-
 #[cfg(test)]
 async fn run_role_with_auth<F, Fut>(
     token_provider: F,
-    task: RoleTask<'_>,
+    input: RoleInput<'_>,
     continuation: Option<BuiltinConversation>,
     completed_conversation: &mut Option<BuiltinConversation>,
     transcript: &mut Vec<u8>,
@@ -291,7 +221,7 @@ where
 {
     run_role_with_auth_observed(
         token_provider,
-        task,
+        input.with_test_deadline(),
         continuation,
         completed_conversation,
         transcript,
@@ -303,7 +233,7 @@ where
 
 async fn run_role_with_auth_observed<F, Fut>(
     token_provider: F,
-    task: RoleTask<'_>,
+    input: RoleInput<'_>,
     continuation: Option<BuiltinConversation>,
     completed_conversation: &mut Option<BuiltinConversation>,
     transcript: &mut Vec<u8>,
@@ -314,28 +244,9 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<String>>,
 {
-    let RoleTask {
-        root,
-        profile,
-        prompt,
-        role,
-        cancelled,
-        deadline,
-        endpoint,
-    } = task;
     run_after_shell_preflight(Path::new("/bin/sh"), cfg!(unix), || async move {
         run_role_with_token_provider_observed(
-            RoleInput {
-                root,
-                profile,
-                prompt,
-                role,
-                cancelled,
-                deadline,
-                endpoint,
-                #[cfg(test)]
-                token: "",
-            },
+            input,
             continuation,
             token_provider,
             completed_conversation,
@@ -407,6 +318,18 @@ struct RoleInput<'a> {
 }
 
 #[cfg(test)]
+impl RoleInput<'_> {
+    // Bound ordinary fixture clients too; explicit short timeout/interruption scenarios retain
+    // their original deadline. Production role configuration never uses this test-only default.
+    fn with_test_deadline(mut self) -> Self {
+        self.deadline = self
+            .deadline
+            .or_else(|| Some(Instant::now() + test_support::WATCHDOG));
+        self
+    }
+}
+
+#[cfg(test)]
 async fn run_role_with_access_token(
     input: RoleInput<'_>,
     transcript: &mut Vec<u8>,
@@ -448,7 +371,7 @@ where
     Fut: Future<Output = Result<String>>,
 {
     run_role_with_token_provider_observed(
-        input,
+        input.with_test_deadline(),
         continuation,
         token_provider,
         completed_conversation,

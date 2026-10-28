@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -9,7 +8,9 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::super::tests::{completed_sse, read_http_request};
+use super::super::test_support::{
+    Reply, WATCHDOG, accept_until, completed_sse, read_request_until, serve_responses, write_until,
+};
 use super::super::{RoleInput, classify_agent_run, run_role_with_access_token};
 use super::{
     completed_output, parse_output_items, render_captured_streams, run_shell, shell_tool_definition,
@@ -235,16 +236,15 @@ fn builtin_sync_backend_enforces_one_role_deadline_across_provider_and_shell() {
     let server = thread::spawn(move || {
         use std::time::Duration;
 
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
+        let deadline = Instant::now() + WATCHDOG;
+        let mut stream = accept_until(&listener, deadline).expect("accept provider request");
+        let request = read_request_until(&mut stream, deadline).expect("read provider request");
         thread::sleep(Duration::from_millis(650));
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write provider response");
+        write_until(&mut stream, response.as_bytes(), deadline).expect("write provider response");
         listener
             .set_nonblocking(true)
             .expect("make provider listener nonblocking");
@@ -254,12 +254,13 @@ fn builtin_sync_backend_enforces_one_role_deadline_across_provider_and_shell() {
             match listener.accept() {
                 Ok((mut extra, _)) => {
                     extra_requests += 1;
-                    let _ = read_http_request(&mut extra);
+                    read_request_until(&mut extra, observation_deadline)
+                        .expect("read unexpected fixture request");
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(_) => break,
+                Err(error) => panic!("inspect fixture listener: {error}"),
             }
         }
         (request, extra_requests)
@@ -344,18 +345,7 @@ fn shell_timeout_preserves_command_and_captured_output_in_transcript() {
         }
     });
     let body = completed_sse(&event);
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write provider response");
-        request
-    });
+    let server = serve_responses(listener, [Reply::sse(body)]);
     let profile: Profile = toml::from_str(
         r"schema_version=3
 [specs]
@@ -389,7 +379,7 @@ model='fixture-model'
         result,
         Err(crate::error::SpecLoopError::Timeout(_))
     ));
-    assert_ne!(server.join().expect("join provider fixture"), "");
+    assert_eq!(server.join().expect("join provider fixture").len(), 1);
     let log = String::from_utf8(transcript).expect("shell transcript is UTF-8");
     assert!(log.contains("$ printf retained; sleep 30"));
     assert!(log.contains("termination=timed_out"));
@@ -436,7 +426,7 @@ fn shell_usage_counts_each_successfully_spawned_call() {
     use super::super::BuiltinConversation;
     use super::{ShellCall, ShellExecutionContext, execute_shell_calls};
     use crate::backend::UsageSnapshot;
-    use crate::backend::builtin::tests::builtin_test_profile;
+    use crate::backend::builtin::test_support::builtin_test_profile;
     use crate::backend::builtin::usage::UsageReporter;
 
     let temporary = TempDir::new().expect("create shell usage fixture");

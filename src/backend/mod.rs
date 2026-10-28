@@ -130,19 +130,10 @@ pub struct AgentInvocation<'a> {
 
 /// Backend contract consumed by workflow policy without backend-specific parsing.
 pub trait AgentBackend {
-    /// Invoke one role-specific agent and return raw logs plus a validated response.
+    /// Invokes one role with reporting and optional backend-owned correction-only state.
     ///
-    fn run(
-        &self,
-        root: &Path,
-        profile: &Profile,
-        prompt: &str,
-        role: PromptRole,
-        cancelled: &Arc<AtomicBool>,
-    ) -> Result<AgentRun>;
-
-    /// Continues a prior response solely to repair its typed handoff.
-    fn run_with_continuation(
+    /// A supplied continuation repairs the typed handoff without repeating completed tools.
+    fn invoke(
         &self,
         root: &Path,
         profile: &Profile,
@@ -150,14 +141,7 @@ pub trait AgentBackend {
         role: PromptRole,
         cancelled: &Arc<AtomicBool>,
         invocation: AgentInvocation<'_>,
-    ) -> Result<AgentRun> {
-        if invocation.continuation.is_some() {
-            return Err(SpecLoopError::Workflow(
-                "selected backend cannot resume a typed-response correction".to_owned(),
-            ));
-        }
-        self.run(root, profile, prompt, role, cancelled)
-    }
+    ) -> Result<AgentRun>;
 }
 
 /// Constructs the configured backend after profile validation.

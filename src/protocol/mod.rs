@@ -4,13 +4,21 @@ use schemars::generate::SchemaSettings;
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+pub use self::blocker::BlockerAdjudication;
 use crate::error::{Result, SpecLoopError};
 
+mod blocker;
 /// Mechanically projects canonical role schemas for provider-native structured output.
 pub mod provider;
 
 #[cfg(test)]
+mod adjudication_tests;
+#[cfg(test)]
+mod schema_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod validation_tests;
 const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -168,6 +176,11 @@ pub enum AuditResult {
         #[schemars(length(min = 1))]
         reason: String,
     },
+    /// Adjudication of the supplied agent blocker, not of findings or overall correctness.
+    Adjudicated {
+        /// Strict outcome-specific evidence and blocker details.
+        adjudication: BlockerAdjudication,
+    },
 }
 
 macro_rules! audit_response {
@@ -242,14 +255,26 @@ macro_rules! evidence_response {
 evidence_response!(PlanClarificationResponse, "plan_review_clarification");
 evidence_response!(ImplementationClarificationResponse, "review_clarification");
 
-/// Typed audit input keeps original reviewer findings paired with their review response.
+/// Typed audit task retains the original response without inferring a task from prose.
 #[derive(JsonSchema, Serialize)]
 #[schemars(deny_unknown_fields)]
-pub struct AuditInput<'a, R> {
-    pub review: &'a R,
-    pub findings: &'a [Finding],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<&'a AuditEvidenceInput>,
+#[serde(tag = "audit_kind", rename_all = "snake_case")]
+pub enum AuditInput<'a, R> {
+    /// Classify only the supplied findings, retaining their review and grounding evidence.
+    Findings {
+        /// Original typed reviewer response.
+        review: &'a R,
+        /// Original findings in reviewer order.
+        findings: &'a [Finding],
+        /// Optional grounding evidence for a follow-up finding audit.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        evidence: Option<&'a AuditEvidenceInput>,
+    },
+    /// Assess the exact supplied blocker without manufacturing findings.
+    AgentBlocker {
+        /// Original typed blocked non-auditor response, including role and exact reason.
+        response: &'a R,
+    },
 }
 
 /// Cited evidence and findings supplied to a follow-up grounding audit.
@@ -291,16 +316,22 @@ pub struct ImplementationRepairInput<'a> {
     pub audit: &'a [FindingClassification],
 }
 
-/// Returns generated JSON Schema 2020-12 for a role response type.
+/// Serializes canonical schemas for contract tests; production serializes shared role values.
+#[cfg(test)]
 pub fn schema<T: JsonSchema>() -> Result<String> {
+    serde_json::to_string_pretty(&schema_value::<T>()?)
+        .map_err(|error| SpecLoopError::Agent(format!("serialize response schema: {error}")))
+}
+
+/// Generates one closed canonical schema value without a JSON text round trip.
+pub fn schema_value<T: JsonSchema>() -> Result<serde_json::Value> {
     let generator = SchemaGenerator::new(SchemaSettings::draft2020_12());
     let schema: Schema = generator.into_root_schema_for::<T>();
     let mut value = serde_json::to_value(schema).map_err(|error| {
         SpecLoopError::Agent(format!("serialize generated response schema: {error}"))
     })?;
     close_flattened_schema(&mut value)?;
-    serde_json::to_string_pretty(&value)
-        .map_err(|error| SpecLoopError::Agent(format!("serialize response schema: {error}")))
+    Ok(value)
 }
 
 fn close_flattened_schema(schema: &mut serde_json::Value) -> Result<()> {
@@ -384,10 +415,7 @@ pub fn parse<T: DeserializeOwned + JsonSchema + ResponseFields>(
             "role response must be one JSON object".to_owned(),
         ));
     }
-    let generated_schema: serde_json::Value =
-        serde_json::from_str(&schema::<T>()?).map_err(|error| {
-            SpecLoopError::Agent(format!("parse generated response schema: {error}"))
-        })?;
+    let generated_schema = schema_value::<T>()?;
     let mut field_errors = Vec::new();
     validate_response_shape(&supplied, &generated_schema, role, &mut field_errors)?;
     if !field_errors.is_empty() {
@@ -503,6 +531,32 @@ fn validate_schema_value(
     field_errors: &mut Vec<String>,
 ) -> Result<()> {
     let schema = resolve_schema_reference(schema, root_schema, role, path)?;
+    if value.is_object()
+        && let Some(branches) = schema.get("oneOf").and_then(serde_json::Value::as_array)
+    {
+        let branch = branches
+            .iter()
+            .find(|branch| {
+                branch
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|properties| {
+                        properties.iter().any(|(name, property)| {
+                            value.get(name).is_some_and(|tag| {
+                                property.get("const") == Some(tag)
+                                    || property
+                                        .get("enum")
+                                        .and_then(serde_json::Value::as_array)
+                                        .is_some_and(|values| values.contains(tag))
+                            })
+                        })
+                    })
+            })
+            .ok_or_else(|| {
+                SpecLoopError::Agent(format!("invalid {role} discriminator at {path}"))
+            })?;
+        return validate_schema_value(value, branch, root_schema, role, path, field_errors);
+    }
     if let Some(object) = value.as_object() {
         let properties = schema
             .get("properties")
@@ -654,26 +708,34 @@ pub trait ResponseFields {
     fn role(&self) -> &str;
     /// Validates status and payload consistency after deserialization.
     fn validate_response(&self) -> Result<()>;
+    /// Returns the exact typed blocker claim, without interpreting its prose.
+    fn blocked_reason(&self) -> Option<&str>;
 }
 
 macro_rules! impl_response_fields {
-    ($($name:ty => $validator:path),+ $(,)?) => {
+    ($($name:ty => $result:ident, $validator:path),+ $(,)?) => {
         $(impl ResponseFields for $name {
             fn protocol_version(&self) -> u32 { self.protocol_version }
             fn role(&self) -> &str { &self.role }
             fn validate_response(&self) -> Result<()> { $validator(&self.result) }
+            fn blocked_reason(&self) -> Option<&str> {
+                match &self.result {
+                    $result::Blocked { reason } => Some(reason),
+                    _ => None,
+                }
+            }
         })+
     };
 }
 
 impl_response_fields!(
-    PlanAuthorResponse => validate_readiness,
-    PlanReviewResponse => validate_review_result,
-    ImplementationReviewResponse => validate_review_result,
-    PlanAuditResponse => validate_audit,
-    ImplementationAuditResponse => validate_audit,
-    PlanClarificationResponse => validate_evidence_result,
-    ImplementationClarificationResponse => validate_evidence_result,
+    PlanAuthorResponse => Readiness, validate_readiness,
+    PlanReviewResponse => ReviewResult, validate_review_result,
+    ImplementationReviewResponse => ReviewResult, validate_review_result,
+    PlanAuditResponse => AuditResult, validate_audit,
+    ImplementationAuditResponse => AuditResult, validate_audit,
+    PlanClarificationResponse => EvidenceResult, validate_evidence_result,
+    ImplementationClarificationResponse => EvidenceResult, validate_evidence_result,
 );
 
 impl ResponseFields for ImplementationResponse {
@@ -688,6 +750,13 @@ impl ResponseFields for ImplementationResponse {
     fn validate_response(&self) -> Result<()> {
         validate_readiness(&self.result)?;
         validate_implementation_summary(&self.summary)
+    }
+
+    fn blocked_reason(&self) -> Option<&str> {
+        match &self.result {
+            Readiness::Blocked { reason } => Some(reason),
+            Readiness::ReadyForReview => None,
+        }
     }
 }
 
@@ -738,40 +807,20 @@ fn validate_audit(result: &AuditResult) -> Result<()> {
                     ));
                 }
                 validate_assessment(item)?;
-                validate_text(&item.rationale, "classification rationale")?;
             }
             Ok(())
         }
         AuditResult::Complete { .. } => Err(SpecLoopError::Agent(
             "complete audit requires non-empty classifications".to_owned(),
         )),
+        AuditResult::Adjudicated { adjudication } => adjudication.validate(),
         AuditResult::Blocked { reason } => validate_text(reason, "blocked reason"),
     }
 }
 
 fn validate_evidence_result(result: &EvidenceResult) -> Result<()> {
     match result {
-        EvidenceResult::Complete { evidence } => {
-            let mut seen = std::collections::BTreeSet::new();
-            for entry in evidence {
-                if entry.finding_id == 0 || !seen.insert(entry.finding_id) {
-                    return Err(SpecLoopError::Agent(
-                        "evidence finding IDs must be positive and unique".to_owned(),
-                    ));
-                }
-                for citation in &entry.citations {
-                    for (field, value) in [
-                        ("citation path", &citation.path),
-                        ("citation location", &citation.location),
-                        ("citation excerpt", &citation.excerpt),
-                        ("citation relevance", &citation.relevance),
-                    ] {
-                        validate_text(value, field)?;
-                    }
-                }
-            }
-            Ok(())
-        }
+        EvidenceResult::Complete { evidence } => validate_evidence_entries(evidence, None),
         EvidenceResult::Blocked { reason } => validate_text(reason, "blocked reason"),
     }
 }
@@ -815,6 +864,30 @@ pub fn validate_classifications(
     classifications: &[FindingClassification],
     findings: &[Finding],
 ) -> Result<()> {
+    validate_classification_count(classifications, findings)?;
+    for (classification, finding) in classifications.iter().zip(findings) {
+        validate_classification_id(classification.finding_id, finding.id)?;
+        validate_assessment(classification)?;
+    }
+    Ok(())
+}
+
+/// Validates only input-dependent count and order after intrinsic typed parsing.
+pub fn validate_classification_order(
+    classifications: &[FindingClassification],
+    findings: &[Finding],
+) -> Result<()> {
+    validate_classification_count(classifications, findings)?;
+    for (classification, finding) in classifications.iter().zip(findings) {
+        validate_classification_id(classification.finding_id, finding.id)?;
+    }
+    Ok(())
+}
+
+fn validate_classification_count(
+    classifications: &[FindingClassification],
+    findings: &[Finding],
+) -> Result<()> {
     if classifications.len() != findings.len() {
         return Err(SpecLoopError::Agent(format!(
             "audit returned {} classifications for {} findings",
@@ -822,15 +895,14 @@ pub fn validate_classifications(
             findings.len()
         )));
     }
-    for (classification, finding) in classifications.iter().zip(findings) {
-        if classification.finding_id != finding.id {
-            return Err(SpecLoopError::Agent(format!(
-                "audit classifications must match finding order; expected {}, got {}",
-                finding.id, classification.finding_id
-            )));
-        }
-        validate_assessment(classification)?;
-        validate_text(&classification.rationale, "classification rationale")?;
+    Ok(())
+}
+
+fn validate_classification_id(actual: u64, expected: u64) -> Result<()> {
+    if actual != expected {
+        return Err(SpecLoopError::Agent(format!(
+            "audit classifications must match finding order; expected {expected}, got {actual}"
+        )));
     }
     Ok(())
 }
@@ -850,24 +922,53 @@ fn validate_assessment(assessment: &FindingClassification) -> Result<()> {
             "ambiguous findings require ambiguous actionability".to_owned(),
         ));
     }
+    validate_text(&assessment.rationale, "classification rationale")
+}
+
+/// Retains standalone unvalidated-evidence guarantees for contract tests.
+#[cfg(test)]
+pub fn validate_evidence(evidence: &[FindingEvidence], requested_ids: &[u64]) -> Result<()> {
+    validate_evidence_entries(evidence, Some(requested_ids))
+}
+
+/// Validates only request membership after intrinsic typed parsing.
+pub fn validate_requested_evidence(
+    evidence: &[FindingEvidence],
+    requested_ids: &[u64],
+) -> Result<()> {
+    for entry in evidence {
+        validate_requested_finding(entry.finding_id, requested_ids)?;
+    }
     Ok(())
 }
 
-/// Validates evidence entries refer only to requested findings and occur once.
-pub fn validate_evidence(evidence: &[FindingEvidence], requested_ids: &[u64]) -> Result<()> {
-    let mut seen = std::collections::BTreeSet::new();
+fn validate_requested_finding(id: u64, requested_ids: &[u64]) -> Result<()> {
+    if !requested_ids.contains(&id) {
+        return Err(SpecLoopError::Agent(format!(
+            "evidence refers to unrequested finding {id}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_evidence_entries(
+    evidence: &[FindingEvidence],
+    requested_ids: Option<&[u64]>,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
     for entry in evidence {
-        if !requested_ids.contains(&entry.finding_id) {
-            return Err(SpecLoopError::Agent(format!(
-                "evidence refers to unrequested finding {}",
-                entry.finding_id
-            )));
-        }
-        if !seen.insert(entry.finding_id) {
-            return Err(SpecLoopError::Agent(format!(
-                "evidence repeats finding {}",
-                entry.finding_id
-            )));
+        if let Some(requested_ids) = requested_ids {
+            validate_requested_finding(entry.finding_id, requested_ids)?;
+            if !seen.insert(entry.finding_id) {
+                return Err(SpecLoopError::Agent(format!(
+                    "evidence repeats finding {}",
+                    entry.finding_id
+                )));
+            }
+        } else if entry.finding_id == 0 || !seen.insert(entry.finding_id) {
+            return Err(SpecLoopError::Agent(
+                "evidence finding IDs must be positive and unique".to_owned(),
+            ));
         }
         for citation in &entry.citations {
             for (field, value) in [

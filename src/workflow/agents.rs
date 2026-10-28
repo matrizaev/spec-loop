@@ -14,6 +14,43 @@ use crate::protocol::{self, ResponseFields};
 pub(super) fn call_typed<T>(
     context: &mut WorkflowContext<'_>,
     request: AgentRequest<'_>,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + JsonSchema + ResponseFields + TypedResult + Serialize,
+{
+    call_typed_validated(context, request, |_| Ok(()))
+}
+
+pub(super) fn call_typed_validated<T>(
+    context: &mut WorkflowContext<'_>,
+    request: AgentRequest<'_>,
+    mut validate: impl FnMut(&T) -> Result<()>,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned + JsonSchema + ResponseFields + TypedResult + Serialize,
+{
+    let mut feedback = request.feedback.map(str::to_owned);
+    loop {
+        let attempt = AgentRequest {
+            feedback: feedback.as_deref(),
+            ..request
+        };
+        let response: T = call_typed_attempts(context, attempt, &mut validate)?;
+        if response.blocked_reason().is_none() {
+            return Ok(response);
+        }
+        let correction = super::audits::adjudicate_blocker(context, attempt, &response)?;
+        // Unsupported is a normal tools-enabled invocation, not a malformed-JSON continuation.
+        // Retain all native task inputs and prior audit feedback; never replay outer workflow steps.
+        let previous = feedback.get_or_insert_with(String::new);
+        previous.push_str("\n\n--- Blocker adjudication feedback ---\n");
+        previous.push_str(&correction);
+    }
+}
+
+pub(super) fn call_typed_attempts<T>(
+    context: &mut WorkflowContext<'_>,
+    request: AgentRequest<'_>,
     mut validate: impl FnMut(&T) -> Result<()>,
 ) -> Result<T>
 where
@@ -199,7 +236,7 @@ fn invoke_and_log_agent(
     continuation: Option<backend::BackendContinuation>,
     usage_baseline: UsageSnapshot,
 ) -> Result<LoggedAgentRun> {
-    let outcome = match context.backend.run_with_continuation(
+    let outcome = match context.backend.invoke(
         context.root,
         context.profile,
         prompt,

@@ -13,6 +13,37 @@ use crate::protocol::{
 };
 
 #[test]
+fn adjudication_output_distinguishes_correction_from_stops_and_sanitizes_evidence() {
+    let fixtures: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../tests/fixtures/blocker-adjudications.json"
+    ))
+    .expect("adjudication fixtures");
+    for mut adjudication in fixtures {
+        adjudication["evidence"] = serde_json::json!("source \u{1b}[31m evidence");
+        let response = crate::protocol::parse::<PlanAuditResponse>(&serde_json::json!({
+            "protocol_version":1,"role":"plan_audit","status":"adjudicated","adjudication":adjudication,
+        }).to_string(), "plan_audit").expect("typed adjudication");
+        let concise = response.render(false);
+        let verbose = response.render(true);
+        assert!(!concise.contains("[PASS]"));
+        assert!(!verbose.contains('\u{1b}'));
+        assert!(verbose.contains("Evidence:"));
+        match adjudication["outcome"].as_str().expect("outcome") {
+            "unsupported" => {
+                assert!(concise.contains("[RETRY]") && concise.contains("this is not approval"));
+            }
+            "confirmed" => {
+                assert!(concise.contains("[BLOCKED]") && concise.contains("Required input:"));
+            }
+            "ambiguous" => {
+                assert!(concise.contains("[BLOCKED]") && concise.contains("Unresolved question:"));
+            }
+            _ => panic!("unexpected fixture outcome"),
+        }
+    }
+}
+
+#[test]
 fn color_policy_detects_streams_independently_and_honors_overrides() {
     let auto = Output::with_environment(
         ColorMode::Auto,
@@ -110,10 +141,14 @@ fn usage_reports_replace_the_same_terminal_block_and_append_when_redirected() {
     );
     assert!(matches!(state, UsageProgressState::Replace { lines: 3 }));
 
-    let (first, state) = render_usage_report("pipe one", UsageProgressState::Initial, false);
-    let (second, _) = render_usage_report("pipe two", state, false);
-    assert_eq!(first, "pipe one\n");
-    assert_eq!(second, "pipe two\n");
+    let (first, state) = render_usage_report(
+        "role header\nstatus one\nusage one",
+        UsageProgressState::Initial,
+        false,
+    );
+    let (second, _) = render_usage_report("role header\nstatus two\nusage two", state, false);
+    assert_eq!(first, "role header\nstatus one\nusage one\n");
+    assert_eq!(second, "status two\nusage two\n");
 }
 
 #[test]

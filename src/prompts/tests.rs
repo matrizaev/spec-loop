@@ -2,6 +2,7 @@ use std::path::Path;
 
 use super::{PromptContext, PromptRole, build_prompt};
 use crate::config::Profile;
+use crate::protocol::{self, PlanReviewResponse, ReviewResult};
 
 #[test]
 fn finding_audits_receive_skeptical_proportionate_correction_contract() {
@@ -94,6 +95,108 @@ fn plan_roles_require_research_complete_executable_handoffs() {
     assert!(implementation.contains("Approved plans are proposed guidance"));
     assert!(implementation.contains("selected specification remains the full authoritative scope"));
     assert!(implementation.contains("approved plan is read-only"));
+}
+
+#[test]
+fn plan_review_status_guidance_distinguishes_empty_success_from_external_blockers() {
+    let approval =
+        r#"{"protocol_version":1,"role":"plan_review","status":"no_issues","findings":[]}"#;
+    let response = protocol::parse::<PlanReviewResponse>(approval, "plan_review")
+        .expect("approval example matches canonical protocol");
+    assert!(matches!(
+        response.result,
+        ReviewResult::NoIssues { findings } if findings.is_empty()
+    ));
+
+    for backend in ["pi", "builtin"] {
+        let profile: Profile = toml::from_str(&format!(
+            "schema_version = 3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='{backend}'\nmodel='model-name'\n"
+        ))
+        .expect("profile");
+        let prompt = build_prompt(
+            Path::new("/project"),
+            &profile,
+            PromptContext {
+                role: PromptRole::PlanReview,
+                spec_id: "1",
+                spec_path: Path::new("specs/1.md"),
+                plan_path: Some(Path::new(".spec-loop/plans/1.md")),
+                feedback: None,
+                validation_feedback: None,
+                checks: "",
+            },
+        )
+        .expect("build plan-review prompt");
+
+        assert!(prompt.contains(approval));
+        assert!(prompt.contains("No findings is a successful review outcome, not a blocker."));
+        assert!(prompt.contains("Never invent findings or return `blocked` merely because no actionable gaps were found."));
+        assert!(prompt.contains(
+            "`issues`: actionable supported gaps exist; return a non-empty `findings` array"
+        ));
+        assert!(prompt.contains("`blocked`: a required external prerequisite"));
+        assert!(prompt.contains("naming the unavailable prerequisite and why it is necessary"));
+        assert!(prompt.contains(
+            "This requests independent blocker adjudication; it is not a successful empty review."
+        ));
+    }
+}
+
+#[test]
+fn both_review_scopes_and_auditors_receive_kind_specific_blocker_contracts() {
+    for backend in ["builtin", "pi"] {
+        let profile: Profile = toml::from_str(&format!(
+            "schema_version=3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='{backend}'\nmodel='fixture-model'\n"
+        )).expect("profile");
+        for role in [
+            PromptRole::PlanReview,
+            PromptRole::Review,
+            PromptRole::PlanAudit,
+            PromptRole::ReviewAudit,
+        ] {
+            let prompt = build_prompt(
+                Path::new("/project"),
+                &profile,
+                PromptContext {
+                    role,
+                    spec_id: "1",
+                    spec_path: Path::new("specs/1.md"),
+                    plan_path: Some(Path::new(".spec-loop/plans/1.md")),
+                    feedback: None,
+                    validation_feedback: None,
+                    checks: "",
+                },
+            )
+            .expect("role prompt");
+            if matches!(role, PromptRole::PlanReview | PromptRole::Review) {
+                assert!(prompt.contains(
+                    "zero findings and no genuine external blocker must return `no_issues`"
+                ));
+                assert!(prompt.contains(
+                    "A genuine external blocker may still require `blocked` with zero findings"
+                ));
+                assert!(prompt.contains("If feedback contains `blocker_audit`"));
+            } else {
+                assert!(prompt.contains("For `audit_kind: agent_blocker` only"));
+                assert!(
+                    prompt.contains(
+                        "The finding-classification contract does not apply to this task"
+                    )
+                );
+                assert!(prompt.contains("status: adjudicated"));
+                assert!(
+                    prompt.contains("confirmed")
+                        && prompt.contains("unsupported")
+                        && prompt.contains("ambiguous")
+                );
+                assert!(
+                    prompt.contains(
+                        "auditor blockers stop immediately and are not recursively audited"
+                    )
+                );
+            }
+        }
+    }
 }
 
 #[test]

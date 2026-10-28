@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,14 +11,13 @@ use tempfile::TempDir;
 
 use super::super::shell::parse_output_items;
 use super::super::shell::shell_tool_definition;
-use super::super::tests::{
-    RESPONSE_STARTED, assert_oauth_only_requests, assert_transient_sse_failure_retries,
-    builtin_test_profile, completed_sse, fake_stream_request, read_http_request,
-    run_fake_http_responses, sse_event,
+use super::super::test_support::{
+    ProviderServer, RESPONSE_STARTED, Reply, WATCHDOG, accept_until, assert_oauth_only_requests,
+    assert_transient_sse_failure_retries, builtin_test_profile, completed_sse, fake_stream_request,
+    read_request_until, run_fake_http_responses, serve_responses, sse_event, write_until,
 };
 use super::super::{
-    RESPONSES_URL, RoleInput, RoleTask, classify_agent_run, run_role_with_access_token,
-    run_role_with_auth,
+    RESPONSES_URL, RoleInput, classify_agent_run, run_role_with_access_token, run_role_with_auth,
 };
 use super::{
     SseState, StreamFailure, advance_retry_counter, request_with_observations,
@@ -48,29 +46,13 @@ fn provider_retry_counts_each_send_and_completed_response_once() {
             }
         }
     }));
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for (status, response_body) in [
-            ("429 Too Many Requests", "retry".to_owned()),
-            ("200 OK", body),
-        ] {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let delay = if status.starts_with("429") {
-                "Retry-After: 0\r\n"
-            } else {
-                ""
-            };
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\n{delay}Content-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+    let server = serve_responses(
+        listener,
+        [
+            Reply::http("429 Too Many Requests", "retry".to_owned()),
+            Reply::sse(body),
+        ],
+    );
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -88,7 +70,7 @@ fn provider_retry_counts_each_send_and_completed_response_once() {
             &format!("http://{address}/v1/responses"),
             "fixture-access-token",
             &json!({"model": "fixture-model", "stream": true}),
-            None,
+            Some(server.deadline()),
             &AtomicBool::new(false),
             &mut reporter,
         ))
@@ -114,9 +96,10 @@ fn request_attempt_is_reported_while_provider_response_is_held() {
     let address = listener.local_addr().expect("provider fixture address");
     let (release_response, response_released) = mpsc::channel();
     let (request_arrived, request_received) = mpsc::channel();
+    let deadline = std::time::Instant::now() + WATCHDOG;
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
+        let mut stream = accept_until(&listener, deadline).expect("accept provider request");
+        let request = read_request_until(&mut stream, deadline).expect("read held request");
         request_arrived
             .send(())
             .expect("notify that provider request arrived");
@@ -131,9 +114,7 @@ fn request_attempt_is_reported_while_provider_response_is_held() {
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write provider response");
+        write_until(&mut stream, response.as_bytes(), deadline).expect("write held response");
         request
     });
     let client = reqwest::Client::builder()
@@ -154,7 +135,7 @@ fn request_attempt_is_reported_while_provider_response_is_held() {
             &format!("http://{address}/v1/responses"),
             "fixture-access-token",
             &json!({"model": "fixture-model", "stream": true}),
-            None,
+            Some(deadline),
             &AtomicBool::new(false),
             &mut reporter,
         ))
@@ -254,7 +235,7 @@ fn incomplete_response_after_shell_effect_is_fatal_without_replay_or_handoff() {
     let mut usage = UsageSnapshot::default();
     let mut observer = |_: &UsageSnapshot| Ok(());
     let result = crate::runtime::block_on(super::super::run_role_with_token_provider_observed(
-        input,
+        input.with_test_deadline(),
         None,
         move || {
             let token = token.clone();
@@ -336,28 +317,12 @@ fn incomplete_response_events(completed_marker: &Path, forbidden_marker: &Path) 
     [completed, incomplete]
 }
 
-fn start_incomplete_response_provider(
-    responses: [String; 2],
-) -> (String, thread::JoinHandle<Vec<String>>) {
+fn start_incomplete_response_provider(responses: [String; 2]) -> (String, ProviderServer) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind incomplete-response fixture");
     let address = listener
         .local_addr()
         .expect("incomplete-response fixture address");
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for body in responses {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write incomplete-response fixture");
-        }
-        requests
-    });
+    let server = serve_responses(listener, responses.into_iter().map(Reply::sse));
     (format!("http://{address}/v1/responses"), server)
 }
 
@@ -365,22 +330,12 @@ fn start_incomplete_response_provider(
 fn responses_request_uses_oauth_and_expected_body_with_fake_http_server() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
-        let body = completed_sse(&json!({
-            "type": "response.completed",
-            "response": {"status": "completed", "output": [], "model": "fixture-model"}
-        }));
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write provider response");
-        request
-    });
+    let server = serve_responses(
+        listener,
+        [Reply::sse(completed_sse(&json!({
+            "type":"response.completed", "response":{"status":"completed","output":[],"model":"fixture-model"}
+        })))],
+    );
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -400,14 +355,15 @@ fn responses_request_uses_oauth_and_expected_body_with_fake_http_server() {
         &address,
         "fixture-access-token",
         &body,
-        None,
+        Some(server.deadline()),
         &AtomicBool::new(false),
     ))
     .expect("construct request runtime")
     .expect("successful fake provider response");
     assert_eq!(response["status"], "completed");
     assert_eq!(RESPONSES_URL, "https://api.openai.com/v1/responses");
-    let request = server.join().expect("join provider server");
+    let requests = server.join().expect("join provider server");
+    let request = requests.first().expect("request captured");
     let (headers, payload) = request
         .split_once("\r\n\r\n")
         .expect("provider request headers");
@@ -630,36 +586,18 @@ fn provider_cancellation_aborts_headers_stream_and_retry_backoff() {
 fn rate_limit_retry_reuses_request_without_api_key_fallback() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
-    let server = thread::spawn(move || {
-        let mut requests = Vec::new();
-        for (status, body, retry_after) in [
-            (
+    let server = serve_responses(
+        listener,
+        [
+            Reply::http(
                 "429 Too Many Requests",
-                r#"{"error":{"code":"rate_limit_exceeded"}}"#,
-                Some("Retry-After: 0\r\n"),
+                r#"{"error":{"code":"rate_limit_exceeded"}}"#.to_owned(),
             ),
-            (
-                "200 OK",
-                &completed_sse(&json!({
-                    "type": "response.completed",
-                    "response": {"status": "completed", "output": []}
-                })),
-                None,
-            ),
-        ] {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let retry_after = retry_after.unwrap_or_default();
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+            Reply::sse(completed_sse(
+                &json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+            )),
+        ],
+    );
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -671,7 +609,7 @@ fn rate_limit_retry_reuses_request_without_api_key_fallback() {
         &address,
         "oauth-only-token",
         &body,
-        None,
+        Some(server.deadline()),
         &AtomicBool::new(false),
     ))
     .expect("construct request runtime")
@@ -765,40 +703,23 @@ fn streamed_usage_limit_errors_remain_fatal() {
 fn transient_response_failed_server_error_retries_stream_request() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
-    let server = thread::spawn(move || {
-        let responses = [
-            (
-                "Retry-After: 0\r\n",
-                format!(
-                    "{RESPONSE_STARTED}{}",
-                    sse_event(
-                        "response.failed",
-                        &json!({"type": "response.failed", "response": {"error": {"code": "server_error"}}})
-                    )
-                ),
-            ),
-            (
-                "",
-                completed_sse(&json!({
-                    "type": "response.completed",
-                    "response": {"status": "completed", "output": []}
-                })),
-            ),
-        ];
-        let mut requests = Vec::new();
-        for (retry_after, body) in responses {
-            let (mut stream, _) = listener.accept().expect("accept provider request");
-            requests.push(read_http_request(&mut stream));
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write provider response");
-        }
-        requests
-    });
+    let mut failure = Reply::sse(format!(
+        "{RESPONSE_STARTED}{}",
+        sse_event(
+            "response.failed",
+            &json!({"type":"response.failed","response":{"error":{"code":"server_error"}}})
+        )
+    ));
+    failure.headers = "Retry-After: 0\r\n";
+    let server = serve_responses(
+        listener,
+        [
+            failure,
+            Reply::sse(completed_sse(
+                &json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+            )),
+        ],
+    );
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -809,7 +730,7 @@ fn transient_response_failed_server_error_retries_stream_request() {
         &format!("http://{address}/v1/responses"),
         "fixture-token",
         &body,
-        None,
+        Some(server.deadline()),
         &AtomicBool::new(false),
     ))
     .expect("construct request runtime")
@@ -822,25 +743,14 @@ fn transient_response_failed_server_error_retries_stream_request() {
 fn permanent_response_failed_does_not_retry_stream_request() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept provider request");
-        let request = read_http_request(&mut stream);
-        let body = format!(
-            "{RESPONSE_STARTED}{}",
-            sse_event(
-                "response.failed",
-                &json!({"type": "response.failed", "response": {"error": {"code": "invalid_request_error"}}})
-            )
-        );
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("write provider response");
-        request
-    });
+    let body = format!(
+        "{RESPONSE_STARTED}{}",
+        sse_event(
+            "response.failed",
+            &json!({"type":"response.failed","response":{"error":{"code":"invalid_request_error"}}})
+        )
+    );
+    let server = serve_responses(listener, [Reply::sse(body)]);
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -851,12 +761,12 @@ fn permanent_response_failed_does_not_retry_stream_request() {
         &format!("http://{address}/v1/responses"),
         "fixture-token",
         &body,
-        None,
+        Some(server.deadline()),
         &AtomicBool::new(false),
     ))
     .expect("construct request runtime");
     assert!(result.is_err());
-    assert_ne!(server.join().expect("join provider fixture"), "");
+    assert_eq!(server.join().expect("join provider fixture").len(), 1);
 }
 
 #[test]
@@ -935,16 +845,17 @@ fn direct_route_admission_denials_are_fatal_before_model_dispatch() {
         let address = listener.local_addr().expect("provider fixture address");
         let model_dispatches = Arc::new(AtomicUsize::new(0));
         let observed_dispatches = Arc::clone(&model_dispatches);
+        let deadline = std::time::Instant::now() + WATCHDOG;
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept admission request");
-            let request = read_http_request(&mut stream);
+            let mut stream = accept_until(&listener, deadline).expect("accept admission request");
+            let request =
+                read_request_until(&mut stream, deadline).expect("read admission request");
             let body = r#"{"error":{"code":"direct_permission_denied"}}"#;
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            stream
-                .write_all(response.as_bytes())
+            write_until(&mut stream, response.as_bytes(), deadline)
                 .expect("write admission denial");
             if status.starts_with("200 ") {
                 observed_dispatches.fetch_add(1, Ordering::Relaxed);
@@ -959,14 +870,15 @@ fn direct_route_admission_denials_are_fatal_before_model_dispatch() {
         let endpoint = format!("http://{address}/v1/responses");
         let result = crate::runtime::block_on(run_role_with_auth(
             || async { Ok("fixture-access-token".to_owned()) },
-            RoleTask {
+            RoleInput {
                 root: temporary.path(),
                 profile: &profile,
                 prompt: "direct permission test",
                 role: PromptRole::Implementation,
                 cancelled: &cancelled,
-                deadline: None,
+                deadline: Some(deadline),
                 endpoint: &endpoint,
+                token: "",
             },
             None,
             &mut completed_conversation,
@@ -981,6 +893,53 @@ fn direct_route_admission_denials_are_fatal_before_model_dispatch() {
         assert!(request.starts_with("POST /v1/responses "));
         assert_eq!(model_dispatches.load(Ordering::Relaxed), 0);
     }
+}
+
+#[test]
+fn generated_schema_rejection_reports_safe_cause_without_retry_or_fallback() {
+    let (requests, response) = run_fake_http_responses(vec![(
+        "400 Bad Request",
+        r#"{"error":{"code":"invalid_json_schema","param":"text.format.schema","message":"private provider echo and credential sentinel"}}"#,
+    )]);
+    let error = response.expect_err("schema rejection must stop");
+    assert!(error.to_string().contains("HTTP 400"));
+    assert!(
+        error
+            .to_string()
+            .contains("generated structured-output schema rejected (invalid_json_schema)")
+    );
+    assert!(!error.to_string().contains("private provider echo"));
+    assert!(!error.to_string().contains("credential sentinel"));
+    assert_eq!(requests.len(), 1);
+    assert_oauth_only_requests(&requests);
+    assert_eq!(
+        classify_agent_run(Err(error), Vec::new())
+            .outcome
+            .expect_err("fatal schema rejection")
+            .kind(),
+        BackendFailureKind::Fatal
+    );
+}
+
+#[test]
+fn cancellation_precedes_schema_serialization_and_sends_no_request() {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("fixture client");
+    let result = crate::runtime::block_on(request_with_retries(
+        &client,
+        "not-a-network-endpoint",
+        "fixture-token",
+        &json!({"text":{"format":{"schema":{"properties":12}}}}),
+        None,
+        &AtomicBool::new(true),
+    ))
+    .expect("runtime");
+    assert!(matches!(
+        result,
+        Err(crate::error::SpecLoopError::Interrupted)
+    ));
 }
 
 #[test]
@@ -1089,20 +1048,18 @@ fn start_stalled_provider(stall: StallPoint) -> (String, thread::JoinHandle<(Str
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stalled provider");
     let address = listener.local_addr().expect("stalled provider address");
+    let deadline = Instant::now() + WATCHDOG;
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept stalled request");
-        let first_request = read_http_request(&mut stream);
+        let mut stream = accept_until(&listener, deadline).expect("accept stalled request");
+        let first_request =
+            read_request_until(&mut stream, deadline).expect("read stalled request");
         match stall {
             StallPoint::BeforeHeaders => {}
             StallPoint::DuringStream => {
-                stream
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\nConnection: keep-alive\r\n\r\n: waiting\n\n")
-                        .expect("write initial stream data");
+                write_until(&mut stream, b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 4096\r\nConnection: keep-alive\r\n\r\n: waiting\n\n", deadline).expect("write initial stream data");
             }
             StallPoint::DuringBackoff => {
-                stream
-                        .write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                        .expect("write rate-limit response");
+                write_until(&mut stream, b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 30\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", deadline).expect("write rate-limit response");
             }
         }
         thread::sleep(Duration::from_millis(250));
@@ -1115,12 +1072,13 @@ fn start_stalled_provider(stall: StallPoint) -> (String, thread::JoinHandle<(Str
             match listener.accept() {
                 Ok((mut extra, _)) => {
                     extra_requests += 1;
-                    let _ = read_http_request(&mut extra);
+                    read_request_until(&mut extra, observation_deadline)
+                        .expect("read unexpected request");
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(_) => break,
+                Err(error) => panic!("inspect stalled fixture listener: {error}"),
             }
         }
         (first_request, extra_requests)

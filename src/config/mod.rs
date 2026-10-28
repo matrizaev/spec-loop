@@ -101,6 +101,24 @@ pub struct PromptConfig {
     pub review_clarification: Vec<PathBuf>,
 }
 
+impl PromptConfig {
+    /// Enumerates every configured role file in workflow role order.
+    pub(crate) fn files(&self) -> impl Iterator<Item = &PathBuf> {
+        [
+            &self.plan_author,
+            &self.plan_review,
+            &self.plan_audit,
+            &self.plan_review_clarification,
+            &self.implementation,
+            &self.review,
+            &self.review_audit,
+            &self.review_clarification,
+        ]
+        .into_iter()
+        .flatten()
+    }
+}
+
 /// One argv-only configured check command.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -512,17 +530,7 @@ fn validate_checks(checks: &[CheckConfig]) -> Result<()> {
 }
 
 fn validate_resource_paths(prompts: &PromptConfig) -> Result<()> {
-    for path in prompts
-        .plan_author
-        .iter()
-        .chain(&prompts.plan_review)
-        .chain(&prompts.plan_audit)
-        .chain(&prompts.plan_review_clarification)
-        .chain(&prompts.implementation)
-        .chain(&prompts.review)
-        .chain(&prompts.review_audit)
-        .chain(&prompts.review_clarification)
-    {
+    for path in prompts.files() {
         validate_relative_path(path, "profile resource path")?;
     }
     Ok(())

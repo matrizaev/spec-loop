@@ -29,13 +29,31 @@ use super::{
     RegistrationPersistence, RegistrationTarget, RegistrationUpdate, Registry,
     active_access_token_at, authorization_details, await_callback, callback_listener, cancellable,
     credential_store_unavailable, expiry_timestamp, login_with_services, manual_authorization_url,
-    parse_callback, persist_registration_with, present_authorization_url, project_boundary,
-    refresh_credential, refresh_is_due, refreshed_credential, registration_id,
-    registry_path_for_auth_dir, registry_path_for_config_dir, select_registration,
-    validate_callback, validate_credential, validate_external_registry_path,
-    write_test_credentials,
+    parse_callback, present_authorization_url, project_boundary, refresh_credential,
+    refresh_is_due, refreshed_credential, registration_id, registry_path_for_auth_dir,
+    registry_path_for_config_dir, select_registration, validate_callback, validate_credential,
+    validate_external_registry_path, write_test_credentials,
 };
 use crate::error::{Result, SpecLoopError};
+
+#[test]
+fn shared_token_scope_extraction_preserves_order_and_missing_scope() {
+    for (scope, expected) in [
+        (
+            Some("profile chatgpt.tokens.use.direct openid"),
+            vec!["profile", "chatgpt.tokens.use.direct", "openid"],
+        ),
+        (None, Vec::new()),
+    ] {
+        let mut value = json!({"access_token":"fixture", "token_type":"Bearer"});
+        if let Some(scope) = scope {
+            value["scope"] = json!(scope);
+        }
+        let token: openidconnect::core::CoreTokenResponse =
+            serde_json::from_value(value).expect("parse token response");
+        assert_eq!(super::token_scopes(&token), expected);
+    }
+}
 
 #[test]
 fn missing_direct_use_scope_rejects_saved_credentials_before_refresh() {
@@ -1228,23 +1246,20 @@ fn unavailable_keyring_uses_file_but_available_store_write_failure_propagates() 
     let path = temporary.path().join("auth.json");
     let mut registry = Registry::empty();
     let input = ("https://auth.openai.com", "subject-a", "client-a");
-    persist_registration_with(
-        &mut registry,
-        &path,
-        test_registration_update(
-            input.0,
-            input.1,
-            input.2,
-            test_credential("file-token"),
-            None,
-        ),
-        RegistrationPersistence {
-            save_registry: Registry::save,
-            write_credential: |_: &str, _: &Credential| Err(CredentialWriteError::Unavailable),
-            read_credential: |_: &Registration| Ok(None),
-            restore_credential: |_: &str, _: Option<&Credential>| Ok(()),
-        },
-    )
+    let update = test_registration_update(
+        input.0,
+        input.1,
+        input.2,
+        test_credential("file-token"),
+        None,
+    );
+    RegistrationPersistence {
+        save_registry: Registry::save,
+        write_credential: |_: &str, _: &Credential| Err(CredentialWriteError::Unavailable),
+        read_credential: |_: &Registration| Ok(None),
+        restore_credential: |_: &str, _: Option<&Credential>| Ok(()),
+    }
+    .persist(&mut registry, &path, update)
     .expect("unavailable OS store should use file fallback");
     let registration = registry
         .registrations
@@ -1264,27 +1279,24 @@ fn unavailable_keyring_uses_file_but_available_store_write_failure_propagates() 
 
     let failure_path = temporary.path().join("failed/auth.json");
     let mut failed_registry = Registry::empty();
-    let error = persist_registration_with(
-        &mut failed_registry,
-        &failure_path,
-        test_registration_update(
-            input.0,
-            input.1,
-            input.2,
-            test_credential("must-not-fallback"),
-            None,
-        ),
-        RegistrationPersistence {
-            save_registry: Registry::save,
-            write_credential: |_: &str, _: &Credential| {
-                Err(CredentialWriteError::Failed(SpecLoopError::Workflow(
-                    "keyring write failed".to_owned(),
-                )))
-            },
-            read_credential: |_: &Registration| Ok(None),
-            restore_credential: |_: &str, _: Option<&Credential>| Ok(()),
+    let update = test_registration_update(
+        input.0,
+        input.1,
+        input.2,
+        test_credential("must-not-fallback"),
+        None,
+    );
+    let error = RegistrationPersistence {
+        save_registry: Registry::save,
+        write_credential: |_: &str, _: &Credential| {
+            Err(CredentialWriteError::Failed(SpecLoopError::Workflow(
+                "keyring write failed".to_owned(),
+            )))
         },
-    )
+        read_credential: |_: &Registration| Ok(None),
+        restore_credential: |_: &str, _: Option<&Credential>| Ok(()),
+    }
+    .persist(&mut failed_registry, &failure_path, update)
     .expect_err("available-store write failure must propagate");
     assert!(error.to_string().contains("keyring write failed"));
     let persisted = Registry::load(&failure_path).expect("read rolled-back registry");
@@ -1299,55 +1311,52 @@ fn registry_activation_failure_removes_new_keyring_credential_and_metadata() {
     let mut registry = Registry::empty();
     let keyring = Arc::new(Mutex::new(HashMap::<String, Credential>::new()));
     let saves = Cell::new(0_usize);
-    let save_result = persist_registration_with(
-        &mut registry,
-        &path,
-        test_registration_update(
-            "https://auth.openai.com",
-            "subject-new",
-            "client-new",
-            test_credential("new-token"),
-            None,
-        ),
-        RegistrationPersistence {
-            save_registry: |candidate: &Registry, path: &Path| {
-                let save_number = saves.get().checked_add(1).expect("save counter");
-                saves.set(save_number);
-                if save_number == 2 {
-                    Err(SpecLoopError::Workflow(
-                        "injected active-registry write failure".to_owned(),
-                    ))
-                } else {
-                    candidate.save(path)
-                }
-            },
-            write_credential: {
-                let keyring = Arc::clone(&keyring);
-                move |id: &str, credential: &Credential| {
-                    keyring
-                        .lock()
-                        .expect("lock fake keyring")
-                        .insert(id.to_owned(), credential.clone());
-                    Ok(())
-                }
-            },
-            read_credential: |_: &Registration| Ok(None),
-            restore_credential: {
-                let keyring = Arc::clone(&keyring);
-                move |id: &str, previous: Option<&Credential>| {
-                    {
-                        let mut entries = keyring.lock().expect("lock fake keyring");
-                        if let Some(credential) = previous {
-                            entries.insert(id.to_owned(), credential.clone());
-                        } else {
-                            entries.remove(id);
-                        }
-                    }
-                    Ok(())
-                }
-            },
-        },
+    let update = test_registration_update(
+        "https://auth.openai.com",
+        "subject-new",
+        "client-new",
+        test_credential("new-token"),
+        None,
     );
+    let save_result = RegistrationPersistence {
+        save_registry: |candidate: &Registry, path: &Path| {
+            let save_number = saves.get().checked_add(1).expect("save counter");
+            saves.set(save_number);
+            if save_number == 2 {
+                Err(SpecLoopError::Workflow(
+                    "injected active-registry write failure".to_owned(),
+                ))
+            } else {
+                candidate.save(path)
+            }
+        },
+        write_credential: {
+            let keyring = Arc::clone(&keyring);
+            move |id: &str, credential: &Credential| {
+                keyring
+                    .lock()
+                    .expect("lock fake keyring")
+                    .insert(id.to_owned(), credential.clone());
+                Ok(())
+            }
+        },
+        read_credential: |_: &Registration| Ok(None),
+        restore_credential: {
+            let keyring = Arc::clone(&keyring);
+            move |id: &str, previous: Option<&Credential>| {
+                {
+                    let mut entries = keyring.lock().expect("lock fake keyring");
+                    if let Some(credential) = previous {
+                        entries.insert(id.to_owned(), credential.clone());
+                    } else {
+                        entries.remove(id);
+                    }
+                }
+                Ok(())
+            }
+        },
+    }
+    .persist(&mut registry, &path, update);
     assert!(save_result.is_err());
     assert!(
         Registry::load(&path)
@@ -1382,64 +1391,61 @@ fn registry_activation_failure_restores_existing_keyring_credential() {
         test_credential("old-token"),
     )])));
     let saves = Cell::new(0_usize);
-    let save_result = persist_registration_with(
-        &mut registry,
-        &path,
-        test_registration_update(
-            "https://auth.openai.com",
-            "subject-old",
-            "client-old",
-            test_credential("new-token"),
-            Some(&id),
-        ),
-        RegistrationPersistence {
-            save_registry: |candidate: &Registry, path: &Path| {
-                let save_number = saves.get().checked_add(1).expect("save counter");
-                saves.set(save_number);
-                if save_number == 2 {
-                    Err(SpecLoopError::Workflow(
-                        "injected active-registry write failure".to_owned(),
-                    ))
-                } else {
-                    candidate.save(path)
-                }
-            },
-            write_credential: {
-                let keyring = Arc::clone(&keyring);
-                move |id: &str, credential: &Credential| {
-                    keyring
-                        .lock()
-                        .expect("lock fake keyring")
-                        .insert(id.to_owned(), credential.clone());
-                    Ok(())
-                }
-            },
-            read_credential: {
-                let keyring = Arc::clone(&keyring);
-                move |registration: &Registration| {
-                    Ok(keyring
-                        .lock()
-                        .expect("lock fake keyring")
-                        .get(&registration.id)
-                        .cloned())
-                }
-            },
-            restore_credential: {
-                let keyring = Arc::clone(&keyring);
-                move |id: &str, previous: Option<&Credential>| {
-                    {
-                        let mut entries = keyring.lock().expect("lock fake keyring");
-                        if let Some(credential) = previous {
-                            entries.insert(id.to_owned(), credential.clone());
-                        } else {
-                            entries.remove(id);
-                        }
-                    }
-                    Ok(())
-                }
-            },
-        },
+    let update = test_registration_update(
+        "https://auth.openai.com",
+        "subject-old",
+        "client-old",
+        test_credential("new-token"),
+        Some(&id),
     );
+    let save_result = RegistrationPersistence {
+        save_registry: |candidate: &Registry, path: &Path| {
+            let save_number = saves.get().checked_add(1).expect("save counter");
+            saves.set(save_number);
+            if save_number == 2 {
+                Err(SpecLoopError::Workflow(
+                    "injected active-registry write failure".to_owned(),
+                ))
+            } else {
+                candidate.save(path)
+            }
+        },
+        write_credential: {
+            let keyring = Arc::clone(&keyring);
+            move |id: &str, credential: &Credential| {
+                keyring
+                    .lock()
+                    .expect("lock fake keyring")
+                    .insert(id.to_owned(), credential.clone());
+                Ok(())
+            }
+        },
+        read_credential: {
+            let keyring = Arc::clone(&keyring);
+            move |registration: &Registration| {
+                Ok(keyring
+                    .lock()
+                    .expect("lock fake keyring")
+                    .get(&registration.id)
+                    .cloned())
+            }
+        },
+        restore_credential: {
+            let keyring = Arc::clone(&keyring);
+            move |id: &str, previous: Option<&Credential>| {
+                {
+                    let mut entries = keyring.lock().expect("lock fake keyring");
+                    if let Some(credential) = previous {
+                        entries.insert(id.to_owned(), credential.clone());
+                    } else {
+                        entries.remove(id);
+                    }
+                }
+                Ok(())
+            }
+        },
+    }
+    .persist(&mut registry, &path, update);
     assert!(save_result.is_err());
     assert_eq!(
         keyring

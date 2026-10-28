@@ -4,10 +4,10 @@ use clap::ValueEnum;
 
 use crate::error::{Result, io_error};
 use crate::protocol::{
-    self, Actionability, AuditResult, EvidenceResult, ImplementationAuditResponse,
-    ImplementationClarificationResponse, ImplementationResponse, ImplementationReviewResponse,
-    PlanAuditResponse, PlanAuthorResponse, PlanClarificationResponse, PlanReviewResponse,
-    Readiness, ReviewResult,
+    self, Actionability, AuditResult, BlockerAdjudication, EvidenceResult,
+    ImplementationAuditResponse, ImplementationClarificationResponse, ImplementationResponse,
+    ImplementationReviewResponse, PlanAuditResponse, PlanAuthorResponse, PlanClarificationResponse,
+    PlanReviewResponse, Readiness, ReviewResult,
 };
 
 #[cfg(test)]
@@ -73,18 +73,6 @@ impl Output {
             },
             stderr_color: enabled(stderr_terminal),
             verbose,
-        }
-    }
-
-    /// Creates a formatter that emits plain text without ANSI styling.
-    pub const fn plain() -> Self {
-        Self {
-            stdout: StdoutPolicy {
-                color: false,
-                rewrite_progress: false,
-            },
-            stderr_color: false,
-            verbose: false,
         }
     }
 
@@ -186,8 +174,10 @@ fn render_usage_report(
                 lines: text.split('\n').count(),
             },
         ),
-        UsageProgressState::Initial | UsageProgressState::AppendOnly => {
-            (format!("{text}\n"), UsageProgressState::AppendOnly)
+        UsageProgressState::Initial => (format!("{text}\n"), UsageProgressState::AppendOnly),
+        UsageProgressState::AppendOnly => {
+            let body = text.split_once('\n').map_or(text, |(_, body)| body);
+            (format!("{body}\n"), UsageProgressState::AppendOnly)
         }
         UsageProgressState::Replace { lines } => {
             let new_lines = text.split('\n').count();
@@ -419,6 +409,9 @@ macro_rules! impl_audit_result {
                         "  [BLOCKED] Reason: {}",
                         field_text(reason, verbose)
                     )),
+                    AuditResult::Adjudicated { adjudication } => {
+                        lines.extend(render_blocker_adjudication(adjudication, verbose));
+                    }
                     AuditResult::Complete { classifications } => {
                         lines.push("  [PASS] Audit complete".to_owned());
                         if classifications.is_empty() {
@@ -445,6 +438,50 @@ macro_rules! impl_audit_result {
 
 impl_audit_result!(PlanAuditResponse, "Plan audit");
 impl_audit_result!(ImplementationAuditResponse, "Audit");
+
+fn render_blocker_adjudication(adjudication: &BlockerAdjudication, verbose: bool) -> Vec<String> {
+    let marker = match adjudication {
+        BlockerAdjudication::Unsupported { .. } => "RETRY",
+        BlockerAdjudication::Confirmed { .. } | BlockerAdjudication::Ambiguous { .. } => "BLOCKED",
+    };
+    let (rationale, evidence) = adjudication.explanation();
+    let mut lines = vec![
+        format!("  [{marker}] Agent blocker: {}", adjudication.name()),
+        format!("  Rationale: {}", field_text(rationale, verbose)),
+    ];
+    match adjudication {
+        BlockerAdjudication::Confirmed {
+            requirement,
+            prerequisite,
+            unavailable_reason,
+            required_input,
+            ..
+        } => {
+            for (name, value) in [
+                ("Requirement", requirement),
+                ("Unavailable prerequisite", prerequisite),
+                ("Why tools cannot resolve it", unavailable_reason),
+                ("Required input", required_input),
+            ] {
+                lines.push(format!("  {name}: {}", field_text(value, verbose)));
+            }
+        }
+        BlockerAdjudication::Ambiguous { question, .. } => {
+            lines.push(format!(
+                "  Unresolved question: {}",
+                field_text(question, verbose)
+            ));
+        }
+        BlockerAdjudication::Unsupported { .. } => {
+            lines.push(
+                "  Originating role must return a corrected response; this is not approval."
+                    .to_owned(),
+            );
+        }
+    }
+    push_field(&mut lines, "Evidence", evidence, verbose);
+    lines
+}
 
 macro_rules! impl_evidence_result {
     ($ty:ty, $heading:literal) => {
@@ -522,6 +559,7 @@ const fn review_name(value: &ReviewResult) -> &'static str {
 const fn audit_name(value: &AuditResult) -> &'static str {
     match value {
         AuditResult::Complete { .. } => "complete",
+        AuditResult::Adjudicated { .. } => "blocker adjudication",
         AuditResult::Blocked { .. } => "blocked",
     }
 }

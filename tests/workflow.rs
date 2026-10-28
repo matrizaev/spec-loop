@@ -252,6 +252,10 @@ fn write_fake_responses(directory: &Path) {
             "{\"protocol_version\":1,\"role\":\"review\",\"status\":\"issues\",\"findings\":[{\"id\":1,\"requirement\":\"spec requirement\",\"location\":\"generated.txt\",\"evidence\":\"observed output\",\"violation\":\"missing detail\",\"proposed_correction\":\"add detail\"}]}",
         ),
         (
+            "blocker-confirmed",
+            r#"{"protocol_version":1,"role":"review_audit","status":"adjudicated","adjudication":{"outcome":"confirmed","rationale":"Fixture external approval unavailable.","evidence":"Original role reason and fixture requirement.","requirement":"External approval required","prerequisite":"User approval","unavailable_reason":"Tools cannot grant approval","required_input":"Provide approval"}}"#,
+        ),
+        (
             "audit-supported",
             "{\"protocol_version\":1,\"role\":\"review_audit\",\"status\":\"complete\",\"classifications\":[{\"finding_id\":1,\"classification\":\"supported\",\"actionability\":\"required\",\"rationale\":\"verified requirement; smallest correct fix is substantial but required\"}]}",
         ),
@@ -301,7 +305,7 @@ fn write_fake_pi(
     temporary: &Path,
 ) {
     let script = format!(
-        "#!/bin/sh\nset -eu\nPROMPT=''\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in -p) PROMPT=\"$2\"; shift 2 ;; *) shift ;; esac; done\nprintf '%s\\n---\\n' \"$PROMPT\" >> {prompts}\ncase \"$PROMPT\" in\n  *'Create or revise selected plan only'*) printf 'plan-author\\n' >> {agent_events}; printf '# Authored plan\\n' > .spec-loop/plans/001.md; cat {plan_ready} ;;\n  *'Independently review plan against selected spec'*) printf 'plan-review\\n' >> {agent_events}; cat {plan_clear} ;;\n  *'Implement only selected spec'*) printf 'implementation:%s\\n' \"$PWD\" >> {agent_events}; printf 'implemented\\n' >> generated.txt; if [ \"${{MODE-}}\" = blocked ]; then cat {blocked}; else cat {ready}; fi ;;\n  *'Audit only supplied implementation-review findings'*) printf 'review-audit:%s\\n' \"$PWD\" >> {agent_events}; count=0; [ ! -f {audit_count} ] || count=$(cat {audit_count}); count=$((count + 1)); printf '%s' \"$count\" > {audit_count}; if [ \"${{MODE-}}\" = audit-blocked ]; then cat {audit_blocked}; elif {{ [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = clarification-blocked ]; }} && [ \"$count\" -eq 1 ]; then cat {audit_unsupported}; elif [ \"${{MODE-}}\" = nonactionable ]; then cat {audit_supported_not_required}; else cat {audit_supported}; fi ;;\n  *'Provide citations only for requested implementation-review finding IDs'*) printf 'review-clarification:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = clarification-blocked ]; then cat {clarification_blocked}; else cat {clarification}; fi ;;\n  *'Independently review current workspace'*) printf 'review:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = review-context-blocked ]; then cat {review_blocked}; elif [ \"${{MODE-}}\" = finding-repair ] || [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = clarification-blocked ] || [ \"${{MODE-}}\" = nonactionable ] || [ \"${{MODE-}}\" = iterative-repair ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"$count\" -eq 1 ] || {{ [ \"${{MODE-}}\" = iterative-repair ] && [ \"$count\" -eq 2 ]; }}; then cat {review_issues}; else cat {review_clear}; fi; elif [ \"${{MODE-}}\" = malformed-review-once ] || [ \"${{MODE-}}\" = malformed-review-always ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"${{MODE-}}\" = malformed-review-always ] || [ \"$count\" -eq 1 ]; then cat {malformed}; else cat {review_clear}; fi; else cat {review_clear}; fi ;;\n  *) printf 'unexpected-role\\n' >> {agent_events}; exit 23 ;;\nesac\n",
+        "#!/bin/sh\nset -eu\nPROMPT=''\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in -p) PROMPT=\"$2\"; shift 2 ;; *) shift ;; esac; done\nprintf '%s\\n---\\n' \"$PROMPT\" >> {prompts}\ncase \"$PROMPT\" in\n  *'Create or revise selected plan only'*) printf 'plan-author\\n' >> {agent_events}; printf '# Authored plan\\n' > .spec-loop/plans/001.md; cat {plan_ready} ;;\n  *'Independently review plan against selected spec'*) printf 'plan-review\\n' >> {agent_events}; cat {plan_clear} ;;\n  *'Implement only selected spec'*) printf 'implementation:%s\\n' \"$PWD\" >> {agent_events}; printf 'implemented\\n' >> generated.txt; if [ \"${{MODE-}}\" = blocked ]; then cat {blocked}; else cat {ready}; fi ;;\n  *'Audit only supplied implementation-review findings'*) printf 'review-audit:%s\\n' \"$PWD\" >> {agent_events}; count=0; [ ! -f {audit_count} ] || count=$(cat {audit_count}); count=$((count + 1)); printf '%s' \"$count\" > {audit_count}; if [ \"${{MODE-}}\" = blocked ] || {{ [ \"${{MODE-}}\" = clarification-blocked ] && [ \"$count\" -gt 1 ]; }}; then cat {blocker_confirmed}; elif [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = review-context-blocked ]; then cat {audit_blocked}; elif {{ [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = clarification-blocked ]; }} && [ \"$count\" -eq 1 ]; then cat {audit_unsupported}; elif [ \"${{MODE-}}\" = nonactionable ]; then cat {audit_supported_not_required}; else cat {audit_supported}; fi ;;\n  *'Provide citations only for requested implementation-review finding IDs'*) printf 'review-clarification:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = clarification-blocked ]; then cat {clarification_blocked}; else cat {clarification}; fi ;;\n  *'Independently review current workspace'*) printf 'review:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = review-context-blocked ]; then cat {review_blocked}; elif [ \"${{MODE-}}\" = finding-repair ] || [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = clarification-blocked ] || [ \"${{MODE-}}\" = nonactionable ] || [ \"${{MODE-}}\" = iterative-repair ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"$count\" -eq 1 ] || {{ [ \"${{MODE-}}\" = iterative-repair ] && [ \"$count\" -eq 2 ]; }}; then cat {review_issues}; else cat {review_clear}; fi; elif [ \"${{MODE-}}\" = malformed-review-once ] || [ \"${{MODE-}}\" = malformed-review-always ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"${{MODE-}}\" = malformed-review-always ] || [ \"$count\" -eq 1 ]; then cat {malformed}; else cat {review_clear}; fi; else cat {review_clear}; fi ;;\n  *) printf 'unexpected-role\\n' >> {agent_events}; exit 23 ;;\nesac\n",
         prompts = shell_quote(prompts),
         agent_events = shell_quote(agent_events),
         plan_ready = shell_quote(&responses.join("plan-ready")),
@@ -309,6 +313,7 @@ fn write_fake_pi(
         ready = shell_quote(&responses.join("ready")),
         blocked = shell_quote(&responses.join("blocked")),
         malformed = shell_quote(&responses.join("malformed")),
+        blocker_confirmed = shell_quote(&responses.join("blocker-confirmed")),
         audit_blocked = shell_quote(&responses.join("audit-blocked")),
         clarification_blocked = shell_quote(&responses.join("clarification-blocked")),
         review_clear = shell_quote(&responses.join("review-clear")),
@@ -322,6 +327,185 @@ fn write_fake_pi(
         review_blocked = shell_quote(&responses.join("review-blocked")),
     );
     write_executable(executable, &script);
+}
+
+fn non_auditor_script(origin: &'static str) -> Vec<(&'static str, serde_json::Value)> {
+    let planning = origin.starts_with("plan_");
+    let worker = if planning {
+        "plan_author"
+    } else {
+        "implementation"
+    };
+    let reviewer = if planning { "plan_review" } else { "review" };
+    let auditor = if planning {
+        "plan_audit"
+    } else {
+        "review_audit"
+    };
+    let ready = if planning {
+        json!({"status":"ready_for_review"})
+    } else {
+        json!({"status":"ready_for_review","summary":"Fixture implementation preserved."})
+    };
+    let approval = json!({"status":"no_issues","findings":[]});
+    let mut prefix = Vec::new();
+    let corrected = if origin == worker {
+        ready.clone()
+    } else if origin == reviewer {
+        approval.clone()
+    } else {
+        json!({"status":"complete","evidence":[]})
+    };
+    if origin != worker {
+        prefix.push((worker, ready));
+    }
+    if origin.ends_with("_clarification") {
+        prefix.push((reviewer,json!({"status":"issues","findings":[{"id":1,"requirement":"fixture requirement","location":"fixture","evidence":"fixture evidence","violation":"fixture gap","proposed_correction":"fixture correction"}]})));
+        prefix.push((auditor,json!({"status":"complete","classifications":[{"finding_id":1,"classification":"unsupported","actionability":"not_required","rationale":"Evidence disproves claim."}]})));
+    }
+    let mut blocked =
+        json!({"status":"blocked","reason":"No actionable gaps and no genuine external blocker."});
+    if origin == "implementation" {
+        blocked["summary"] = json!("Initial tool work preserved.");
+    }
+    prefix.extend([(origin,blocked), (auditor,json!({"status":"adjudicated","adjudication":{"outcome":"unsupported","rationale":"No missing prerequisite established.","evidence":"Original reason expressly denies genuine external blocker."}})), (origin,corrected)]);
+    if origin == worker {
+        prefix.push((reviewer, approval));
+    }
+    prefix
+}
+
+fn configure_origin_script(fixture: &Fixture, origin: &'static str) {
+    let steps = non_auditor_script(origin);
+    let mut script = format!(
+        r#"#!/bin/sh
+set -eu
+prompt=''
+while [ "$#" -gt 0 ]; do case "$1" in -p) prompt="$2"; shift 2 ;; *) shift ;; esac; done
+printf '%s\n---\n' "$prompt" >> {prompts}
+count=0
+[ ! -f {counter} ] || count=$(cat {counter})
+count=$((count + 1))
+printf '%s' "$count" > {counter}
+case "$count" in
+"#,
+        prompts = shell_quote(&fixture.prompts),
+        counter = shell_quote(&fixture.temporary.path().join("origin-step"))
+    );
+    let mut origin_calls = 0;
+    for (index, (role, mut value)) in steps.into_iter().enumerate() {
+        let instruction = match role {
+            "plan_author" => "Create or revise selected plan only",
+            "plan_review" => "Independently review plan against selected spec",
+            "plan_audit" => "Audit only the supplied findings or non-auditor blocker",
+            "plan_review_clarification" => {
+                "Provide citations only for requested plan-review finding IDs"
+            }
+            "implementation" => "Implement only selected spec",
+            "review" => "Independently review current workspace",
+            "review_audit" => "Audit only supplied implementation-review findings",
+            "review_clarification" => {
+                "Provide citations only for requested implementation-review finding IDs"
+            }
+            _ => panic!("fixture role"),
+        };
+        value["protocol_version"] = json!(1);
+        value["role"] = json!(role);
+        let path = fixture
+            .temporary
+            .path()
+            .join(format!("origin-response-{index}"));
+        fs::write(&path, response(&value.to_string())).expect("typed response fixture");
+        writeln!(
+            script,
+            "  {}) case \"$prompt\" in *'{instruction}'*) ;; *) exit 26 ;; esac",
+            index.checked_add(1).expect("step count")
+        )
+        .expect("script");
+        writeln!(
+            script,
+            "printf '%s\\n' '{role}' >> {}",
+            shell_quote(&fixture.agent_events)
+        )
+        .expect("script");
+        if role == origin {
+            origin_calls += 1;
+            if origin_calls == 1 {
+                script.push_str("printf x >> completed-effect\n");
+            } else {
+                script.push_str("[ \"$(cat completed-effect)\" = x ]\n[ ! -e archive/001.md ]\ncase \"$prompt\" in *'--- Blocker adjudication feedback ---'*) ;; *) exit 27 ;; esac\nprintf y >> unfinished-effect\n");
+                if origin.ends_with("_clarification") {
+                    script.push_str("case \"$prompt\" in *'\"requested_finding_ids\":[1]'*) ;; *) exit 28 ;; esac\n");
+                }
+            }
+        }
+        writeln!(script, "cat {} ;;", shell_quote(&path)).expect("script");
+    }
+    script.push_str("  *) exit 29 ;;\nesac\n");
+    write_executable(&fixture.temporary.path().join("tools/fake-pi"), &script);
+}
+
+#[test]
+fn pi_every_non_auditor_resumes_with_tools_and_native_context_only_after_adjudication() {
+    for origin in [
+        "plan_author",
+        "plan_review",
+        "plan_review_clarification",
+        "implementation",
+        "review",
+        "review_clarification",
+    ] {
+        let fixture = Fixture::new(true, false);
+        configure_origin_script(&fixture, origin);
+        let args = if origin.starts_with("plan_") {
+            vec!["--plan", "--spec", "001"]
+        } else {
+            vec!["--spec", "001"]
+        };
+        let output = fixture.run(&args);
+        assert_success(&output);
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("completed-effect")).expect("prior tool work"),
+            "x"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("unfinished-effect"))
+                .expect("tools-enabled resume"),
+            "y"
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.agent_events)
+                .expect("roles")
+                .lines()
+                .filter(|role| *role == origin)
+                .count(),
+            2
+        );
+        let prompts = fs::read_to_string(&fixture.prompts).expect("prompts");
+        assert!(prompts.contains("\"audit_kind\":\"agent_blocker\""));
+        assert!(prompts.contains("No actionable gaps and no genuine external blocker."));
+        if origin.starts_with("plan_") {
+            assert!(!fixture.events.exists());
+            assert!(fixture.root.join("specs/001.md").is_file());
+        } else {
+            let events = fs::read_to_string(&fixture.events).expect("check and action effects");
+            assert_eq!(
+                events
+                    .lines()
+                    .filter(|line| line.starts_with("check-one|"))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .lines()
+                    .filter(|line| line.starts_with("review-success|"))
+                    .count(),
+                1
+            );
+            assert!(fixture.root.join("archive/001.md").is_file());
+        }
+    }
 }
 
 fn write_fake_commands(tools: &Path, events: &Path) {
@@ -427,6 +611,127 @@ fi
         events = shell_quote(&fixture.events)
     );
     write_executable(&fixture.temporary.path().join("tools/finish"), &script);
+}
+
+#[derive(Clone, Copy)]
+enum BlockerReviewScope {
+    Plan,
+    Implementation,
+}
+
+fn configure_blocker_retry_agent(fixture: &Fixture, scope: BlockerReviewScope) {
+    let (initial_role, reviewer_role, auditor_role) = match scope {
+        BlockerReviewScope::Plan => ("plan_author", "plan_review", "plan_audit"),
+        BlockerReviewScope::Implementation => ("implementation", "review", "review_audit"),
+    };
+    let responses = fixture.temporary.path().join("responses");
+    let mut initial = json!({"protocol_version":1,"role":initial_role,"status":"ready_for_review"});
+    if matches!(scope, BlockerReviewScope::Implementation) {
+        initial["summary"] = json!("Completed fixture implementation once.");
+    }
+    for (name, value) in [
+        ("blocker-initial", initial),
+        (
+            "blocker-review",
+            json!({"protocol_version":1,"role":reviewer_role,"status":"blocked","reason":"No actionable gaps and no genuine external blocker."}),
+        ),
+        (
+            "blocker-adjudication",
+            json!({"protocol_version":1,"role":auditor_role,"status":"adjudicated","adjudication":{"outcome":"unsupported","rationale":"Supplied review explicitly identifies no blocker.","evidence":"Original review.reason"}}),
+        ),
+        (
+            "blocker-corrected",
+            json!({"protocol_version":1,"role":reviewer_role,"status":"no_issues","findings":[]}),
+        ),
+    ] {
+        fs::write(responses.join(name), response(&value.to_string())).expect("role response");
+    }
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+prompt=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in -p) prompt="$2"; shift 2 ;; *) shift ;; esac
+done
+printf '%s\n---\n' "$prompt" >> {prompts}
+case "$prompt" in
+  *'Create or revise selected plan only'*) printf 'plan-author\n' >> {agents}; cat {initial} ;;
+  *'Implement only selected spec'*) printf 'implementation\n' >> {agents}; printf 'implemented\n' >> generated.txt; cat {initial} ;;
+  *'Audit only the supplied findings'*|*'Audit only supplied implementation-review findings'*)
+    printf 'blocker-audit\n' >> {agents}; cat {audit} ;;
+  *'Independently review plan against selected spec'*|*'Independently review current workspace'*)
+    printf 'review\n' >> {agents}
+    if [ ! -f {reviewed} ]; then
+      printf x > {reviewed}; cat {blocked}
+    else
+      test -f specs/001.md
+      test ! -f archive/001.md
+      cat {corrected}
+    fi ;;
+  *) exit 23 ;;
+esac
+"#,
+        prompts = shell_quote(&fixture.prompts),
+        agents = shell_quote(&fixture.agent_events),
+        initial = shell_quote(&responses.join("blocker-initial")),
+        audit = shell_quote(&responses.join("blocker-adjudication")),
+        blocked = shell_quote(&responses.join("blocker-review")),
+        corrected = shell_quote(&responses.join("blocker-corrected")),
+        reviewed = shell_quote(&fixture.temporary.path().join("reviewed-once")),
+    );
+    write_executable(&fixture.temporary.path().join("tools/fake-pi"), &script);
+}
+
+#[test]
+fn pi_reviewer_blocker_audit_corrects_status_before_approval_and_completion() {
+    for scope in [BlockerReviewScope::Plan, BlockerReviewScope::Implementation] {
+        let fixture = Fixture::new(true, false);
+        configure_blocker_retry_agent(&fixture, scope);
+        let arguments: &[&str] = match scope {
+            BlockerReviewScope::Plan => &["--plan", "--spec", "001"],
+            BlockerReviewScope::Implementation => &["--spec", "001"],
+        };
+        let output = fixture.run(arguments);
+        assert_success(&output);
+        let agents = fs::read_to_string(&fixture.agent_events).expect("role events");
+        assert_eq!(
+            agents.lines().collect::<Vec<_>>(),
+            [
+                match scope {
+                    BlockerReviewScope::Plan => "plan-author",
+                    BlockerReviewScope::Implementation => "implementation",
+                },
+                "review",
+                "blocker-audit",
+                "review",
+            ]
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Agent blocker: unsupported"));
+        assert!(stdout.contains("this is not approval"));
+        let prompts = fs::read_to_string(&fixture.prompts).expect("prompts");
+        assert!(prompts.contains("\"audit_kind\":\"agent_blocker\""));
+        assert!(prompts.contains("\"blocker_audit\""));
+        match scope {
+            BlockerReviewScope::Plan => {
+                assert!(!fixture.events.exists());
+                assert!(fixture.root.join("specs/001.md").exists());
+                assert!(!fixture.root.join("archive/001.md").exists());
+            }
+            BlockerReviewScope::Implementation => {
+                let events = fs::read_to_string(&fixture.events).expect("gate events");
+                for event in ["check-one|", "check-two|", "review-success|", "finish|"] {
+                    assert_eq!(events.matches(event).count(), 1, "gate repeated: {events}");
+                }
+                assert_eq!(
+                    fs::read_to_string(fixture.root.join("generated.txt"))
+                        .expect("implementation effects"),
+                    "implemented\n"
+                );
+                assert!(fixture.root.join("archive/001.md").exists());
+            }
+        }
+    }
 }
 
 #[test]
@@ -1018,7 +1323,7 @@ fn typed_retry_feedback_preserves_handoff_context() {
 }
 
 #[test]
-fn malformed_typed_review_retries_same_role_and_valid_blocked_stops_without_retry() {
+fn malformed_typed_review_retries_same_role_and_valid_blocker_is_adjudicated() {
     let fixture = Fixture::new(false, false);
     let output = fixture.run_with_env(&["--spec", "001"], &[("MODE", "malformed-review-once")]);
     assert_success(&output);
@@ -1028,9 +1333,11 @@ fn malformed_typed_review_retries_same_role_and_valid_blocked_stops_without_retr
     let output = blocked.run_with_env(&["--spec", "001"], &[("MODE", "blocked")]);
     assert!(!output.status.success());
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("implementation blocked: cannot proceed")
+        String::from_utf8_lossy(&output.stderr)
+            .contains("implementation blocked: auditor confirmed blocker")
     );
     assert_eq!(count_lines(&blocked.agent_events, "implementation:"), 1);
+    assert_eq!(count_lines(&blocked.agent_events, "review-audit:"), 1);
     assert!(!blocked.events.exists());
 }
 
@@ -1151,11 +1458,13 @@ fn review_context_failure_reported_as_typed_blocked_stops_completion() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("implementation reviewer blocked: review context command failed")
+            .contains("implementation finding auditor blocked: review context command failed")
     );
     let events = fs::read_to_string(&fixture.events).expect("check events");
     assert!(!events.contains("review-success|"));
     assert!(!events.contains("finish|"));
+    assert_eq!(count_lines(&fixture.agent_events, "review:"), 1);
+    assert_eq!(count_lines(&fixture.agent_events, "review-audit:"), 1);
     assert!(fixture.root.join("generated.txt").exists());
 }
 

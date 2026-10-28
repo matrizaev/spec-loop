@@ -59,12 +59,12 @@ impl UsageSnapshot {
             .clone()
             .or_else(|| self.latest_response.clone());
         Self {
-            provider_request_attempts: add_counters(
+            provider_request_attempts: add_options(
                 self.provider_request_attempts,
                 delta.provider_request_attempts,
             ),
-            completed_responses: add_counters(self.completed_responses, delta.completed_responses),
-            executed_shell_calls: add_counters(
+            completed_responses: add_options(self.completed_responses, delta.completed_responses),
+            executed_shell_calls: add_options(
                 self.executed_shell_calls,
                 delta.executed_shell_calls,
             ),
@@ -84,22 +84,22 @@ impl UsageSnapshot {
         let latest = self.latest_response.as_ref();
         let cumulative = &self.cumulative;
         format!(
-            "📊 Built-in · {role} · {model} · {elapsed_seconds}s\n↻ {} req · ✓ {} completed · ⚙ {} shell calls\n🧠 Last response: {} in · {} out · {} total · cache {} · reasoning {} · context {} of user limit {}\n∑ Observed completed-response usage: {} in · {} out · {} total · cache {} · reasoning {}",
+            "📊 Built-in · {role} · {model}\n↻ {} req · ✓ {} completed · ⚙ {} shell calls · {elapsed_seconds}s\n🧠 Last response: {} in · {} out · {} total\n  Context {} / user limit {}\n  Cache {} · reasoning {}\n∑ Observed completed-response usage\n  {} in · {} out · {} total\n  Cache {} · reasoning {}",
             display(self.provider_request_attempts),
             display(self.completed_responses),
             display(self.executed_shell_calls),
-            display_option(latest.and_then(|usage| usage.input)),
-            display_option(latest.and_then(|usage| usage.output)),
-            display_option(latest.and_then(|usage| usage.total)),
-            display_option(latest.and_then(|usage| usage.cached_input)),
-            display_option(latest.and_then(|usage| usage.reasoning_output)),
+            display(latest.and_then(|usage| usage.input)),
+            display(latest.and_then(|usage| usage.output)),
+            display(latest.and_then(|usage| usage.total)),
             context_percentage(latest, context_window_tokens),
-            display_option(context_window_tokens),
-            display_option(cumulative.input_tokens),
-            display_option(cumulative.output_tokens),
-            display_option(cumulative.total_tokens),
-            display_option(cumulative.cached_input_tokens),
-            display_option(cumulative.reasoning_output_tokens),
+            display(context_window_tokens),
+            display(latest.and_then(|usage| usage.cached_input)),
+            display(latest.and_then(|usage| usage.reasoning_output)),
+            display(cumulative.input_tokens),
+            display(cumulative.output_tokens),
+            display(cumulative.total_tokens),
+            display(cumulative.cached_input_tokens),
+            display(cumulative.reasoning_output_tokens),
         )
     }
 }
@@ -231,13 +231,6 @@ fn increment(value: &mut Option<u64>) {
     *value = value.and_then(|count| count.checked_add(1));
 }
 
-const fn add_counters(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => left.checked_add(right),
-        _ => None,
-    }
-}
-
 const fn add_options(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     match (left, right) {
         (Some(left), Some(right)) => left.checked_add(right),
@@ -258,10 +251,6 @@ fn grouped_count(count: u64) -> String {
         grouped.push(digit);
     }
     grouped.chars().rev().collect()
-}
-
-fn display_option(value: Option<u64>) -> String {
-    display(value)
 }
 
 fn context_percentage(usage: Option<&ResponseUsage>, limit: Option<u64>) -> String {

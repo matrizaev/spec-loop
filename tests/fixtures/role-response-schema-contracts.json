@@ -1,0 +1,1984 @@
+{
+  "implementation": {
+    "canonical": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Typed implementation handoff, including a concise account of completed work.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "description": "Protocol version in response envelope.",
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "description": "Exact role identifier in response envelope.",
+              "pattern": "^implementation$",
+              "type": "string"
+            },
+            "status": {
+              "const": "ready_for_review",
+              "type": "string"
+            },
+            "summary": {
+              "description": "Brief factual summary printed when workflow enters automated checks.",
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "protocol_version",
+            "role",
+            "summary"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "description": "Protocol version in response envelope.",
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "description": "Exact role identifier in response envelope.",
+              "pattern": "^implementation$",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            },
+            "summary": {
+              "description": "Brief factual summary printed when workflow enters automated checks.",
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "protocol_version",
+            "role",
+            "summary"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "ImplementationResponse"
+    },
+    "provider": {
+      "additionalProperties": false,
+      "description": "Typed implementation handoff, including a concise account of completed work.",
+      "properties": {
+        "response": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "description": "Protocol version in response envelope.",
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "description": "Exact role identifier in response envelope.",
+                  "pattern": "^implementation$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "ready_for_review"
+                  ],
+                  "type": "string"
+                },
+                "summary": {
+                  "description": "Brief factual summary printed when workflow enters automated checks.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "protocol_version",
+                "role",
+                "summary"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "description": "Protocol version in response envelope.",
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "role": {
+                  "description": "Exact role identifier in response envelope.",
+                  "pattern": "^implementation$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "blocked"
+                  ],
+                  "type": "string"
+                },
+                "summary": {
+                  "description": "Brief factual summary printed when workflow enters automated checks.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason",
+                "protocol_version",
+                "role",
+                "summary"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response"
+      ],
+      "type": "object"
+    }
+  },
+  "plan_audit": {
+    "canonical": {
+      "$defs": {
+        "Actionability": {
+          "description": "Describes whether a factually supported finding requires a correction.",
+          "oneOf": [
+            {
+              "const": "required",
+              "description": "Existing requirements require a correction.",
+              "type": "string"
+            },
+            {
+              "const": "not_required",
+              "description": "No correction is needed under existing requirements and scope.",
+              "type": "string"
+            },
+            {
+              "const": "ambiguous",
+              "description": "Available evidence cannot settle whether correction is required.",
+              "type": "string"
+            }
+          ]
+        },
+        "Classification": {
+          "description": "Describes whether a finding's factual claim is established by evidence.",
+          "oneOf": [
+            {
+              "const": "supported",
+              "description": "Evidence establishes the finding's factual claim.",
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "Evidence disproves the finding's factual claim.",
+              "type": "string"
+            },
+            {
+              "const": "ambiguous",
+              "description": "Available evidence cannot settle the finding's factual claim.",
+              "type": "string"
+            }
+          ]
+        },
+        "FindingClassification": {
+          "additionalProperties": false,
+          "description": "Records factual validity separately from whether a correction is necessary.",
+          "properties": {
+            "actionability": {
+              "$ref": "#/$defs/Actionability",
+              "description": "Whether repository requirements require a correction."
+            },
+            "classification": {
+              "$ref": "#/$defs/Classification",
+              "description": "Factual validity of the reported finding."
+            },
+            "finding_id": {
+              "description": "ID of corresponding input finding.",
+              "format": "uint64",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "rationale": {
+              "description": "Evidence-based rationale, including correction proportionality.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "finding_id",
+            "classification",
+            "actionability",
+            "rationale"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "classifications": {
+              "items": {
+                "$ref": "#/$defs/FindingClassification"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^plan_audit$",
+              "type": "string"
+            },
+            "status": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "classifications",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "pattern": "^plan_audit$",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "PlanAuditResponse"
+    },
+    "provider": {
+      "$defs": {
+        "Actionability": {
+          "anyOf": [
+            {
+              "description": "Existing requirements require a correction.",
+              "enum": [
+                "required"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "No correction is needed under existing requirements and scope.",
+              "enum": [
+                "not_required"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "Available evidence cannot settle whether correction is required.",
+              "enum": [
+                "ambiguous"
+              ],
+              "type": "string"
+            }
+          ],
+          "description": "Describes whether a factually supported finding requires a correction."
+        },
+        "Classification": {
+          "anyOf": [
+            {
+              "description": "Evidence establishes the finding's factual claim.",
+              "enum": [
+                "supported"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "Evidence disproves the finding's factual claim.",
+              "enum": [
+                "unsupported"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "Available evidence cannot settle the finding's factual claim.",
+              "enum": [
+                "ambiguous"
+              ],
+              "type": "string"
+            }
+          ],
+          "description": "Describes whether a finding's factual claim is established by evidence."
+        },
+        "FindingClassification": {
+          "additionalProperties": false,
+          "description": "Records factual validity separately from whether a correction is necessary.",
+          "properties": {
+            "actionability": {
+              "$ref": "#/$defs/Actionability",
+              "description": "Whether repository requirements require a correction."
+            },
+            "classification": {
+              "$ref": "#/$defs/Classification",
+              "description": "Factual validity of the reported finding."
+            },
+            "finding_id": {
+              "description": "ID of corresponding input finding.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "rationale": {
+              "description": "Evidence-based rationale, including correction proportionality.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "finding_id",
+            "classification",
+            "actionability",
+            "rationale"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "response": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "classifications": {
+                  "items": {
+                    "$ref": "#/$defs/FindingClassification"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^plan_audit$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "complete"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "classifications",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "role": {
+                  "pattern": "^plan_audit$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response"
+      ],
+      "type": "object"
+    }
+  },
+  "plan_author": {
+    "canonical": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^plan_author$",
+              "type": "string"
+            },
+            "status": {
+              "const": "ready_for_review",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "pattern": "^plan_author$",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "PlanAuthorResponse"
+    },
+    "provider": {
+      "additionalProperties": false,
+      "properties": {
+        "response": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^plan_author$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "ready_for_review"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "role": {
+                  "pattern": "^plan_author$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response"
+      ],
+      "type": "object"
+    }
+  },
+  "plan_review": {
+    "canonical": {
+      "$defs": {
+        "Finding": {
+          "additionalProperties": false,
+          "properties": {
+            "evidence": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "format": "uint64",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "location": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "proposed_correction": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "requirement": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "violation": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "requirement",
+            "location",
+            "evidence",
+            "violation",
+            "proposed_correction"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "findings": {
+              "items": {
+                "$ref": "#/$defs/Finding"
+              },
+              "maxItems": 0,
+              "minItems": 0,
+              "type": "array"
+            },
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^plan_review$",
+              "type": "string"
+            },
+            "status": {
+              "const": "no_issues",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "findings",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "findings": {
+              "items": {
+                "$ref": "#/$defs/Finding"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^plan_review$",
+              "type": "string"
+            },
+            "status": {
+              "const": "issues",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "findings",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "pattern": "^plan_review$",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "PlanReviewResponse"
+    },
+    "provider": {
+      "$defs": {
+        "Finding": {
+          "additionalProperties": false,
+          "properties": {
+            "evidence": {
+              "type": "string"
+            },
+            "id": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "location": {
+              "type": "string"
+            },
+            "proposed_correction": {
+              "type": "string"
+            },
+            "requirement": {
+              "type": "string"
+            },
+            "violation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "requirement",
+            "location",
+            "evidence",
+            "violation",
+            "proposed_correction"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "response": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "findings": {
+                  "items": {
+                    "$ref": "#/$defs/Finding"
+                  },
+                  "maxItems": 0,
+                  "minItems": 0,
+                  "type": "array"
+                },
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^plan_review$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "no_issues"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "findings",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "findings": {
+                  "items": {
+                    "$ref": "#/$defs/Finding"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^plan_review$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "issues"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "findings",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "role": {
+                  "pattern": "^plan_review$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response"
+      ],
+      "type": "object"
+    }
+  },
+  "plan_review_clarification": {
+    "canonical": {
+      "$defs": {
+        "Citation": {
+          "additionalProperties": false,
+          "properties": {
+            "excerpt": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "location": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "path": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "relevance": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "location",
+            "excerpt",
+            "relevance"
+          ],
+          "type": "object"
+        },
+        "FindingEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "citations": {
+              "items": {
+                "$ref": "#/$defs/Citation"
+              },
+              "type": "array"
+            },
+            "finding_id": {
+              "format": "uint64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "finding_id",
+            "citations"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "evidence": {
+              "items": {
+                "$ref": "#/$defs/FindingEvidence"
+              },
+              "type": "array"
+            },
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^plan_review_clarification$",
+              "type": "string"
+            },
+            "status": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "evidence",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "pattern": "^plan_review_clarification$",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "PlanClarificationResponse"
+    },
+    "provider": {
+      "$defs": {
+        "Citation": {
+          "additionalProperties": false,
+          "properties": {
+            "excerpt": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "relevance": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "location",
+            "excerpt",
+            "relevance"
+          ],
+          "type": "object"
+        },
+        "FindingEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "citations": {
+              "items": {
+                "$ref": "#/$defs/Citation"
+              },
+              "type": "array"
+            },
+            "finding_id": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "finding_id",
+            "citations"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "response": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "evidence": {
+                  "items": {
+                    "$ref": "#/$defs/FindingEvidence"
+                  },
+                  "type": "array"
+                },
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^plan_review_clarification$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "complete"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "evidence",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "role": {
+                  "pattern": "^plan_review_clarification$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response"
+      ],
+      "type": "object"
+    }
+  },
+  "review": {
+    "canonical": {
+      "$defs": {
+        "Finding": {
+          "additionalProperties": false,
+          "properties": {
+            "evidence": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "format": "uint64",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "location": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "proposed_correction": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "requirement": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "violation": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "requirement",
+            "location",
+            "evidence",
+            "violation",
+            "proposed_correction"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "findings": {
+              "items": {
+                "$ref": "#/$defs/Finding"
+              },
+              "maxItems": 0,
+              "minItems": 0,
+              "type": "array"
+            },
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^review$",
+              "type": "string"
+            },
+            "status": {
+              "const": "no_issues",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "findings",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "findings": {
+              "items": {
+                "$ref": "#/$defs/Finding"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^review$",
+              "type": "string"
+            },
+            "status": {
+              "const": "issues",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "findings",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "pattern": "^review$",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "ImplementationReviewResponse"
+    },
+    "provider": {
+      "$defs": {
+        "Finding": {
+          "additionalProperties": false,
+          "properties": {
+            "evidence": {
+              "type": "string"
+            },
+            "id": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "location": {
+              "type": "string"
+            },
+            "proposed_correction": {
+              "type": "string"
+            },
+            "requirement": {
+              "type": "string"
+            },
+            "violation": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "requirement",
+            "location",
+            "evidence",
+            "violation",
+            "proposed_correction"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "response": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "findings": {
+                  "items": {
+                    "$ref": "#/$defs/Finding"
+                  },
+                  "maxItems": 0,
+                  "minItems": 0,
+                  "type": "array"
+                },
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^review$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "no_issues"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "findings",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "findings": {
+                  "items": {
+                    "$ref": "#/$defs/Finding"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^review$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "issues"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "findings",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "role": {
+                  "pattern": "^review$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response"
+      ],
+      "type": "object"
+    }
+  },
+  "review_audit": {
+    "canonical": {
+      "$defs": {
+        "Actionability": {
+          "description": "Describes whether a factually supported finding requires a correction.",
+          "oneOf": [
+            {
+              "const": "required",
+              "description": "Existing requirements require a correction.",
+              "type": "string"
+            },
+            {
+              "const": "not_required",
+              "description": "No correction is needed under existing requirements and scope.",
+              "type": "string"
+            },
+            {
+              "const": "ambiguous",
+              "description": "Available evidence cannot settle whether correction is required.",
+              "type": "string"
+            }
+          ]
+        },
+        "Classification": {
+          "description": "Describes whether a finding's factual claim is established by evidence.",
+          "oneOf": [
+            {
+              "const": "supported",
+              "description": "Evidence establishes the finding's factual claim.",
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "Evidence disproves the finding's factual claim.",
+              "type": "string"
+            },
+            {
+              "const": "ambiguous",
+              "description": "Available evidence cannot settle the finding's factual claim.",
+              "type": "string"
+            }
+          ]
+        },
+        "FindingClassification": {
+          "additionalProperties": false,
+          "description": "Records factual validity separately from whether a correction is necessary.",
+          "properties": {
+            "actionability": {
+              "$ref": "#/$defs/Actionability",
+              "description": "Whether repository requirements require a correction."
+            },
+            "classification": {
+              "$ref": "#/$defs/Classification",
+              "description": "Factual validity of the reported finding."
+            },
+            "finding_id": {
+              "description": "ID of corresponding input finding.",
+              "format": "uint64",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "rationale": {
+              "description": "Evidence-based rationale, including correction proportionality.",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "finding_id",
+            "classification",
+            "actionability",
+            "rationale"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "classifications": {
+              "items": {
+                "$ref": "#/$defs/FindingClassification"
+              },
+              "minItems": 1,
+              "type": "array"
+            },
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^review_audit$",
+              "type": "string"
+            },
+            "status": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "classifications",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "pattern": "^review_audit$",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "ImplementationAuditResponse"
+    },
+    "provider": {
+      "$defs": {
+        "Actionability": {
+          "anyOf": [
+            {
+              "description": "Existing requirements require a correction.",
+              "enum": [
+                "required"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "No correction is needed under existing requirements and scope.",
+              "enum": [
+                "not_required"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "Available evidence cannot settle whether correction is required.",
+              "enum": [
+                "ambiguous"
+              ],
+              "type": "string"
+            }
+          ],
+          "description": "Describes whether a factually supported finding requires a correction."
+        },
+        "Classification": {
+          "anyOf": [
+            {
+              "description": "Evidence establishes the finding's factual claim.",
+              "enum": [
+                "supported"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "Evidence disproves the finding's factual claim.",
+              "enum": [
+                "unsupported"
+              ],
+              "type": "string"
+            },
+            {
+              "description": "Available evidence cannot settle the finding's factual claim.",
+              "enum": [
+                "ambiguous"
+              ],
+              "type": "string"
+            }
+          ],
+          "description": "Describes whether a finding's factual claim is established by evidence."
+        },
+        "FindingClassification": {
+          "additionalProperties": false,
+          "description": "Records factual validity separately from whether a correction is necessary.",
+          "properties": {
+            "actionability": {
+              "$ref": "#/$defs/Actionability",
+              "description": "Whether repository requirements require a correction."
+            },
+            "classification": {
+              "$ref": "#/$defs/Classification",
+              "description": "Factual validity of the reported finding."
+            },
+            "finding_id": {
+              "description": "ID of corresponding input finding.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "rationale": {
+              "description": "Evidence-based rationale, including correction proportionality.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "finding_id",
+            "classification",
+            "actionability",
+            "rationale"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "response": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "classifications": {
+                  "items": {
+                    "$ref": "#/$defs/FindingClassification"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^review_audit$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "complete"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "classifications",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "role": {
+                  "pattern": "^review_audit$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response"
+      ],
+      "type": "object"
+    }
+  },
+  "review_clarification": {
+    "canonical": {
+      "$defs": {
+        "Citation": {
+          "additionalProperties": false,
+          "properties": {
+            "excerpt": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "location": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "path": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "relevance": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "location",
+            "excerpt",
+            "relevance"
+          ],
+          "type": "object"
+        },
+        "FindingEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "citations": {
+              "items": {
+                "$ref": "#/$defs/Citation"
+              },
+              "type": "array"
+            },
+            "finding_id": {
+              "format": "uint64",
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "finding_id",
+            "citations"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "evidence": {
+              "items": {
+                "$ref": "#/$defs/FindingEvidence"
+              },
+              "type": "array"
+            },
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "role": {
+              "pattern": "^review_clarification$",
+              "type": "string"
+            },
+            "status": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "evidence",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "protocol_version": {
+              "format": "uint32",
+              "maximum": 1,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "reason": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "role": {
+              "pattern": "^review_clarification$",
+              "type": "string"
+            },
+            "status": {
+              "const": "blocked",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason",
+            "protocol_version",
+            "role"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "ImplementationClarificationResponse"
+    },
+    "provider": {
+      "$defs": {
+        "Citation": {
+          "additionalProperties": false,
+          "properties": {
+            "excerpt": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "relevance": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "location",
+            "excerpt",
+            "relevance"
+          ],
+          "type": "object"
+        },
+        "FindingEvidence": {
+          "additionalProperties": false,
+          "properties": {
+            "citations": {
+              "items": {
+                "$ref": "#/$defs/Citation"
+              },
+              "type": "array"
+            },
+            "finding_id": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "finding_id",
+            "citations"
+          ],
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "response": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "evidence": {
+                  "items": {
+                    "$ref": "#/$defs/FindingEvidence"
+                  },
+                  "type": "array"
+                },
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "role": {
+                  "pattern": "^review_clarification$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "complete"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "evidence",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "protocol_version": {
+                  "maximum": 1,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "role": {
+                  "pattern": "^review_clarification$",
+                  "type": "string"
+                },
+                "status": {
+                  "enum": [
+                    "blocked"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason",
+                "protocol_version",
+                "role"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response"
+      ],
+      "type": "object"
+    }
+  }
+}

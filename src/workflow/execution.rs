@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use super::audits::{AuditScope, AuditTask, request_audit};
 use super::{
     ActionIntegrityPolicy, AgentRequest, AuditReport, CandidateFiles, CheckReport,
     FindingDisposition, ImplementationEntry, WorkflowContext, expand_argv, plan_exists,
@@ -20,10 +21,10 @@ use crate::output::Output;
 use crate::prompts::PromptRole;
 use crate::protocol::{
     self, Actionability, AuditEvidenceInput, AuditInput, AuditResult, ClarificationInput,
-    Classification, EvidenceResult, Finding, FindingClassification, ImplementationAuditResponse,
+    Classification, EvidenceResult, Finding, FindingClassification,
     ImplementationClarificationResponse, ImplementationRepairInput, ImplementationResponse,
-    ImplementationReviewResponse, PlanAuditResponse, PlanAuthorResponse, PlanClarificationResponse,
-    PlanRepairInput, PlanReviewResponse, Readiness, ReviewResult,
+    ImplementationReviewResponse, PlanAuthorResponse, PlanClarificationResponse, PlanRepairInput,
+    PlanReviewResponse, Readiness, ReviewResult,
 };
 
 pub(super) fn run_plan_workflow(
@@ -87,10 +88,6 @@ fn run_plan_loop(
                 feedback: feedback.as_deref(),
                 validation_feedback: None,
                 checks: "",
-            },
-            |value| match &value.result {
-                Readiness::ReadyForReview => Ok(()),
-                Readiness::Blocked { reason } => protocol::validate_text(reason, "blocked reason"),
             },
         )?;
         match response.result {
@@ -179,7 +176,6 @@ fn review_plan(
             validation_feedback: None,
             checks: "",
         },
-        |response: &PlanReviewResponse| protocol::validate_review_result(&response.result),
     )
 }
 
@@ -203,12 +199,6 @@ pub(super) fn run_implementation_workflow(
                         feedback: feedback.as_deref(),
                         validation_feedback: None,
                         checks: "",
-                    },
-                    |value| match &value.result {
-                        Readiness::ReadyForReview => Ok(()),
-                        Readiness::Blocked { reason } => {
-                            protocol::validate_text(reason, "blocked reason")
-                        }
                     },
                 )?;
                 match response.result {
@@ -258,6 +248,25 @@ pub(super) fn run_implementation_workflow(
     }
 }
 
+fn review_current_implementation(
+    context: &mut WorkflowContext<'_>,
+    candidate: &SpecCandidate,
+    plan_path: &Path,
+    checks: &str,
+) -> Result<ImplementationReviewResponse> {
+    super::agents::call_typed(
+        context,
+        AgentRequest {
+            candidate,
+            role: PromptRole::Review,
+            plan_path: Some(plan_path),
+            feedback: None,
+            validation_feedback: None,
+            checks,
+        },
+    )
+}
+
 enum ReviewDisposition {
     Approved,
     Repair(String),
@@ -269,18 +278,7 @@ fn review_implementation(
     plan_path: &Path,
     checks: &str,
 ) -> Result<ReviewDisposition> {
-    let review = super::agents::call_typed::<ImplementationReviewResponse>(
-        context,
-        AgentRequest {
-            candidate,
-            role: PromptRole::Review,
-            plan_path: Some(plan_path),
-            feedback: None,
-            validation_feedback: None,
-            checks,
-        },
-        |response| protocol::validate_review_result(&response.result),
-    )?;
+    let review = review_current_implementation(context, candidate, plan_path, checks)?;
     match review.result {
         ReviewResult::Blocked { reason } => Err(super::agents::role_blocked(
             "implementation reviewer",
@@ -319,18 +317,6 @@ fn review_implementation(
                 "Resume implementation from current workspace and preserve prior work. Repair only findings marked supported and required in the audit. Follow audit rationale for the smallest sufficient correct fix, even when substantial. Do not change code for supported findings marked not_required. Resolve ambiguous findings from available evidence; do not treat ambiguity as authorization to change code, and return blocked if consequential ambiguity remains. If required in-scope work remains but can be implemented compliantly, make a concrete increment and return ready_for_review; the workflow will rerun checks and review, then route remaining findings back here. ready_for_review marks readiness for another pass, not full spec completion. Unfinished work or its size alone is not a blocker.\n{message}"
             )))
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AuditScope {
-    Plan,
-    Implementation,
-}
-
-impl AuditScope {
-    const fn is_plan(self) -> bool {
-        matches!(self, Self::Plan)
     }
 }
 
@@ -438,52 +424,37 @@ fn request_evidence<R: Serialize>(
             request.checks
         },
     };
-    let evidence = if request.scope.is_plan() {
-        let response = super::agents::call_typed::<PlanClarificationResponse>(
+    let result = if request.scope.is_plan() {
+        super::agents::call_typed_validated::<PlanClarificationResponse>(
             context,
             agent_request,
-            |value| match &value.result {
-                EvidenceResult::Complete { evidence } => {
-                    protocol::validate_evidence(evidence, requested)
-                }
-                EvidenceResult::Blocked { reason } => {
-                    protocol::validate_text(reason, "blocked reason")
-                }
-            },
-        )?;
-        match response.result {
-            EvidenceResult::Blocked { reason } => {
-                return Err(super::agents::role_blocked(
-                    "evidence clarification",
-                    &reason,
-                ));
-            }
-            EvidenceResult::Complete { evidence } => evidence,
-        }
+            |value| validate_evidence_request(&value.result, requested),
+        )?
+        .result
     } else {
-        let response = super::agents::call_typed::<ImplementationClarificationResponse>(
+        super::agents::call_typed_validated::<ImplementationClarificationResponse>(
             context,
             agent_request,
-            |value| match &value.result {
-                EvidenceResult::Complete { evidence } => {
-                    protocol::validate_evidence(evidence, requested)
-                }
-                EvidenceResult::Blocked { reason } => {
-                    protocol::validate_text(reason, "blocked reason")
-                }
-            },
-        )?;
-        match response.result {
-            EvidenceResult::Blocked { reason } => {
-                return Err(super::agents::role_blocked(
-                    "evidence clarification",
-                    &reason,
-                ));
-            }
-            EvidenceResult::Complete { evidence } => evidence,
-        }
+            |value| validate_evidence_request(&value.result, requested),
+        )?
+        .result
     };
-    Ok(evidence)
+    match result {
+        EvidenceResult::Complete { evidence } => Ok(evidence),
+        EvidenceResult::Blocked { reason } => Err(super::agents::role_blocked(
+            "evidence clarification",
+            &reason,
+        )),
+    }
+}
+
+fn validate_evidence_request(result: &EvidenceResult, requested: &[u64]) -> Result<()> {
+    match result {
+        EvidenceResult::Complete { evidence } => {
+            protocol::validate_requested_evidence(evidence, requested)
+        }
+        EvidenceResult::Blocked { .. } => Ok(()),
+    }
 }
 
 fn merge_audit_reports(initial: AuditReport, clarified: AuditReport) -> AuditReport {
@@ -510,7 +481,7 @@ fn invoke_audit(
     } else {
         PromptRole::ReviewAudit
     };
-    let handoff = AuditInput {
+    let handoff = AuditInput::Findings {
         review: request.review,
         findings: request.findings,
         evidence,
@@ -528,43 +499,17 @@ fn invoke_audit(
             request.checks
         },
     };
-    if request.scope.is_plan() {
-        let response =
-            super::agents::call_typed::<PlanAuditResponse>(context, agent_request, |value| {
-                match &value.result {
-                    AuditResult::Complete { classifications } => {
-                        protocol::validate_classifications(classifications, request.findings)
-                    }
-                    AuditResult::Blocked { reason } => {
-                        protocol::validate_text(reason, "blocked reason")
-                    }
-                }
-            })?;
-        match response.result {
-            AuditResult::Blocked { reason } => {
-                Err(super::agents::role_blocked("plan auditor", &reason))
-            }
-            AuditResult::Complete { classifications } => Ok(AuditReport { classifications }),
-        }
-    } else {
-        let response = super::agents::call_typed::<ImplementationAuditResponse>(
-            context,
-            agent_request,
-            |value| match &value.result {
-                AuditResult::Complete { classifications } => {
-                    protocol::validate_classifications(classifications, request.findings)
-                }
-                AuditResult::Blocked { reason } => {
-                    protocol::validate_text(reason, "blocked reason")
-                }
-            },
-        )?;
-        match response.result {
-            AuditResult::Blocked { reason } => Err(super::agents::role_blocked(
-                "implementation finding auditor",
-                &reason,
-            )),
-            AuditResult::Complete { classifications } => Ok(AuditReport { classifications }),
+    match request_audit(
+        context,
+        agent_request,
+        request.scope,
+        AuditTask::Findings(request.findings),
+    )? {
+        AuditResult::Complete { classifications } => Ok(AuditReport { classifications }),
+        AuditResult::Adjudicated { .. } | AuditResult::Blocked { .. } => {
+            Err(SpecLoopError::Workflow(
+                "finding audit returned an unexpected result after validation".to_owned(),
+            ))
         }
     }
 }

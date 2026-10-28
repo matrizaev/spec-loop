@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use serde_json::{Map, Value, json};
 
 use crate::error::{Result, SpecLoopError};
+#[cfg(test)]
 use crate::protocol;
 
 #[cfg(test)]
@@ -27,16 +28,13 @@ const SUPPORTED_KEYWORDS: &[&str] = &[
     "type",
 ];
 
-/// Mechanically projects one canonical role schema into the provider's strict subset.
-/// Generates the provider strict-schema projection directly from the canonical role schema.
-pub fn schema<T: schemars::JsonSchema>() -> Result<Value> {
-    let canonical: Value = serde_json::from_str(&protocol::schema::<T>()?).map_err(|error| {
-        SpecLoopError::Agent(format!("parse canonical role schema for provider: {error}"))
-    })?;
-    project_schema(&canonical)
+#[cfg(test)]
+pub(super) fn schema<T: schemars::JsonSchema>() -> Result<Value> {
+    project_schema(&protocol::schema_value::<T>()?)
 }
 
-fn project_schema(canonical: &Value) -> Result<Value> {
+/// Mechanically projects a canonical role schema into the strict provider subset.
+pub fn project_schema(canonical: &Value) -> Result<Value> {
     let canonical_object = canonical.as_object().ok_or_else(|| {
         SpecLoopError::Agent("canonical role schema root is not an object".to_owned())
     })?;
@@ -103,6 +101,9 @@ fn transform_schema(value: &Value, path: &str) -> Result<Value> {
         return Ok(value.clone());
     };
 
+    if object.contains_key("$ref") {
+        return transform_reference(object, path);
+    }
     let mut transformed = Map::new();
     for (keyword, child) in object {
         if let Some((projected_keyword, projected_value)) =
@@ -113,6 +114,31 @@ fn transform_schema(value: &Value, path: &str) -> Result<Value> {
     }
     ensure_strict_object(&mut transformed, path)?;
     Ok(Value::Object(transformed))
+}
+
+fn transform_reference(schema: &Map<String, Value>, path: &str) -> Result<Value> {
+    let reference = schema
+        .get("$ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| schema_error(path, "schema reference must be a string"))?;
+    // The provider forbids every $ref sibling. Omit documentation annotations only;
+    // constraints must fail closed instead of disappearing from the projected contract.
+    for (keyword, value) in schema {
+        match keyword.as_str() {
+            "$ref" => {}
+            "description" | "title" | "$schema" if value.is_string() => {}
+            "description" | "title" | "$schema" => {
+                return Err(schema_error(path, "reference annotation must be a string"));
+            }
+            _ => {
+                return Err(schema_error(
+                    path,
+                    &format!("unsupported keyword {keyword:?} beside $ref"),
+                ));
+            }
+        }
+    }
+    Ok(json!({"$ref":reference}))
 }
 
 fn transform_keyword(
@@ -263,14 +289,39 @@ fn transform_schema_map(value: &Value, path: &str) -> Result<Value> {
     Ok(Value::Object(transformed))
 }
 
+/// Finds a tagged union's finite discriminator for validation and provider wire ordering.
+/// Scalar enum alternatives have no object discriminator. Callers validate disjointness separately.
+pub fn discriminator(branches: &[Value]) -> Option<&str> {
+    branches
+        .first()
+        .and_then(|branch| branch.get("properties"))
+        .and_then(Value::as_object)
+        .and_then(|properties| {
+            properties.iter().find(|(_, property)| {
+                property.get("const").is_some() || property.get("enum").is_some()
+            })
+        })
+        .map(|(name, _)| name.as_str())
+}
+
 fn ensure_disjoint_statuses(branches: &[Value]) -> Result<()> {
+    // Nested adjudication uses outcome; derive the tag from the schema, not role policy.
+    let tag = discriminator(branches);
     let mut seen = BTreeSet::new();
     for (index, branch) in branches.iter().enumerate() {
-        let discriminator = branch
-            .get("properties")
-            .and_then(Value::as_object)
-            .and_then(|properties| properties.get("status"))
-            .unwrap_or(branch);
+        let discriminator = if let Some(tag) = tag {
+            branch
+                .get("properties")
+                .and_then(|properties| properties.get(tag))
+                .ok_or_else(|| {
+                    schema_error(
+                        "oneOf",
+                        "canonical union branches have different discriminators",
+                    )
+                })?
+        } else {
+            branch
+        };
         let values = if let Some(value) = discriminator.get("const") {
             vec![value]
         } else {

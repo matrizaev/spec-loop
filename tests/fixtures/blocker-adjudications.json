@@ -1,0 +1,22 @@
+[
+  {
+    "outcome": "confirmed",
+    "rationale": "The selected spec requires external approval which is unavailable.",
+    "evidence": "Selected specification: approval prerequisite; review.reason: external approval unavailable.",
+    "requirement": "External approval before compliant implementation",
+    "prerequisite": "External approval",
+    "unavailable_reason": "Available tools cannot grant an external party's approval",
+    "required_input": "Provide the required external approval"
+  },
+  {
+    "outcome": "unsupported",
+    "rationale": "The review explicitly reports no gaps and no genuine blocker.",
+    "evidence": "Original supplied review.reason"
+  },
+  {
+    "outcome": "ambiguous",
+    "rationale": "Available evidence cannot establish whether the required approval exists.",
+    "evidence": "Selected specification: approval prerequisite; original review: availability unresolved.",
+    "question": "Has the required external approval been granted?"
+  }
+]

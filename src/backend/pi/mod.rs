@@ -15,24 +15,15 @@ use crate::paths;
 use crate::prompts::PromptRole;
 
 #[cfg(test)]
+mod api_probe;
+#[cfg(test)]
 mod tests;
 
 /// Pi's machine-readable subprocess backend.
 pub struct PiBackend;
 
 impl AgentBackend for PiBackend {
-    fn run(
-        &self,
-        root: &Path,
-        profile: &Profile,
-        prompt: &str,
-        role: PromptRole,
-        cancelled: &Arc<AtomicBool>,
-    ) -> Result<AgentRun> {
-        run_agent(root, profile, prompt, role, cancelled, &Output::plain())
-    }
-
-    fn run_with_continuation(
+    fn invoke(
         &self,
         root: &Path,
         profile: &Profile,

@@ -5,6 +5,42 @@ use tempfile::TempDir;
 use super::{AgentBackendKind, AgentStage, Profile};
 
 #[test]
+fn every_prompt_collection_is_enumerated_and_validated() {
+    for role in [
+        "plan_author",
+        "plan_review",
+        "plan_audit",
+        "plan_review_clarification",
+        "implementation",
+        "review",
+        "review_audit",
+        "review_clarification",
+    ] {
+        let profile: Profile = toml::from_str(&format!(
+            "schema_version=3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='pi'\n[prompts]\n{role}=['{role}.md']\n"
+        )).expect("profile");
+        assert_eq!(
+            profile.prompts.files().collect::<Vec<_>>(),
+            [&std::path::PathBuf::from(format!("{role}.md"))]
+        );
+        profile.validate().expect("relative prompt path");
+        for invalid in ["", "/absolute.md", "bad\0path"] {
+            let text = serde_json::to_string(invalid).expect("quote invalid path");
+            let profile: Profile = toml::from_str(&format!(
+                "schema_version=3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='pi'\n[prompts]\n{role}=[{text}]\n"
+            )).expect("invalid-path profile");
+            assert!(
+                profile
+                    .validate()
+                    .expect_err("invalid prompt path")
+                    .to_string()
+                    .contains("profile resource path must be a non-empty repository-relative path")
+            );
+        }
+    }
+}
+
+#[test]
 fn profile_load_reports_manual_migration_for_legacy_versions() {
     for version in [1, 2] {
         let temporary = TempDir::new().expect("create temporary profile directory");

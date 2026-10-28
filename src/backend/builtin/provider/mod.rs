@@ -4,11 +4,13 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use self::request::encode_request;
 use crate::backend::builtin::usage::UsageReporter;
 #[cfg(test)]
 use crate::backend::builtin::usage::UsageSnapshot;
 use crate::error::{Result, SpecLoopError};
 
+mod request;
 #[cfg(test)]
 mod tests;
 
@@ -49,10 +51,19 @@ pub(super) async fn request_with_observations(
     cancelled: &AtomicBool,
     reporter: &mut UsageReporter<'_>,
 ) -> Result<Value> {
+    ensure_active(deadline, cancelled)?;
+    // Reuse exact serialized bytes across retries. Serializing a Value with .json()
+    // would alphabetize properties again and discard discriminator-first schema order.
+    let encoded = encode_request(body)?;
     let mut retry_count = 0_u8;
     loop {
         ensure_active(deadline, cancelled)?;
-        let request = client.post(endpoint).bearer_auth(token).json(body).send();
+        let request = client
+            .post(endpoint)
+            .bearer_auth(token)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(encoded.clone())
+            .send();
         let send = async {
             reporter.snapshot.request_sent();
             reporter.report()?;
@@ -132,11 +143,23 @@ pub(super) async fn request_with_observations(
                 MAX_PROVIDER_RETRIES
             )));
         }
-        return Err(SpecLoopError::Workflow(format!(
-            "OpenAI Responses rejected the request (HTTP {}); verify model and agent configuration",
-            status.as_u16()
-        )));
+        return Err(request_rejection(status.as_u16(), &bytes));
     }
+}
+
+fn request_rejection(status: u16, body: &[u8]) -> SpecLoopError {
+    // Inspect only the known error code, never echo provider prose or request data.
+    // Non-JSON errors retain the HTTP failure rather than hiding it behind a parse error.
+    if let Ok(error) = serde_json::from_slice::<Value>(body)
+        && error.pointer("/error/code").and_then(Value::as_str) == Some("invalid_json_schema")
+    {
+        return SpecLoopError::Workflow(format!(
+            "OpenAI Responses rejected the request (HTTP {status}); generated structured-output schema rejected (invalid_json_schema); report this provider-schema error; no weaker-format fallback was attempted"
+        ));
+    }
+    SpecLoopError::Workflow(format!(
+        "OpenAI Responses rejected the request (HTTP {status}); verify model and agent configuration"
+    ))
 }
 
 fn advance_retry_counter(retry_count: u8) -> Result<u8> {

@@ -35,6 +35,8 @@ use crate::error::{Result, SpecLoopError, io_error};
 use crate::runtime;
 
 mod callback;
+#[cfg(test)]
+mod persistence_tests;
 mod registry;
 #[cfg(test)]
 mod tests;
@@ -875,7 +877,18 @@ fn persist_registration(
     selected_id: Option<&str>,
 ) -> Result<()> {
     let id = registration_id(&issuer, &subject, &client_id)?;
-    persist_registration_with(
+    RegistrationPersistence {
+        save_registry: Registry::save,
+        write_credential: try_save_credential,
+        read_credential: load_credential,
+        restore_credential: |registration_id: &str, previous: Option<&Credential>| {
+            previous.map_or_else(
+                || delete_credential(registration_id),
+                |credential| save_credential(registration_id, credential),
+            )
+        },
+    }
+    .persist(
         registry,
         path,
         RegistrationUpdate {
@@ -890,215 +903,146 @@ fn persist_registration(
             credential,
             selected_id: selected_id.map(str::to_owned),
         },
-        RegistrationPersistence {
-            save_registry: Registry::save,
-            write_credential: try_save_credential,
-            read_credential: load_credential,
-            restore_credential: |registration_id: &str, previous: Option<&Credential>| {
-                previous.map_or_else(
-                    || delete_credential(registration_id),
-                    |credential| save_credential(registration_id, credential),
-                )
-            },
-        },
     )
 }
 
-fn persist_registration_with<SaveRegistry, WriteCredential, ReadCredential, RestoreCredential>(
-    registry: &mut Registry,
-    path: &Path,
-    update: RegistrationUpdate,
-    mut persistence: RegistrationPersistence<
-        SaveRegistry,
-        WriteCredential,
-        ReadCredential,
-        RestoreCredential,
-    >,
-) -> Result<()>
+impl<SaveRegistry, WriteCredential, ReadCredential, RestoreCredential>
+    RegistrationPersistence<SaveRegistry, WriteCredential, ReadCredential, RestoreCredential>
 where
     SaveRegistry: FnMut(&Registry, &Path) -> Result<()>,
     WriteCredential: FnMut(&str, &Credential) -> std::result::Result<(), CredentialWriteError>,
     ReadCredential: FnMut(&Registration) -> Result<Option<Credential>>,
     RestoreCredential: FnMut(&str, Option<&Credential>) -> Result<()>,
 {
-    let id = &update.registration.id;
-    if update
-        .selected_id
-        .as_deref()
-        .is_some_and(|selected| selected != id)
-    {
-        return Err(SpecLoopError::Config(
+    fn persist(
+        &mut self,
+        registry: &mut Registry,
+        path: &Path,
+        update: RegistrationUpdate,
+    ) -> Result<()> {
+        let id = &update.registration.id;
+        if update
+            .selected_id
+            .as_deref()
+            .is_some_and(|selected| selected != id)
+        {
+            return Err(SpecLoopError::Config(
             "verified ChatGPT identity does not match selected registration; existing credentials were preserved".to_owned(),
         ));
-    }
-    let previous = registry
-        .registrations
-        .iter()
-        .find(|previous| previous.id == *id)
-        .cloned();
-    if update.selected_id.is_none() && previous.is_some() {
-        return Err(SpecLoopError::Config(
+        }
+        let previous = registry
+            .registrations
+            .iter()
+            .find(|previous| previous.id == *id)
+            .cloned();
+        if update.selected_id.is_none() && previous.is_some() {
+            return Err(SpecLoopError::Config(
             "this ChatGPT identity and client registration already exists; select its registration ID".to_owned(),
         ));
-    }
-    let previous_keyring_credential = match previous.as_ref() {
-        Some(entry) if matches!(entry.credential_storage, CredentialStorage::Keyring) => {
-            (persistence.read_credential)(entry)?
         }
-        _ => None,
-    };
-    let original = registry.clone();
-    let is_new_registration = previous.is_none();
-    let mut staged = original.clone();
-    if is_new_registration {
-        staged.registrations.push(update.registration.clone());
-    }
-    let transaction = RegistrationTransaction {
-        registration_id: id.clone(),
-        original,
-        staged,
-        previous_keyring_credential,
-        is_new_registration,
-    };
-
-    // Persist identity-bound metadata before writing credentials; it stays inactive until commit.
-    (persistence.save_registry)(&transaction.staged, path)?;
-    match (persistence.write_credential)(id, &update.credential) {
-        Ok(()) => {
-            commit_keyring_registration(registry, path, update, &transaction, &mut persistence)
+        let previous_keyring_credential = match previous.as_ref() {
+            Some(entry) if matches!(entry.credential_storage, CredentialStorage::Keyring) => {
+                (self.read_credential)(entry)?
+            }
+            _ => None,
+        };
+        let original = registry.clone();
+        let is_new_registration = previous.is_none();
+        let mut staged = original.clone();
+        if is_new_registration {
+            staged.registrations.push(update.registration.clone());
         }
-        Err(CredentialWriteError::Unavailable) => {
-            commit_file_registration(registry, path, update, &transaction, &mut persistence)
+        let transaction = RegistrationTransaction {
+            registration_id: id.clone(),
+            original,
+            staged,
+            previous_keyring_credential,
+            is_new_registration,
+        };
+
+        // Persist identity-bound metadata before writing credentials; it stays inactive until commit.
+        (self.save_registry)(&transaction.staged, path)?;
+        match (self.write_credential)(id, &update.credential) {
+            Ok(()) => self.commit_keyring_registration(registry, path, update, &transaction),
+            Err(CredentialWriteError::Unavailable) => {
+                self.commit_file_registration(registry, path, update, &transaction)
+            }
+            Err(CredentialWriteError::Failed(error)) => {
+                Err(self.rollback_registration(error, path, &transaction, true))
+            }
         }
-        Err(CredentialWriteError::Failed(error)) => Err(rollback_registration(
-            error,
-            path,
-            &transaction,
-            &mut persistence,
-            true,
-        )),
     }
-}
 
-fn commit_keyring_registration<SaveRegistry, WriteCredential, ReadCredential, RestoreCredential>(
-    registry: &mut Registry,
-    path: &Path,
-    update: RegistrationUpdate,
-    transaction: &RegistrationTransaction,
-    persistence: &mut RegistrationPersistence<
-        SaveRegistry,
-        WriteCredential,
-        ReadCredential,
-        RestoreCredential,
-    >,
-) -> Result<()>
-where
-    SaveRegistry: FnMut(&Registry, &Path) -> Result<()>,
-    WriteCredential: FnMut(&str, &Credential) -> std::result::Result<(), CredentialWriteError>,
-    ReadCredential: FnMut(&Registration) -> Result<Option<Credential>>,
-    RestoreCredential: FnMut(&str, Option<&Credential>) -> Result<()>,
-{
-    let mut activated = transaction.staged.clone();
-    replace_registration(&mut activated, update.registration);
-    activated.active_registration_id = Some(transaction.registration_id.clone());
-    save_activation(registry, path, activated, transaction, persistence, true)
-}
-
-fn commit_file_registration<SaveRegistry, WriteCredential, ReadCredential, RestoreCredential>(
-    registry: &mut Registry,
-    path: &Path,
-    mut update: RegistrationUpdate,
-    transaction: &RegistrationTransaction,
-    persistence: &mut RegistrationPersistence<
-        SaveRegistry,
-        WriteCredential,
-        ReadCredential,
-        RestoreCredential,
-    >,
-) -> Result<()>
-where
-    SaveRegistry: FnMut(&Registry, &Path) -> Result<()>,
-    WriteCredential: FnMut(&str, &Credential) -> std::result::Result<(), CredentialWriteError>,
-    ReadCredential: FnMut(&Registration) -> Result<Option<Credential>>,
-    RestoreCredential: FnMut(&str, Option<&Credential>) -> Result<()>,
-{
-    update.registration.credential_storage = CredentialStorage::File;
-    update.registration.fallback_credential = Some(update.credential);
-    let mut activated = transaction.staged.clone();
-    replace_registration(&mut activated, update.registration);
-    activated.active_registration_id = Some(transaction.registration_id.clone());
-    save_activation(registry, path, activated, transaction, persistence, false)?;
-    println!(
-        "OS credential store unavailable; credentials saved unencrypted with owner-only permissions at {}.",
-        path.display()
-    );
-    Ok(())
-}
-
-fn save_activation<SaveRegistry, WriteCredential, ReadCredential, RestoreCredential>(
-    registry: &mut Registry,
-    path: &Path,
-    activated: Registry,
-    transaction: &RegistrationTransaction,
-    persistence: &mut RegistrationPersistence<
-        SaveRegistry,
-        WriteCredential,
-        ReadCredential,
-        RestoreCredential,
-    >,
-    restore_keyring: bool,
-) -> Result<()>
-where
-    SaveRegistry: FnMut(&Registry, &Path) -> Result<()>,
-    WriteCredential: FnMut(&str, &Credential) -> std::result::Result<(), CredentialWriteError>,
-    ReadCredential: FnMut(&Registration) -> Result<Option<Credential>>,
-    RestoreCredential: FnMut(&str, Option<&Credential>) -> Result<()>,
-{
-    if let Err(error) = (persistence.save_registry)(&activated, path) {
-        return Err(rollback_registration(
-            error,
-            path,
-            transaction,
-            persistence,
-            restore_keyring,
-        ));
+    fn commit_keyring_registration(
+        &mut self,
+        registry: &mut Registry,
+        path: &Path,
+        update: RegistrationUpdate,
+        transaction: &RegistrationTransaction,
+    ) -> Result<()> {
+        let mut activated = transaction.staged.clone();
+        replace_registration(&mut activated, update.registration);
+        activated.active_registration_id = Some(transaction.registration_id.clone());
+        self.save_activation(registry, path, activated, transaction, true)
     }
-    *registry = activated;
-    Ok(())
-}
 
-fn rollback_registration<SaveRegistry, WriteCredential, ReadCredential, RestoreCredential>(
-    error: SpecLoopError,
-    path: &Path,
-    transaction: &RegistrationTransaction,
-    persistence: &mut RegistrationPersistence<
-        SaveRegistry,
-        WriteCredential,
-        ReadCredential,
-        RestoreCredential,
-    >,
-    restore_keyring: bool,
-) -> SpecLoopError
-where
-    SaveRegistry: FnMut(&Registry, &Path) -> Result<()>,
-    WriteCredential: FnMut(&str, &Credential) -> std::result::Result<(), CredentialWriteError>,
-    ReadCredential: FnMut(&Registration) -> Result<Option<Credential>>,
-    RestoreCredential: FnMut(&str, Option<&Credential>) -> Result<()>,
-{
-    let credential_rollback = if restore_keyring {
-        (persistence.restore_credential)(
-            &transaction.registration_id,
-            transaction.previous_keyring_credential.as_ref(),
-        )
-    } else {
+    fn commit_file_registration(
+        &mut self,
+        registry: &mut Registry,
+        path: &Path,
+        mut update: RegistrationUpdate,
+        transaction: &RegistrationTransaction,
+    ) -> Result<()> {
+        update.registration.credential_storage = CredentialStorage::File;
+        update.registration.fallback_credential = Some(update.credential);
+        let mut activated = transaction.staged.clone();
+        replace_registration(&mut activated, update.registration);
+        activated.active_registration_id = Some(transaction.registration_id.clone());
+        self.save_activation(registry, path, activated, transaction, false)?;
+        println!(
+            "OS credential store unavailable; credentials saved unencrypted with owner-only permissions at {}.",
+            path.display()
+        );
         Ok(())
-    };
-    let registry_rollback = if transaction.is_new_registration {
-        (persistence.save_registry)(&transaction.original, path)
-    } else {
+    }
+
+    fn save_activation(
+        &mut self,
+        registry: &mut Registry,
+        path: &Path,
+        activated: Registry,
+        transaction: &RegistrationTransaction,
+        restore_keyring: bool,
+    ) -> Result<()> {
+        if let Err(error) = (self.save_registry)(&activated, path) {
+            return Err(self.rollback_registration(error, path, transaction, restore_keyring));
+        }
+        *registry = activated;
         Ok(())
-    };
-    combine_registration_rollback(error, credential_rollback, registry_rollback)
+    }
+
+    fn rollback_registration(
+        &mut self,
+        error: SpecLoopError,
+        path: &Path,
+        transaction: &RegistrationTransaction,
+        restore_keyring: bool,
+    ) -> SpecLoopError {
+        let credential_rollback = if restore_keyring {
+            (self.restore_credential)(
+                &transaction.registration_id,
+                transaction.previous_keyring_credential.as_ref(),
+            )
+        } else {
+            Ok(())
+        };
+        let registry_rollback = if transaction.is_new_registration {
+            (self.save_registry)(&transaction.original, path)
+        } else {
+            Ok(())
+        };
+        combine_registration_rollback(error, credential_rollback, registry_rollback)
+    }
 }
 
 fn replace_registration(registry: &mut Registry, registration: Registration) {
@@ -1137,15 +1081,7 @@ fn credential_from_token(
     verifier: &CoreIdTokenVerifier<'_>,
     nonce: &Nonce,
 ) -> Result<(String, String, Credential)> {
-    let scopes = token
-        .scopes()
-        .map(|scopes| {
-            scopes
-                .iter()
-                .map(|scope| scope.as_str().to_owned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let scopes = token_scopes(token);
     if !scopes.iter().any(|scope| scope == DIRECT_SCOPE) {
         return Err(SpecLoopError::Workflow(format!(
             "OpenAI authorization lacks required `{DIRECT_SCOPE}` permission; grant it and run `spec-loop auth login` again"
