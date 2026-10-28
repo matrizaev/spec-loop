@@ -54,6 +54,7 @@ struct AgentRequest<'a> {
     feedback: Option<&'a str>,
     validation_feedback: Option<&'a str>,
     checks: &'a str,
+    implementation_summary: Option<&'a str>,
 }
 
 struct CandidateFiles {

@@ -1763,6 +1763,7 @@ fn exercise_native_context(backend: &str, origin: PromptRole, interrupt_audit: b
                 r#"{"task":"native-task-sentinel","actionable_findings":["repair-finding-sentinel"],"requested_finding_ids":[3,1]}"#,
             ),
             checks: "check-diagnostic-sentinel",
+            implementation_summary: None,
             validation_feedback: Some("previous-feedback-sentinel"),
         },
     );

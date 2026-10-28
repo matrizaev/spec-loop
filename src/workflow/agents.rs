@@ -217,6 +217,7 @@ fn build_role_prompt(context: &WorkflowContext<'_>, request: AgentRequest<'_>) -
             feedback: request.feedback,
             validation_feedback: request.validation_feedback,
             checks: request.checks,
+            implementation_summary: request.implementation_summary,
         },
     )
 }

@@ -240,6 +240,14 @@ fn write_fake_responses(directory: &Path) {
             "{\"protocol_version\":1,\"role\":\"implementation\",\"summary\":\"Added requested implementation changes and regression coverage.\",\"status\":\"ready_for_review\"}",
         ),
         (
+            "summary-first",
+            "{\"protocol_version\":1,\"role\":\"implementation\",\"summary\":\"Completed first repair pass: isolated the validation path.\",\"status\":\"ready_for_review\"}",
+        ),
+        (
+            "summary-second",
+            "{\"protocol_version\":1,\"role\":\"implementation\",\"summary\":\"Completed second repair pass: applied the audited correction.\",\"status\":\"ready_for_review\"}",
+        ),
+        (
             "blocked",
             "{\"protocol_version\":1,\"role\":\"implementation\",\"summary\":\"No changes made; required input unavailable.\",\"status\":\"blocked\",\"reason\":\"cannot proceed\"}",
         ),
@@ -305,12 +313,15 @@ fn write_fake_pi(
     temporary: &Path,
 ) {
     let script = format!(
-        "#!/bin/sh\nset -eu\nPROMPT=''\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in -p) PROMPT=\"$2\"; shift 2 ;; *) shift ;; esac; done\nprintf '%s\\n---\\n' \"$PROMPT\" >> {prompts}\ncase \"$PROMPT\" in\n  *'Create or revise selected plan only'*) printf 'plan-author\\n' >> {agent_events}; printf '# Authored plan\\n' > .spec-loop/plans/001.md; cat {plan_ready} ;;\n  *'Independently review plan against selected spec'*) printf 'plan-review\\n' >> {agent_events}; cat {plan_clear} ;;\n  *'Implement only selected spec'*) printf 'implementation:%s\\n' \"$PWD\" >> {agent_events}; printf 'implemented\\n' >> generated.txt; if [ \"${{MODE-}}\" = blocked ]; then cat {blocked}; else cat {ready}; fi ;;\n  *'Audit only supplied implementation-review findings'*) printf 'review-audit:%s\\n' \"$PWD\" >> {agent_events}; count=0; [ ! -f {audit_count} ] || count=$(cat {audit_count}); count=$((count + 1)); printf '%s' \"$count\" > {audit_count}; if [ \"${{MODE-}}\" = blocked ] || {{ [ \"${{MODE-}}\" = clarification-blocked ] && [ \"$count\" -gt 1 ]; }}; then cat {blocker_confirmed}; elif [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = review-context-blocked ]; then cat {audit_blocked}; elif {{ [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = clarification-blocked ]; }} && [ \"$count\" -eq 1 ]; then cat {audit_unsupported}; elif [ \"${{MODE-}}\" = nonactionable ]; then cat {audit_supported_not_required}; else cat {audit_supported}; fi ;;\n  *'Provide citations only for requested implementation-review finding IDs'*) printf 'review-clarification:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = clarification-blocked ]; then cat {clarification_blocked}; else cat {clarification}; fi ;;\n  *'Independently review current workspace'*) printf 'review:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = review-context-blocked ]; then cat {review_blocked}; elif [ \"${{MODE-}}\" = finding-repair ] || [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = clarification-blocked ] || [ \"${{MODE-}}\" = nonactionable ] || [ \"${{MODE-}}\" = iterative-repair ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"$count\" -eq 1 ] || {{ [ \"${{MODE-}}\" = iterative-repair ] && [ \"$count\" -eq 2 ]; }}; then cat {review_issues}; else cat {review_clear}; fi; elif [ \"${{MODE-}}\" = malformed-review-once ] || [ \"${{MODE-}}\" = malformed-review-always ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"${{MODE-}}\" = malformed-review-always ] || [ \"$count\" -eq 1 ]; then cat {malformed}; else cat {review_clear}; fi; else cat {review_clear}; fi ;;\n  *) printf 'unexpected-role\\n' >> {agent_events}; exit 23 ;;\nesac\n",
+        "#!/bin/sh\nset -eu\nPROMPT=''\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in -p) PROMPT=\"$2\"; shift 2 ;; *) shift ;; esac; done\nprintf '%s\\n---\\n' \"$PROMPT\" >> {prompts}\ncase \"$PROMPT\" in\n  *'Create or revise selected plan only'*) printf 'plan-author\\n' >> {agent_events}; printf '# Authored plan\\n' > .spec-loop/plans/001.md; cat {plan_ready} ;;\n  *'Independently review plan against selected spec'*) printf 'plan-review\\n' >> {agent_events}; cat {plan_clear} ;;\n  *'Implement only selected spec'*) printf 'implementation:%s\\n' \"$PWD\" >> {agent_events}; printf 'implemented\\n' >> generated.txt; if [ \"${{MODE-}}\" = summary-repair ]; then count=0; [ ! -f {implementation_count} ] || count=$(cat {implementation_count}); count=$((count + 1)); printf '%s' \"$count\" > {implementation_count}; if [ \"$count\" -eq 1 ]; then cat {summary_first}; else cat {summary_second}; fi; elif [ \"${{MODE-}}\" = blocked ]; then cat {blocked}; else cat {ready}; fi ;;\n  *'Audit only supplied implementation-review findings'*) printf 'review-audit:%s\\n' \"$PWD\" >> {agent_events}; count=0; [ ! -f {audit_count} ] || count=$(cat {audit_count}); count=$((count + 1)); printf '%s' \"$count\" > {audit_count}; if [ \"${{MODE-}}\" = blocked ] || {{ [ \"${{MODE-}}\" = clarification-blocked ] && [ \"$count\" -gt 1 ]; }}; then cat {blocker_confirmed}; elif [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = review-context-blocked ]; then cat {audit_blocked}; elif {{ [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = clarification-blocked ]; }} && [ \"$count\" -eq 1 ]; then cat {audit_unsupported}; elif [ \"${{MODE-}}\" = nonactionable ]; then cat {audit_supported_not_required}; else cat {audit_supported}; fi ;;\n  *'Provide citations only for requested implementation-review finding IDs'*) printf 'review-clarification:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = clarification-blocked ]; then cat {clarification_blocked}; else cat {clarification}; fi ;;\n  *'Independently review current workspace'*) printf 'review:%s\\n' \"$PWD\" >> {agent_events}; if [ \"${{MODE-}}\" = review-context-blocked ]; then cat {review_blocked}; elif [ \"${{MODE-}}\" = finding-repair ] || [ \"${{MODE-}}\" = clarify ] || [ \"${{MODE-}}\" = audit-blocked ] || [ \"${{MODE-}}\" = clarification-blocked ] || [ \"${{MODE-}}\" = nonactionable ] || [ \"${{MODE-}}\" = iterative-repair ] || [ \"${{MODE-}}\" = summary-repair ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"$count\" -eq 1 ] || {{ [ \"${{MODE-}}\" = iterative-repair ] && [ \"$count\" -eq 2 ]; }}; then cat {review_issues}; else cat {review_clear}; fi; elif [ \"${{MODE-}}\" = malformed-review-once ] || [ \"${{MODE-}}\" = malformed-review-always ]; then count=0; [ ! -f {review_count} ] || count=$(cat {review_count}); count=$((count + 1)); printf '%s' \"$count\" > {review_count}; if [ \"${{MODE-}}\" = malformed-review-always ] || [ \"$count\" -eq 1 ]; then cat {malformed}; else cat {review_clear}; fi; else cat {review_clear}; fi ;;\n  *) printf 'unexpected-role\\n' >> {agent_events}; exit 23 ;;\nesac\n",
         prompts = shell_quote(prompts),
         agent_events = shell_quote(agent_events),
         plan_ready = shell_quote(&responses.join("plan-ready")),
         plan_clear = shell_quote(&responses.join("plan-clear")),
         ready = shell_quote(&responses.join("ready")),
+        summary_first = shell_quote(&responses.join("summary-first")),
+        summary_second = shell_quote(&responses.join("summary-second")),
+        implementation_count = shell_quote(&temporary.join("implementation-count")),
         blocked = shell_quote(&responses.join("blocked")),
         malformed = shell_quote(&responses.join("malformed")),
         blocker_confirmed = shell_quote(&responses.join("blocker-confirmed")),
@@ -789,9 +800,68 @@ fn workflow_runs_without_git_and_actions_receive_archived_paths_and_root_cwd() {
     )));
     assert!(prompt_log.contains("Generated response schema"));
     assert!(prompt_log.contains("concise, factual, single-line `summary`"));
+    assert!(prompt_log.contains(
+        r#"{"summary": "Added requested implementation changes and regression coverage."}"#
+    ));
+    assert!(prompt_log.contains("implementer-authored, unverified orientation context"));
     assert!(prompt_log.contains("draft/2020-12"));
     assert_eq!(count_lines(&fixture.agent_events, "implementation:"), 1);
     assert_eq!(count_lines(&fixture.agent_events, "review:"), 1);
+}
+
+#[test]
+fn implementation_review_receives_only_latest_implementation_summary() {
+    let fixture = Fixture::new(false, false);
+    let output = fixture.run_with_env(&["--spec", "001"], &[("MODE", "summary-repair")]);
+
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches("Check summary").count(), 2);
+    assert_eq!(count_lines(&fixture.agent_events, "implementation:"), 2);
+    assert_eq!(count_lines(&fixture.agent_events, "review:"), 2);
+    let prompts = fs::read_to_string(&fixture.prompts).expect("role prompts");
+    let review_prompts = prompts
+        .split("\n---\n")
+        .filter(|prompt| prompt.contains("Independently review current workspace"))
+        .collect::<Vec<_>>();
+    assert_eq!(review_prompts.len(), 2);
+    assert!(
+        review_prompts[0].contains(
+            r#"{"summary": "Completed first repair pass: isolated the validation path."}"#
+        )
+    );
+    assert!(!review_prompts[0].contains("Completed second repair pass"));
+    assert!(review_prompts[1].contains(
+        r#"{"summary": "Completed second repair pass: applied the audited correction."}"#
+    ));
+    assert!(!review_prompts[1].contains("Completed first repair pass"));
+    let other_prompts = prompts
+        .split("\n---\n")
+        .filter(|prompt| !prompt.contains("Independently review current workspace"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        other_prompts
+            .iter()
+            .filter(|prompt| prompt.contains("Implement only selected spec"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        other_prompts
+            .iter()
+            .filter(|prompt| prompt.contains("Audit only supplied implementation-review findings"))
+            .count(),
+        1
+    );
+    assert!(
+        other_prompts
+            .iter()
+            .all(|prompt| !prompt.contains("Begin implementation summary"))
+    );
+    assert!(
+        stdout.find("Check summary").expect("first check summary")
+            < stdout.find("Stage: agent review").expect("review stage")
+    );
 }
 
 #[test]
@@ -1070,6 +1140,11 @@ fn review_resume_accepts_non_git_workspace_without_a_patch() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Implementation summary:"));
     assert_eq!(count_lines(&fixture.agent_events, "implementation:"), 0);
     assert_eq!(count_lines(&fixture.agent_events, "review:"), 1);
+    assert!(
+        !fs::read_to_string(&fixture.prompts)
+            .expect("role prompts")
+            .contains("Begin implementation summary")
+    );
     assert!(!fixture.root.join(".git").exists());
     let events = fs::read_to_string(&fixture.events).expect("action events");
     assert!(
@@ -1384,6 +1459,14 @@ fn typed_finding_audit_and_one_time_evidence_clarification_run_with_review_conte
         assert!(prompts.contains("Review-context command argv"));
         assert!(prompts.contains("review_audit"));
         assert!(prompts.contains("smallest correct fix is substantial but required"));
+        for prompt in prompts.split("\n---\n").filter(|prompt| {
+            prompt.contains("Audit only supplied implementation-review findings")
+                || prompt.contains(
+                    "Provide citations only for requested implementation-review finding IDs",
+                )
+        }) {
+            assert!(!prompt.contains("Begin implementation summary"));
+        }
         if mode == "clarify" {
             assert!(prompts.contains("review_clarification"));
             assert!(prompts.contains("source confirms behavior"));
@@ -1466,6 +1549,15 @@ fn review_context_failure_reported_as_typed_blocked_stops_completion() {
     assert!(!events.contains("finish|"));
     assert_eq!(count_lines(&fixture.agent_events, "review:"), 1);
     assert_eq!(count_lines(&fixture.agent_events, "review-audit:"), 1);
+    let prompts = fs::read_to_string(&fixture.prompts).expect("role prompts");
+    let blocker_audit = prompts
+        .split("\n---\n")
+        .find(|prompt| {
+            prompt.contains("Audit only supplied implementation-review findings")
+                && prompt.contains("\"audit_kind\":\"agent_blocker\"")
+        })
+        .expect("blocker adjudication prompt");
+    assert!(!blocker_audit.contains("Begin implementation summary"));
     assert!(fixture.root.join("generated.txt").exists());
 }
 
@@ -1666,6 +1758,11 @@ fn all_checks_run_after_failure_and_review_and_actions_are_skipped() {
     assert!(!events.contains("review-success|"));
     assert!(!events.contains("finish|"));
     assert_eq!(count_lines(&fixture.agent_events, "review:"), 0);
+    assert!(
+        !fs::read_to_string(&fixture.prompts)
+            .expect("role prompts")
+            .contains("Begin implementation summary")
+    );
     assert!(fixture.root.join("generated.txt").exists());
 }
 

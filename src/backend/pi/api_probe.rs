@@ -43,6 +43,7 @@ fn live_pi_review_status_probe() {
             feedback: None,
             validation_feedback: None,
             checks: &checks,
+            implementation_summary: None,
         },
     )
     .expect("normal review prompt");

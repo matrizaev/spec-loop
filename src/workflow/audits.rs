@@ -124,6 +124,7 @@ pub(super) fn adjudicate_blocker(
             role: scope.auditor(),
             feedback: Some(&handoff),
             validation_feedback: None,
+            implementation_summary: None,
             ..request
         },
         scope,

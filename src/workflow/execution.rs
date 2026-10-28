@@ -88,6 +88,7 @@ fn run_plan_loop(
                 feedback: feedback.as_deref(),
                 validation_feedback: None,
                 checks: "",
+                implementation_summary: None,
             },
         )?;
         match response.result {
@@ -175,6 +176,7 @@ fn review_plan(
             feedback: None,
             validation_feedback: None,
             checks: "",
+            implementation_summary: None,
         },
     )
 }
@@ -199,6 +201,7 @@ pub(super) fn run_implementation_workflow(
                         feedback: feedback.as_deref(),
                         validation_feedback: None,
                         checks: "",
+                        implementation_summary: None,
                     },
                 )?;
                 match response.result {
@@ -212,9 +215,9 @@ pub(super) fn run_implementation_workflow(
         };
         context.integrity.verify(context.root)?;
         let mut transition = format!("Stage: automated checks for spec {}", candidate.id);
-        if let Some(summary) = implementation_summary {
+        if let Some(summary) = implementation_summary.as_deref() {
             transition.push_str("\nImplementation summary: ");
-            transition.push_str(&Output::display_text(&summary, 160));
+            transition.push_str(&Output::display_text(summary, 160));
         }
         context.output.stage(&transition)?;
         let checks = run_checks(context, candidate, plan_path)?;
@@ -236,7 +239,13 @@ pub(super) fn run_implementation_workflow(
             ));
             continue;
         }
-        match review_implementation(context, candidate, plan_path, &checks.summary)? {
+        match review_implementation(
+            context,
+            candidate,
+            plan_path,
+            &checks.summary,
+            implementation_summary.as_deref(),
+        )? {
             ReviewDisposition::Approved => {
                 complete_spec(context, candidate, plan_path, archive_path)?;
                 return Ok(());
@@ -253,6 +262,7 @@ fn review_current_implementation(
     candidate: &SpecCandidate,
     plan_path: &Path,
     checks: &str,
+    implementation_summary: Option<&str>,
 ) -> Result<ImplementationReviewResponse> {
     super::agents::call_typed(
         context,
@@ -263,6 +273,7 @@ fn review_current_implementation(
             feedback: None,
             validation_feedback: None,
             checks,
+            implementation_summary,
         },
     )
 }
@@ -277,8 +288,15 @@ fn review_implementation(
     candidate: &SpecCandidate,
     plan_path: &Path,
     checks: &str,
+    implementation_summary: Option<&str>,
 ) -> Result<ReviewDisposition> {
-    let review = review_current_implementation(context, candidate, plan_path, checks)?;
+    let review = review_current_implementation(
+        context,
+        candidate,
+        plan_path,
+        checks,
+        implementation_summary,
+    )?;
     match review.result {
         ReviewResult::Blocked { reason } => Err(super::agents::role_blocked(
             "implementation reviewer",
@@ -423,6 +441,7 @@ fn request_evidence<R: Serialize>(
         } else {
             request.checks
         },
+        implementation_summary: None,
     };
     let result = if request.scope.is_plan() {
         super::agents::call_typed_validated::<PlanClarificationResponse>(
@@ -498,6 +517,7 @@ fn invoke_audit(
         } else {
             request.checks
         },
+        implementation_summary: None,
     };
     match request_audit(
         context,
