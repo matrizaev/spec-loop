@@ -4,6 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+/// Numeric usage observations produced by built-in role execution.
+pub use self::builtin::usage::UsageSnapshot;
 use crate::config::{AgentBackendKind, Profile};
 use crate::error::{Result, SpecLoopError};
 use crate::output::Output;
@@ -112,6 +114,8 @@ pub struct AgentRun {
     pub stdout: Vec<u8>,
     /// Raw backend stderr, retained independently for diagnostics.
     pub stderr: Vec<u8>,
+    /// Numeric usage observations made by this built-in invocation, if applicable.
+    pub usage: Option<UsageSnapshot>,
 }
 
 /// Invocation settings that carry backend continuation and formatter-only presentation.
@@ -120,6 +124,8 @@ pub struct AgentInvocation<'a> {
     pub continuation: Option<BackendContinuation>,
     /// Workflow formatter used only for terminal diagnostics.
     pub output: &'a Output,
+    /// Cumulative observations for this spec and role before the current invocation.
+    pub usage_baseline: UsageSnapshot,
 }
 
 /// Backend contract consumed by workflow policy without backend-specific parsing.

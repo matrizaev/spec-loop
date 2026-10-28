@@ -23,8 +23,16 @@ timeout_seconds = 1800
 # Omitted backend selects built-in OpenAI Responses; set model before use.
 # Omitting max_tool_calls means no Spec Loop shell-call count ceiling.
 # max_tool_output_bytes defaults to a combined 1,048,576-byte stdout/stderr payload cap per built-in shell call; neither stream has a reserved share.
+# Optional positive limit supplied by you, not a measured limit for this example model:
+# context_window_tokens = 128000
 model = "your-chatgpt-model"
 timeout_seconds = 3600
+
+[agent.stages.review]
+# Optional stage limit overrides the global context limit. If this stage overrides
+# model, it must also set a stage limit; otherwise its applicable limit is unknown.
+# model = "your-review-model"
+# context_window_tokens = 128000
 
 [completion]
 max_passes = 0

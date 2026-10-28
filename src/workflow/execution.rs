@@ -179,18 +179,7 @@ fn review_plan(
             validation_feedback: None,
             checks: "",
         },
-        |response: &PlanReviewResponse| match &response.result {
-            ReviewResult::NoIssues { findings } => {
-                if !findings.is_empty() {
-                    return Err(SpecLoopError::Agent(
-                        "no_issues requires empty findings".to_owned(),
-                    ));
-                }
-                Ok(())
-            }
-            ReviewResult::Issues { findings } => protocol::validate_findings(findings),
-            ReviewResult::Blocked { reason } => protocol::validate_text(reason, "blocked reason"),
-        },
+        |response: &PlanReviewResponse| protocol::validate_review_result(&response.result),
     )
 }
 
@@ -290,18 +279,7 @@ fn review_implementation(
             validation_feedback: None,
             checks,
         },
-        |response| match &response.result {
-            ReviewResult::NoIssues { findings } => {
-                if !findings.is_empty() {
-                    return Err(SpecLoopError::Agent(
-                        "no_issues requires empty findings".to_owned(),
-                    ));
-                }
-                Ok(())
-            }
-            ReviewResult::Issues { findings } => protocol::validate_findings(findings),
-            ReviewResult::Blocked { reason } => protocol::validate_text(reason, "blocked reason"),
-        },
+        |response| protocol::validate_review_result(&response.result),
     )?;
     match review.result {
         ReviewResult::Blocked { reason } => Err(super::agents::role_blocked(

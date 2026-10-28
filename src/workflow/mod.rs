@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::backend::{self, AgentBackend};
+use crate::backend::{self, AgentBackend, UsageSnapshot};
 use crate::cli::{Cli, WorkflowMode};
 use crate::config::{AgentBackendKind, Profile};
 use crate::discovery::{self, SpecCandidate};
@@ -38,6 +38,7 @@ struct WorkflowContext<'a> {
     cancelled: Arc<AtomicBool>,
     max_passes: usize,
     role_calls: BTreeMap<PromptRole, usize>,
+    role_usage: BTreeMap<(String, PromptRole), UsageSnapshot>,
     log_index: usize,
     integrity: InputIntegrity,
     backend: Box<dyn AgentBackend>,
@@ -142,6 +143,7 @@ fn run_at(
         cancelled,
         max_passes: profile.completion.max_passes,
         role_calls: BTreeMap::new(),
+        role_usage: BTreeMap::new(),
         log_index: 0,
         integrity: prepared.integrity,
         backend,

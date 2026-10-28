@@ -1,8 +1,11 @@
 use std::io::Write;
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -18,9 +21,345 @@ use super::super::{
     RESPONSES_URL, RoleInput, RoleTask, classify_agent_run, run_role_with_access_token,
     run_role_with_auth,
 };
-use super::{SseState, StreamFailure, request_with_retries, retry_delay, usage_limit_error};
+use super::{
+    SseState, StreamFailure, advance_retry_counter, request_with_observations,
+    request_with_retries, retry_delay, usage_limit_error,
+};
 use crate::backend::BackendFailureKind;
+use crate::backend::UsageSnapshot;
+use crate::backend::builtin::usage::UsageReporter;
 use crate::prompts::PromptRole;
+
+#[test]
+fn provider_retry_counts_each_send_and_completed_response_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let body = completed_sse(&json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [],
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 35,
+                "total_tokens": 155,
+                "input_tokens_details": {"cached_tokens": 12},
+                "output_tokens_details": {"reasoning_tokens": 20}
+            }
+        }
+    }));
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for (status, response_body) in [
+            ("429 Too Many Requests", "retry".to_owned()),
+            ("200 OK", body),
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            requests.push(read_http_request(&mut stream));
+            let delay = if status.starts_with("429") {
+                "Retry-After: 0\r\n"
+            } else {
+                ""
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\n{delay}Content-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write provider response");
+        }
+        requests
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build provider client");
+    let mut usage = UsageSnapshot::default();
+    let live = {
+        let mut live = Vec::new();
+        let mut observe = |snapshot: &UsageSnapshot| {
+            live.push(snapshot.clone());
+            Ok(())
+        };
+        let mut reporter = UsageReporter::new(&mut usage, &mut observe);
+        let result = crate::runtime::block_on(request_with_observations(
+            &client,
+            &format!("http://{address}/v1/responses"),
+            "fixture-access-token",
+            &json!({"model": "fixture-model", "stream": true}),
+            None,
+            &AtomicBool::new(false),
+            &mut reporter,
+        ))
+        .expect("construct provider runtime")
+        .expect("retry succeeds");
+        assert_eq!(result["status"], "completed");
+        live
+    };
+    assert_eq!(usage.provider_request_attempts, Some(2));
+    assert_eq!(usage.completed_responses, Some(1));
+    assert_eq!(
+        usage.latest_response.as_ref().and_then(|item| item.total),
+        Some(155)
+    );
+    assert_eq!(live.len(), 3);
+    let requests = server.join().expect("join provider fixture");
+    assert_eq!(requests.len(), 2);
+}
+
+#[test]
+fn request_attempt_is_reported_while_provider_response_is_held() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let (release_response, response_released) = mpsc::channel();
+    let (request_arrived, request_received) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        let request = read_http_request(&mut stream);
+        request_arrived
+            .send(())
+            .expect("notify that provider request arrived");
+        response_released
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait until the request attempt is observed");
+        let body = completed_sse(&json!({
+            "type": "response.completed",
+            "response": {"status": "completed", "output": []}
+        }));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write provider response");
+        request
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build provider client");
+    let (observed, observations) = mpsc::channel();
+    let request_thread = thread::spawn(move || {
+        let mut usage = UsageSnapshot::default();
+        let mut observe = |snapshot: &UsageSnapshot| {
+            observed
+                .send(snapshot.clone())
+                .map_err(|error| crate::error::SpecLoopError::Workflow(error.to_string()))
+        };
+        let mut reporter = UsageReporter::new(&mut usage, &mut observe);
+        crate::runtime::block_on(request_with_observations(
+            &client,
+            &format!("http://{address}/v1/responses"),
+            "fixture-access-token",
+            &json!({"model": "fixture-model", "stream": true}),
+            None,
+            &AtomicBool::new(false),
+            &mut reporter,
+        ))
+    });
+
+    let in_flight = observations.recv_timeout(Duration::from_secs(2));
+    let arrived = request_received.recv_timeout(Duration::from_secs(2));
+    release_response
+        .send(())
+        .expect("release held provider response");
+    let request_result = request_thread.join().expect("join request task");
+    assert!(
+        request_result.expect("construct request runtime").is_ok(),
+        "request should complete successfully"
+    );
+    let in_flight = in_flight.expect("attempt report before provider response release");
+    arrived.expect("request must be in flight before response release");
+    assert_eq!(in_flight.provider_request_attempts, Some(1));
+    assert_eq!(in_flight.completed_responses, Some(0));
+    assert!(
+        server
+            .join()
+            .expect("join provider server")
+            .starts_with("POST ")
+    );
+}
+
+#[test]
+fn completed_usage_is_observed_before_malformed_output_validation() {
+    let mut state = SseState::default();
+    let mut usage = UsageSnapshot::default();
+    let mut live_count = 0_u64;
+    {
+        let mut observe = |_: &UsageSnapshot| {
+            live_count += 1;
+            Ok(())
+        };
+        let mut reporter = UsageReporter::new(&mut usage, &mut observe);
+        for (event_type, event) in [
+            ("response.created", json!({"type": "response.created"})),
+            (
+                "response.in_progress",
+                json!({"type": "response.in_progress"}),
+            ),
+        ] {
+            assert!(
+                state
+                    .accept_event_observed(event_type, &event, &mut reporter)
+                    .is_ok()
+            );
+        }
+        let malformed = json!({
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}
+            }
+        });
+        assert!(matches!(
+            state.accept_event_observed("response.completed", &malformed, &mut reporter),
+            Err(StreamFailure::Fatal(_))
+        ));
+    }
+    assert_eq!(usage.completed_responses, Some(1));
+    assert_eq!(
+        usage.latest_response.as_ref().and_then(|item| item.total),
+        Some(3)
+    );
+    assert_eq!(live_count, 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn incomplete_response_after_shell_effect_is_fatal_without_replay_or_handoff() {
+    let temporary = TempDir::new().expect("create incomplete-response project");
+    let completed_marker = temporary.path().join("completed-effect");
+    let forbidden_marker = temporary.path().join("incomplete-effect");
+    let (endpoint, server) = start_incomplete_response_provider(incomplete_response_events(
+        &completed_marker,
+        &forbidden_marker,
+    ));
+    let profile = builtin_test_profile();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let input = RoleInput {
+        root: temporary.path(),
+        profile: &profile,
+        prompt: "execute one completed shell call and await a final role handoff",
+        role: PromptRole::Implementation,
+        cancelled: &cancelled,
+        deadline: None,
+        endpoint: &endpoint,
+        token: "fixture-access-token",
+    };
+    let token = input.token.to_owned();
+    let mut conversation = None;
+    let mut transcript = Vec::new();
+    let mut usage = UsageSnapshot::default();
+    let mut observer = |_: &UsageSnapshot| Ok(());
+    let result = crate::runtime::block_on(super::super::run_role_with_token_provider_observed(
+        input,
+        None,
+        move || {
+            let token = token.clone();
+            async move { Ok(token) }
+        },
+        &mut conversation,
+        &mut transcript,
+        &mut usage,
+        &mut observer,
+    ))
+    .expect("construct incomplete-response runtime");
+    let error = result.expect_err("incomplete provider response must not become a handoff");
+    assert!(error.to_string().contains("provider failure"));
+    assert_eq!(
+        std::fs::read_to_string(&completed_marker).expect("read completed side effect"),
+        "x"
+    );
+    assert!(!forbidden_marker.exists());
+    assert_eq!(usage.provider_request_attempts, Some(2));
+    assert_eq!(usage.completed_responses, Some(1));
+    assert_eq!(usage.executed_shell_calls, Some(1));
+    assert_eq!(
+        usage
+            .latest_response
+            .as_ref()
+            .and_then(|snapshot| snapshot.total),
+        Some(12)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&transcript)
+            .matches("$ printf")
+            .count(),
+        1
+    );
+    let requests = server.join().expect("join incomplete-response fixture");
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request.starts_with("POST ")));
+}
+
+fn incomplete_response_events(completed_marker: &Path, forbidden_marker: &Path) -> [String; 2] {
+    let shell_command = format!("printf x >> '{}'", completed_marker.display());
+    let completed = completed_sse(&json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [{
+                "type": "function_call",
+                "call_id": "completed-shell-call",
+                "name": "spec_loop.shell",
+                "arguments": serde_json::to_string(&json!({"command": shell_command}))
+                    .expect("serialize completed shell call")
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+        }
+    }));
+    let incomplete_call = json!({
+        "type": "function_call",
+        "call_id": "incomplete-shell-call",
+        "name": "spec_loop.shell",
+        "arguments": serde_json::to_string(&json!({
+            "command": format!("touch {}", forbidden_marker.display())
+        }))
+        .expect("serialize incomplete shell call")
+    });
+    let incomplete = format!(
+        "{RESPONSE_STARTED}{}",
+        sse_event(
+            "response.incomplete",
+            &json!({
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "output": [incomplete_call],
+                    "incomplete_details": {"reason": "max_output_tokens"}
+                }
+            })
+        )
+    );
+    [completed, incomplete]
+}
+
+fn start_incomplete_response_provider(
+    responses: [String; 2],
+) -> (String, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind incomplete-response fixture");
+    let address = listener
+        .local_addr()
+        .expect("incomplete-response fixture address");
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            requests.push(read_http_request(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write incomplete-response fixture");
+        }
+        requests
+    });
+    (format!("http://{address}/v1/responses"), server)
+}
 
 #[test]
 fn responses_request_uses_oauth_and_expected_body_with_fake_http_server() {
@@ -518,6 +857,12 @@ fn permanent_response_failed_does_not_retry_stream_request() {
     .expect("construct request runtime");
     assert!(result.is_err());
     assert_ne!(server.join().expect("join provider fixture"), "");
+}
+
+#[test]
+fn provider_retry_counter_advancement_is_checked() {
+    assert_eq!(advance_retry_counter(0).expect("advance retry counter"), 1);
+    assert!(advance_retry_counter(u8::MAX).is_err());
 }
 
 #[test]

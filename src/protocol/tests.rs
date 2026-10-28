@@ -3,7 +3,7 @@ use super::{
     ImplementationAuditResponse, ImplementationClarificationResponse, ImplementationResponse,
     ImplementationReviewResponse, PlanAuditResponse, PlanAuthorResponse, PlanClarificationResponse,
     PlanReviewResponse, ReviewResult, schema, validate_classifications, validate_evidence,
-    validate_findings,
+    validate_findings, validate_review_result,
 };
 
 #[test]
@@ -207,6 +207,55 @@ fn implementation_schema_requires_bounded_summary_for_each_status() {
                 .any(|field| field == "summary")
         );
     }
+}
+
+#[test]
+fn shared_review_validator_preserves_all_status_constraints() {
+    let finding = Finding {
+        id: 1,
+        requirement: "requirement".to_owned(),
+        location: "src/example.rs:1".to_owned(),
+        evidence: "evidence".to_owned(),
+        violation: "violation".to_owned(),
+        proposed_correction: "correction".to_owned(),
+    };
+
+    assert!(
+        validate_review_result(&ReviewResult::NoIssues {
+            findings: Vec::new()
+        })
+        .is_ok()
+    );
+    assert!(
+        validate_review_result(&ReviewResult::NoIssues {
+            findings: vec![finding.clone()],
+        })
+        .is_err()
+    );
+    assert!(
+        validate_review_result(&ReviewResult::Issues {
+            findings: vec![finding],
+        })
+        .is_ok()
+    );
+    assert!(
+        validate_review_result(&ReviewResult::Issues {
+            findings: Vec::new()
+        })
+        .is_err()
+    );
+    assert!(
+        validate_review_result(&ReviewResult::Blocked {
+            reason: "review unavailable".to_owned(),
+        })
+        .is_ok()
+    );
+    assert!(
+        validate_review_result(&ReviewResult::Blocked {
+            reason: String::new(),
+        })
+        .is_err()
+    );
 }
 
 #[test]

@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::error::{Result, SpecLoopError};
 
+/// Mechanically projects canonical role schemas for provider-native structured output.
+pub mod provider;
+
 #[cfg(test)]
 mod tests;
 const PROTOCOL_VERSION: u32 = 1;
@@ -665,8 +668,8 @@ macro_rules! impl_response_fields {
 
 impl_response_fields!(
     PlanAuthorResponse => validate_readiness,
-    PlanReviewResponse => validate_review,
-    ImplementationReviewResponse => validate_review,
+    PlanReviewResponse => validate_review_result,
+    ImplementationReviewResponse => validate_review_result,
     PlanAuditResponse => validate_audit,
     ImplementationAuditResponse => validate_audit,
     PlanClarificationResponse => validate_evidence_result,
@@ -710,7 +713,8 @@ fn validate_readiness(result: &Readiness) -> Result<()> {
     Ok(())
 }
 
-fn validate_review(result: &ReviewResult) -> Result<()> {
+/// Validates status-specific review findings and blocked reasons for every backend.
+pub fn validate_review_result(result: &ReviewResult) -> Result<()> {
     match result {
         ReviewResult::NoIssues { findings } if findings.is_empty() => Ok(()),
         ReviewResult::NoIssues { .. } => Err(SpecLoopError::Agent(

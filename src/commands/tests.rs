@@ -2,14 +2,14 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
 use super::{
     ProcessTermination, ensure_not_cancelled, run_process, run_process_until,
-    run_process_with_os_args,
+    run_process_until_with_spawn_observer, run_process_with_os_args,
 };
 
 #[test]
@@ -280,4 +280,40 @@ fn assert_process_terminated(pid: u32) {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn spawn_observer_counts_only_successful_process_spawns() {
+    let temporary = TempDir::new().expect("create spawn observer fixture");
+    let spawned = AtomicUsize::new(0);
+    let output = run_process_until_with_spawn_observer(
+        Path::new("/bin/sh"),
+        &["-c".to_owned(), "exit 0".to_owned()],
+        temporary.path(),
+        None,
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        || {
+            spawned.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+    )
+    .expect("run successful observed process");
+    assert_eq!(output.termination, ProcessTermination::Exited);
+    assert_eq!(spawned.load(Ordering::Relaxed), 1);
+
+    let failed = run_process_until_with_spawn_observer(
+        &temporary.path().join("missing-executable"),
+        &[],
+        temporary.path(),
+        None,
+        None,
+        &Arc::new(AtomicBool::new(false)),
+        || {
+            spawned.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        },
+    );
+    assert!(failed.is_err());
+    assert_eq!(spawned.load(Ordering::Relaxed), 1);
 }

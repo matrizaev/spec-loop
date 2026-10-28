@@ -11,7 +11,7 @@ use tempfile::TempDir;
 use super::provider::request_with_retries;
 use super::{
     RoleInput, RoleTask, classify_agent_run, run_after_shell_preflight, run_role_with_access_token,
-    run_role_with_auth, run_role_with_continuation, stage_for_role,
+    run_role_with_auth,
 };
 use crate::backend::BackendFailureKind;
 use crate::config::{AgentStage, Profile};
@@ -131,6 +131,343 @@ model='fixture-model'
     profile
 }
 
+async fn run_role_with_usage(
+    input: RoleInput<'_>,
+    continuation: Option<super::BuiltinConversation>,
+    completed_conversation: &mut Option<super::BuiltinConversation>,
+    transcript: &mut Vec<u8>,
+    usage: &mut crate::backend::UsageSnapshot,
+) -> crate::error::Result<super::AgentResponse> {
+    let token = input.token.to_owned();
+    let mut observer = |_: &crate::backend::UsageSnapshot| Ok(());
+    super::run_role_with_token_provider_observed(
+        input,
+        continuation,
+        move || {
+            let token = token.clone();
+            async move { Ok(token) }
+        },
+        completed_conversation,
+        transcript,
+        usage,
+        &mut observer,
+    )
+    .await
+}
+
+fn response_with_usage(output: &Value, input: u64, output_tokens: u64) -> Value {
+    json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": output,
+            "usage": {
+                "input_tokens": input,
+                "output_tokens": output_tokens,
+                "total_tokens": input + output_tokens
+            }
+        }
+    })
+}
+
+fn start_one_response_provider(response: &Value) -> (String, thread::JoinHandle<Vec<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let body = completed_sse(response);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        let request = read_http_request(&mut stream);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write provider response");
+        vec![request]
+    });
+    (format!("http://{address}/v1/responses"), server)
+}
+
+fn provider_request_payload(request: &str) -> Value {
+    let (_, body) = request
+        .split_once("\r\n\r\n")
+        .expect("provider request body");
+    serde_json::from_str(body).expect("parse provider request body")
+}
+
+fn assert_strict_role_format(request: &str, role: PromptRole) {
+    let payload = provider_request_payload(request);
+    let format = &payload["text"]["format"];
+    assert_eq!(format["type"], "json_schema");
+    assert_eq!(format["name"], role.protocol_name());
+    assert_eq!(format["strict"], true);
+    assert_eq!(format["schema"]["type"], "object");
+    assert_eq!(format["schema"]["required"], json!(["response"]));
+    assert!(format["schema"]["properties"]["response"]["anyOf"].is_array());
+}
+
+fn assert_blocked_usage(response: &super::AgentResponse, usage: &crate::backend::UsageSnapshot) {
+    let parsed = crate::protocol::parse::<crate::protocol::ImplementationResponse>(
+        &response.response,
+        PromptRole::Implementation.protocol_name(),
+    )
+    .expect("parse blocked implementation response");
+    assert!(matches!(
+        parsed.result,
+        crate::protocol::Readiness::Blocked { .. }
+    ));
+    assert_eq!(usage.provider_request_attempts, Some(3));
+    assert_eq!(usage.completed_responses, Some(3));
+    assert_eq!(usage.executed_shell_calls, Some(2));
+    assert_eq!(
+        usage.latest_response.as_ref().and_then(|item| item.input),
+        Some(30)
+    );
+    let report = usage.format_report("implementation", "fixture-model", 0, None);
+    assert!(report.contains("∑ Observed completed-response usage: 60 in · 8 out · 68 total"));
+}
+
+#[cfg(unix)]
+#[test]
+fn multiple_tool_turns_and_blocked_handoff_preserve_role_usage_without_replay() {
+    let temporary = TempDir::new().expect("create built-in project root");
+    let marker = temporary.path().join("tool-turns");
+    let commands = [
+        format!("printf x >> '{}'", marker.display()),
+        format!("printf y >> '{}'", marker.display()),
+    ];
+    let tool_response = |call_id: &str, command: &str| {
+        response_with_usage(
+            &json!([{
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "spec_loop.shell",
+                "arguments": serde_json::to_string(&json!({"command": command}))
+                    .expect("serialize shell command")
+            }]),
+            if call_id == "first" { 10 } else { 20 },
+            2,
+        )
+    };
+    let blocked_text = r#"{"protocol_version":1,"role":"implementation","status":"blocked","summary":"No changes made; required input unavailable.","reason":"required input unavailable"}"#;
+    let responses = [
+        completed_sse(&tool_response("first", &commands[0])),
+        completed_sse(&tool_response("second", &commands[1])),
+        completed_sse(&response_with_usage(
+            &json!([{
+                "type": "message",
+                "content": [{"type": "output_text", "text": format!(r#"{{"response":{blocked_text}}}"#)}]
+            }]),
+            30,
+            4,
+        )),
+    ];
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for body in responses {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            requests.push(read_http_request(&mut stream));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write provider response");
+        }
+        requests
+    });
+    let profile = builtin_test_profile();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut transcript = Vec::new();
+    let mut conversation = None;
+    let mut usage = crate::backend::UsageSnapshot::default();
+    let result = crate::runtime::block_on(run_role_with_usage(
+        RoleInput {
+            root: temporary.path(),
+            profile: &profile,
+            prompt: "perform two deterministic tool turns",
+            role: PromptRole::Implementation,
+            cancelled: &cancelled,
+            deadline: None,
+            endpoint: &format!("http://{address}/v1/responses"),
+            token: "fixture-access-token",
+        },
+        None,
+        &mut conversation,
+        &mut transcript,
+        &mut usage,
+    ))
+    .expect("construct provider runtime")
+    .expect("receive blocked typed response");
+    assert_blocked_usage(&result, &usage);
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("read tool marker"),
+        "xy"
+    );
+    let requests = server.join().expect("join provider fixture");
+    assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_strict_role_format(request, PromptRole::Implementation);
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&transcript)
+            .matches("$ printf")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn failed_provider_response_preserves_attempt_count_without_completion_or_shell_calls() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let body = format!(
+        "{RESPONSE_STARTED}{}",
+        sse_event(
+            "response.failed",
+            &json!({
+                "type": "response.failed",
+                "response": {"status": "failed", "error": {"code": "invalid_response"}}
+            })
+        )
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept provider request");
+        let request = read_http_request(&mut stream);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write provider failure");
+        request
+    });
+    let profile = builtin_test_profile();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut transcript = Vec::new();
+    let mut conversation = None;
+    let mut usage = crate::backend::UsageSnapshot::default();
+    let result = crate::runtime::block_on(run_role_with_usage(
+        RoleInput {
+            root: Path::new("."),
+            profile: &profile,
+            prompt: "failure fixture",
+            role: PromptRole::Implementation,
+            cancelled: &cancelled,
+            deadline: None,
+            endpoint: &format!("http://{address}/v1/responses"),
+            token: "fixture-access-token",
+        },
+        None,
+        &mut conversation,
+        &mut transcript,
+        &mut usage,
+    ))
+    .expect("construct provider runtime");
+    assert!(result.is_err());
+    assert_eq!(usage.provider_request_attempts, Some(1));
+    assert_eq!(usage.completed_responses, Some(0));
+    assert_eq!(usage.executed_shell_calls, Some(0));
+    assert!(
+        server
+            .join()
+            .expect("join provider fixture")
+            .starts_with("POST ")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_timeout_and_interruption_preserve_usage_and_never_replay_tool_effects() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    for interrupted in [false, true] {
+        let temporary = TempDir::new().expect("create shell project root");
+        let marker = temporary.path().join("started");
+        let command = format!("printf x > '{}'; sleep 30", marker.display());
+        let response = response_with_usage(
+            &json!([{
+                "type": "function_call",
+                "call_id": "once",
+                "name": "spec_loop.shell",
+                "arguments": serde_json::to_string(&json!({"command": command}))
+                    .expect("serialize shell command")
+            }]),
+            8,
+            2,
+        );
+        let (endpoint, server) = start_one_response_provider(&response);
+        let profile = builtin_test_profile();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_task = if interrupted {
+            let cancellation = Arc::clone(&cancelled);
+            let marker = marker.clone();
+            Some(thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline && !marker.exists() {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let marker_started = marker.exists();
+                cancellation.store(true, Ordering::Relaxed);
+                marker_started
+            }))
+        } else {
+            None
+        };
+        let mut transcript = Vec::new();
+        let mut conversation = None;
+        let mut usage = crate::backend::UsageSnapshot::default();
+        let deadline = (!interrupted).then(|| Instant::now() + Duration::from_millis(300));
+        let result = crate::runtime::block_on(run_role_with_usage(
+            RoleInput {
+                root: temporary.path(),
+                profile: &profile,
+                prompt: "interrupted shell fixture",
+                role: PromptRole::Implementation,
+                cancelled: &cancelled,
+                deadline,
+                endpoint: &endpoint,
+                token: "fixture-access-token",
+            },
+            None,
+            &mut conversation,
+            &mut transcript,
+            &mut usage,
+        ))
+        .expect("construct provider runtime");
+        let error = result.expect_err("shell timeout/interruption must stop the role");
+        if interrupted {
+            assert!(matches!(error, crate::error::SpecLoopError::Interrupted));
+            assert!(
+                cancel_task
+                    .expect("interruption task")
+                    .join()
+                    .expect("join interruption task")
+            );
+        } else {
+            assert!(matches!(error, crate::error::SpecLoopError::Timeout(_)));
+        }
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("read started side effect"),
+            "x"
+        );
+        assert_eq!(usage.provider_request_attempts, Some(1));
+        assert_eq!(usage.completed_responses, Some(1));
+        assert_eq!(usage.executed_shell_calls, Some(1));
+        assert_eq!(
+            usage.latest_response.as_ref().and_then(|item| item.total),
+            Some(10)
+        );
+        assert_eq!(server.join().expect("join provider fixture").len(), 1);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn missing_local_direct_permission_sends_zero_responses_requests() {
@@ -213,16 +550,19 @@ fn missing_shell_fails_before_provider_request() {
 
 #[test]
 fn all_roles_map_to_their_configured_stage_family() {
-    assert_eq!(stage_for_role(PromptRole::PlanAuthor), AgentStage::Planning);
-    assert_eq!(
-        stage_for_role(PromptRole::PlanClarification),
-        AgentStage::Planning
-    );
-    assert_eq!(
-        stage_for_role(PromptRole::Implementation),
-        AgentStage::Implementation
-    );
-    assert_eq!(stage_for_role(PromptRole::ReviewAudit), AgentStage::Review);
+    let roles = [
+        (PromptRole::PlanAuthor, AgentStage::Planning),
+        (PromptRole::PlanReview, AgentStage::Planning),
+        (PromptRole::PlanAudit, AgentStage::Planning),
+        (PromptRole::PlanClarification, AgentStage::Planning),
+        (PromptRole::Implementation, AgentStage::Implementation),
+        (PromptRole::Review, AgentStage::Review),
+        (PromptRole::ReviewAudit, AgentStage::Review),
+        (PromptRole::ReviewClarification, AgentStage::Review),
+    ];
+    for (role, stage) in roles {
+        assert_eq!(role.agent_stage(), stage);
+    }
 }
 
 #[test]
@@ -281,7 +621,7 @@ fn builtin_backend_accepts_typed_responses_for_every_role_from_fake_provider() {
                     "status": "completed",
                     "output": [{
                         "type": "message",
-                        "content": [{"type": "output_text", "text": response.to_string()}]
+                        "content": [{"type": "output_text", "text": json!({"response": response}).to_string()}]
                     }]
                 }
             });
@@ -338,7 +678,7 @@ model='fixture-model'
         .expect("run role through fake provider");
         assert_eq!(result.response, response.to_string());
         assert_eq!(transcript, Vec::<u8>::default());
-        expected_prompts.push(prompt);
+        expected_prompts.push((prompt, role));
 
         match role {
             PromptRole::PlanAuthor => {
@@ -399,16 +739,79 @@ model='fixture-model'
 
     let requests = server.join().expect("join fake provider");
     assert_eq!(requests.len(), expected_prompts.len());
-    for (request, expected_prompt) in requests.iter().zip(expected_prompts) {
+    for (request, (expected_prompt, role)) in requests.iter().zip(expected_prompts) {
         let (_, payload) = request
             .split_once("\r\n\r\n")
             .expect("provider request body");
         let payload: Value = serde_json::from_str(payload).expect("parse request body");
         assert_eq!(payload["input"][0]["content"], expected_prompt);
+        assert_eq!(payload["text"]["format"]["type"], "json_schema");
+        assert_eq!(payload["text"]["format"]["name"], role.protocol_name());
+        assert_eq!(payload["text"]["format"]["strict"], true);
+        assert_eq!(payload["text"]["format"]["schema"]["type"], "object");
+        assert_eq!(
+            payload["text"]["format"]["schema"]["required"],
+            json!(["response"])
+        );
+        assert_eq!(
+            payload["text"]["format"]["schema"]["additionalProperties"],
+            false
+        );
+        assert!(payload["text"]["format"]["schema"]["properties"]["response"]["anyOf"].is_array());
         assert_eq!(payload["tools"][0]["type"], "namespace");
         assert_eq!(payload["tools"][0]["name"], "spec_loop");
         assert_eq!(payload["tools"][0]["tools"][0]["name"], "shell");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn refusal_with_shell_call_never_executes_the_call() {
+    let temporary = TempDir::new().expect("create refusal fixture project");
+    let marker = temporary.path().join("must-not-exist");
+    let response = json!({
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "refused-tool-call",
+                    "name": "spec_loop.shell",
+                    "arguments": serde_json::to_string(&json!({
+                        "command": format!("touch {}", marker.display())
+                    }))
+                    .expect("serialize refusal shell command")
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "refusal", "refusal": "private refusal text sentinel"}]
+                }
+            ]
+        }
+    });
+    let (endpoint, server) = start_one_response_provider(&response);
+    let profile = builtin_test_profile();
+    let mut transcript = Vec::new();
+    let result = crate::runtime::block_on(run_role_with_access_token(
+        RoleInput {
+            root: temporary.path(),
+            profile: &profile,
+            prompt: "perform a task",
+            role: PromptRole::Implementation,
+            cancelled: &Arc::new(AtomicBool::new(false)),
+            deadline: None,
+            endpoint: &endpoint,
+            token: "fixture-access-token",
+        },
+        &mut transcript,
+    ))
+    .expect("construct refusal test runtime");
+    let error = result.expect_err("refusal must invalidate the provider response");
+    assert!(error.to_string().contains("refused the role request"));
+    assert!(!error.to_string().contains("private refusal text sentinel"));
+    assert!(!marker.exists());
+    assert_eq!(server.join().expect("join fake provider").len(), 1);
 }
 
 #[cfg(unix)]
@@ -543,7 +946,7 @@ fn omitted_call_limit_allows_more_than_fifty_shell_calls() {
             "model": "fixture-model",
             "output": [{
                 "type": "message",
-                "content": [{"type": "output_text", "text": final_text}]
+                "content": [{"type": "output_text", "text": format!(r#"{{"response":{final_text}}}"#)}]
             }]
         }
     });
@@ -696,7 +1099,7 @@ fn configured_shell_call_limit_resets_for_each_role() {
                 "model": "fixture-model",
                 "output": [{"type": "message", "content": [{
                     "type": "output_text",
-                    "text": final_text
+                    "text": format!(r#"{{"response":{final_text}}}"#)
                 }]}]
             }
         });
@@ -800,7 +1203,7 @@ fn token_refresh_responses() -> [String; 2] {
                 "type": "message",
                 "content": [{
                     "type": "output_text",
-                    "text": "final after fresh token"
+                    "text": r#"{"response":{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Refreshed request completed."}}"#
                 }]
             }]
         }
@@ -864,7 +1267,10 @@ fn resolves_access_token_again_after_shell_tool_before_followup_request() {
     .expect("construct runtime")
     .expect("run role with refreshed request credentials");
 
-    assert_eq!(result.response, "final after fresh token");
+    assert_eq!(
+        result.response,
+        r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Refreshed request completed."}"#
+    );
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     assert_eq!(
         std::fs::read_to_string(temporary.path().join("shell-invocations"))
@@ -1003,7 +1409,7 @@ fn transient_followup_retry_reuses_completed_shell_tool_result() {
                 "type": "message",
                 "content": [{
                     "type": "output_text",
-                    "text": r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Retried follow-up without replay."}"#
+                    "text": r#"{"response":{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Retried follow-up without replay."}}"#
                 }]
             }]
         }
@@ -1071,6 +1477,9 @@ model='fixture-model'
 
     let requests = server.join().expect("join fake provider");
     assert_eq!(requests.len(), 3);
+    for request in &requests {
+        assert_strict_role_format(request, PromptRole::Implementation);
+    }
     let parse_body = |request: &str| {
         let (_, body) = request
             .split_once("\r\n\r\n")
@@ -1099,43 +1508,36 @@ fn start_malformed_typed_response_provider(
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
-    let tool_response = json!({
-        "type": "response.completed",
-        "response": {
-            "status": "completed",
-            "output": [{
-                "type": "function_call",
-                "call_id": "typed-call-once",
-                "name": "spec_loop.shell",
-                "arguments": serde_json::to_string(&json!({"command": command}))
-                    .expect("serialize shell command")
+    let tool_response = response_with_usage(
+        &json!([{
+            "type": "function_call",
+            "call_id": "typed-call-once",
+            "name": "spec_loop.shell",
+            "arguments": serde_json::to_string(&json!({"command": command}))
+                .expect("serialize shell command")
+        }]),
+        10,
+        2,
+    );
+    let malformed_response = response_with_usage(
+        &json!([{
+            "type": "message",
+            "content": [{"type": "output_text", "text": r#"{"response":{"unexpected":"typed schema failure"}}"#}]
+        }]),
+        11,
+        3,
+    );
+    let corrected_response = response_with_usage(
+        &json!([{
+            "type": "message",
+            "content": [{
+                "type": "output_text",
+                "text": r#"{"response":{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Corrected handoff only."}}"#
             }]
-        }
-    });
-    let malformed_response = json!({
-        "type": "response.completed",
-        "response": {
-            "status": "completed",
-            "output": [{
-                "type": "message",
-                "content": [{"type": "output_text", "text": "not valid typed JSON"}]
-            }]
-        }
-    });
-    let corrected_response = json!({
-        "type": "response.completed",
-        "response": {
-            "status": "completed",
-            "model": "fixture-model",
-            "output": [{
-                "type": "message",
-                "content": [{
-                    "type": "output_text",
-                    "text": r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Corrected handoff only."}"#
-                }]
-            }]
-        }
-    });
+        }]),
+        12,
+        4,
+    );
     let provider_responses = [
         completed_sse(&tool_response),
         completed_sse(&malformed_response),
@@ -1159,6 +1561,31 @@ fn start_malformed_typed_response_provider(
     (format!("http://{address}/v1/responses"), server)
 }
 
+fn assert_correction_usage(
+    initial: &crate::backend::UsageSnapshot,
+    correction: &crate::backend::UsageSnapshot,
+) {
+    assert_eq!(initial.provider_request_attempts, Some(2));
+    assert_eq!(initial.completed_responses, Some(2));
+    assert_eq!(initial.executed_shell_calls, Some(1));
+    assert_eq!(correction.provider_request_attempts, Some(1));
+    assert_eq!(correction.completed_responses, Some(1));
+    assert_eq!(correction.executed_shell_calls, Some(0));
+    let cumulative = initial.merged(correction);
+    assert_eq!(cumulative.provider_request_attempts, Some(3));
+    assert_eq!(cumulative.completed_responses, Some(3));
+    assert_eq!(cumulative.executed_shell_calls, Some(1));
+    assert_eq!(
+        cumulative
+            .latest_response
+            .as_ref()
+            .and_then(|usage| usage.total),
+        Some(16)
+    );
+    let report = cumulative.format_report("implementation", "fixture-model", 0, None);
+    assert!(report.contains("∑ Observed completed-response usage: 33 in · 9 out · 42 total"));
+}
+
 #[cfg(unix)]
 #[test]
 fn malformed_typed_response_correction_reuses_completed_shell_state() {
@@ -1170,7 +1597,8 @@ fn malformed_typed_response_correction_reuses_completed_shell_state() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut transcript = Vec::new();
     let mut conversation = None;
-    let malformed = crate::runtime::block_on(run_role_with_continuation(
+    let mut initial_usage = crate::backend::UsageSnapshot::default();
+    let malformed = crate::runtime::block_on(run_role_with_usage(
         RoleInput {
             root: temporary.path(),
             profile: &profile,
@@ -1184,14 +1612,19 @@ fn malformed_typed_response_correction_reuses_completed_shell_state() {
         None,
         &mut conversation,
         &mut transcript,
+        &mut initial_usage,
     ))
     .expect("construct initial runtime")
     .expect("receive malformed final text");
-    assert_eq!(malformed.response, "not valid typed JSON");
+    assert_eq!(
+        malformed.response,
+        r#"{"unexpected":"typed schema failure"}"#
+    );
     let conversation = conversation.expect("retain completed conversation for correction");
 
     let mut corrected_conversation = None;
-    let corrected = crate::runtime::block_on(run_role_with_continuation(
+    let mut correction_usage = crate::backend::UsageSnapshot::default();
+    let corrected = crate::runtime::block_on(run_role_with_usage(
         RoleInput {
             root: temporary.path(),
             profile: &profile,
@@ -1205,6 +1638,7 @@ fn malformed_typed_response_correction_reuses_completed_shell_state() {
         Some(conversation),
         &mut corrected_conversation,
         &mut transcript,
+        &mut correction_usage,
     ))
     .expect("construct correction runtime")
     .expect("receive corrected final text");
@@ -1213,16 +1647,17 @@ fn malformed_typed_response_correction_reuses_completed_shell_state() {
         std::fs::read_to_string(marker).expect("read shell side effect"),
         "x"
     );
+    assert_correction_usage(&initial_usage, &correction_usage);
 
     let requests = server.join().expect("join fake provider");
     assert_eq!(requests.len(), 3);
     let bodies = requests
         .iter()
-        .map(|request| {
-            let (_, body) = request.split_once("\r\n\r\n").expect("request body");
-            serde_json::from_str::<Value>(body).expect("parse provider request")
-        })
+        .map(|request| provider_request_payload(request))
         .collect::<Vec<_>>();
+    for request in &requests {
+        assert_strict_role_format(request, PromptRole::Implementation);
+    }
     assert_eq!(
         bodies[0]["input"][0]["content"],
         "original implementation task"
@@ -1231,7 +1666,7 @@ fn malformed_typed_response_correction_reuses_completed_shell_state() {
     assert!(
         bodies[2]["input"][3]
             .to_string()
-            .contains("not valid typed JSON")
+            .contains("typed schema failure")
     );
     assert!(
         bodies[2]["input"][2]["output"]
@@ -1239,6 +1674,8 @@ fn malformed_typed_response_correction_reuses_completed_shell_state() {
             .is_some_and(|text| text.contains("exit_status=0"))
     );
     assert_eq!(bodies[2]["tool_choice"], "none");
+    assert_eq!(bodies[2]["text"]["format"]["strict"], true);
+    assert_eq!(bodies[2]["text"]["format"]["name"], "implementation");
     assert_eq!(
         bodies[2]["input"][4]["content"],
         "Correct malformed typed response only; do not invoke tools."

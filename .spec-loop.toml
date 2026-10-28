@@ -21,6 +21,7 @@ argv = ["make", "check"]
 [agent]
 backend = "builtin"
 model = "gpt-6-luna"
+context_window_tokens = 1_050_000
 thinking = "xhigh"
 max_tool_calls = 500
 

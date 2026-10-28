@@ -261,3 +261,115 @@ fn minimal_profile_defaults_review_context_and_empty_actions() {
     assert_eq!(profile.review.context.argv, ["git", "diff"]);
     assert!(profile.actions.on_finish.is_empty());
 }
+
+#[test]
+fn context_window_limits_must_be_positive_and_builtin_only() {
+    for (section, field, expected) in [
+        ("", "context_window_tokens", "agent.context_window_tokens"),
+        (
+            "[agent.stages.planning]\n",
+            "context_window_tokens",
+            "agent.stages.planning.context_window_tokens",
+        ),
+        (
+            "[agent.stages.implementation]\n",
+            "context_window_tokens",
+            "agent.stages.implementation.context_window_tokens",
+        ),
+        (
+            "[agent.stages.review]\n",
+            "context_window_tokens",
+            "agent.stages.review.context_window_tokens",
+        ),
+    ] {
+        let profile: Profile = toml::from_str(&format!(
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'model-name'\n{section}{field} = 0\n"
+        ))
+        .expect("parse zero context limit");
+        let error = profile
+            .validate()
+            .expect_err("zero context limit must fail");
+        assert!(error.to_string().contains(expected));
+        assert!(error.to_string().contains("must be positive"));
+
+        let pi_profile: Profile = toml::from_str(&format!(
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = 'pi'\n{section}{field} = 100\n"
+        ))
+        .expect("parse Pi context limit");
+        let error = pi_profile
+            .validate()
+            .expect_err("Pi must reject context limits");
+        assert!(error.to_string().contains(expected));
+        assert!(
+            error
+                .to_string()
+                .contains("only valid for the built-in backend")
+        );
+    }
+}
+
+#[test]
+fn context_window_limit_follows_stage_model_inheritance() {
+    let inherited: Profile = toml::from_str(
+        "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'global-model'\ncontext_window_tokens = 1000\n",
+    )
+    .expect("parse inherited-model limits");
+    inherited.validate().expect("valid inherited-model limits");
+    for stage in [
+        AgentStage::Planning,
+        AgentStage::Implementation,
+        AgentStage::Review,
+    ] {
+        assert_eq!(inherited.agent.context_window_tokens_for(stage), Some(1000));
+    }
+
+    let stage_limit: Profile = toml::from_str(
+        "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'global-model'\ncontext_window_tokens = 1000\n[agent.stages.review]\ncontext_window_tokens = 750\n",
+    )
+    .expect("parse stage limit");
+    stage_limit.validate().expect("valid stage limit");
+    assert_eq!(
+        stage_limit
+            .agent
+            .context_window_tokens_for(AgentStage::Review),
+        Some(750)
+    );
+
+    let overridden_model: Profile = toml::from_str(
+        "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'global-model'\ncontext_window_tokens = 1000\n[agent.stages.implementation]\nmodel = 'stage-model'\n",
+    )
+    .expect("parse stage model override");
+    overridden_model
+        .validate()
+        .expect("valid stage model override");
+    assert_eq!(
+        overridden_model
+            .agent
+            .context_window_tokens_for(AgentStage::Implementation),
+        None
+    );
+
+    let override_with_limit: Profile = toml::from_str(
+        "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'global-model'\ncontext_window_tokens = 1000\n[agent.stages.planning]\nmodel = 'stage-model'\ncontext_window_tokens = 500\n",
+    )
+    .expect("parse overridden model with explicit stage limit");
+    override_with_limit
+        .validate()
+        .expect("valid overridden model limit");
+    assert_eq!(
+        override_with_limit
+            .agent
+            .context_window_tokens_for(AgentStage::Planning),
+        Some(500)
+    );
+
+    let no_limit: Profile = toml::from_str(
+        "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nmodel = 'global-model'\n",
+    )
+    .expect("parse absent context limit");
+    no_limit.validate().expect("valid absent limit");
+    assert_eq!(
+        no_limit.agent.context_window_tokens_for(AgentStage::Review),
+        None
+    );
+}

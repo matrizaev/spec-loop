@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::Write;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -424,4 +425,68 @@ fn shell_cancellation_stops_active_process() {
     assert!(log.contains("$ printf interrupted-output; sleep 30"));
     assert!(log.contains("termination=interrupted"));
     assert!(log.contains("stdout:\ninterrupted-output"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_usage_counts_each_successfully_spawned_call() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use super::super::BuiltinConversation;
+    use super::{ShellCall, ShellExecutionContext, execute_shell_calls};
+    use crate::backend::UsageSnapshot;
+    use crate::backend::builtin::tests::builtin_test_profile;
+    use crate::backend::builtin::usage::UsageReporter;
+
+    let temporary = TempDir::new().expect("create shell usage fixture");
+    let profile = builtin_test_profile();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut conversation = BuiltinConversation {
+        input: Vec::new(),
+        tool_calls: None,
+    };
+    let calls = vec![
+        ShellCall {
+            call_id: "first".to_owned(),
+            command: "printf first > first-call".to_owned(),
+        },
+        ShellCall {
+            call_id: "second".to_owned(),
+            command: "printf second > second-call".to_owned(),
+        },
+    ];
+    let mut transcript = Vec::new();
+    let mut usage = UsageSnapshot::default();
+    let mut live = Vec::new();
+    {
+        let mut observer = |snapshot: &UsageSnapshot| {
+            live.push(snapshot.executed_shell_calls);
+            Ok(())
+        };
+        let mut reporter = UsageReporter::new(&mut usage, &mut observer);
+        execute_shell_calls(
+            ShellExecutionContext {
+                root: temporary.path(),
+                profile: &profile,
+                deadline: None,
+                cancelled: &cancelled,
+                conversation: &mut conversation,
+                transcript: &mut transcript,
+            },
+            calls,
+            &mut reporter,
+        )
+        .expect("execute observed shell calls");
+    }
+    assert_eq!(usage.executed_shell_calls, Some(2));
+    assert_eq!(live, [Some(1), Some(2)]);
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("first-call")).expect("read first"),
+        "first"
+    );
+    assert_eq!(
+        fs::read_to_string(temporary.path().join("second-call")).expect("read second"),
+        "second"
+    );
 }

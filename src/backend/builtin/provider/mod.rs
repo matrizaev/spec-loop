@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::backend::builtin::usage::UsageReporter;
+#[cfg(test)]
+use crate::backend::builtin::usage::UsageSnapshot;
 use crate::error::{Result, SpecLoopError};
 
 #[cfg(test)]
@@ -13,6 +16,7 @@ const MAX_PROVIDER_RETRIES: u8 = 3;
 const MAX_RETRY_DELAY_SECONDS: u64 = 30;
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+#[cfg(test)]
 pub(super) async fn request_with_retries(
     client: &reqwest::Client,
     endpoint: &str,
@@ -21,17 +25,45 @@ pub(super) async fn request_with_retries(
     deadline: Option<Instant>,
     cancelled: &AtomicBool,
 ) -> Result<Value> {
+    let mut snapshot = UsageSnapshot::default();
+    let mut observer = |_: &UsageSnapshot| Ok(());
+    let mut reporter = UsageReporter::new(&mut snapshot, &mut observer);
+    request_with_observations(
+        client,
+        endpoint,
+        token,
+        body,
+        deadline,
+        cancelled,
+        &mut reporter,
+    )
+    .await
+}
+
+pub(super) async fn request_with_observations(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    body: &Value,
+    deadline: Option<Instant>,
+    cancelled: &AtomicBool,
+    reporter: &mut UsageReporter<'_>,
+) -> Result<Value> {
     let mut retry_count = 0_u8;
     loop {
         ensure_active(deadline, cancelled)?;
         let request = client.post(endpoint).bearer_auth(token).json(body).send();
-        let response = match await_limited(request, deadline, cancelled).await? {
+        let send = async {
+            reporter.snapshot.request_sent();
+            reporter.report()?;
+            Ok::<_, SpecLoopError>(request.await)
+        };
+        let response_result = await_limited(send, deadline, cancelled).await??;
+        let response = match response_result {
             Ok(response) => response,
             Err(_) if retry_count < MAX_PROVIDER_RETRIES => {
                 wait_before_retry(retry_count, None, deadline, cancelled).await?;
-                retry_count = retry_count.checked_add(1).ok_or_else(|| {
-                    SpecLoopError::Workflow("provider retry counter overflowed".to_owned())
-                })?;
+                retry_count = advance_retry_counter(retry_count)?;
                 continue;
             }
             Err(_) => {
@@ -47,16 +79,14 @@ pub(super) async fn request_with_retries(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         if status.is_success() {
-            match read_streamed_response(response, deadline, cancelled).await {
+            match read_streamed_response(response, deadline, cancelled, reporter).await {
                 Ok(completed) => return Ok(completed),
                 Err(StreamFailure::Network | StreamFailure::RetryableProvider)
                     if retry_count < MAX_PROVIDER_RETRIES =>
                 {
                     wait_before_retry(retry_count, retry_after.as_deref(), deadline, cancelled)
                         .await?;
-                    retry_count = retry_count.checked_add(1).ok_or_else(|| {
-                        SpecLoopError::Workflow("provider retry counter overflowed".to_owned())
-                    })?;
+                    retry_count = advance_retry_counter(retry_count)?;
                     continue;
                 }
                 Err(StreamFailure::Network | StreamFailure::RetryableProvider) => {
@@ -71,9 +101,7 @@ pub(super) async fn request_with_retries(
             Ok(bytes) => bytes,
             Err(_) if retry_count < MAX_PROVIDER_RETRIES => {
                 wait_before_retry(retry_count, None, deadline, cancelled).await?;
-                retry_count = retry_count.checked_add(1).ok_or_else(|| {
-                    SpecLoopError::Workflow("provider retry counter overflowed".to_owned())
-                })?;
+                retry_count = advance_retry_counter(retry_count)?;
                 continue;
             }
             Err(_) => {
@@ -95,9 +123,7 @@ pub(super) async fn request_with_retries(
             }
             if retry_count < MAX_PROVIDER_RETRIES {
                 wait_before_retry(retry_count, retry_after.as_deref(), deadline, cancelled).await?;
-                retry_count = retry_count.checked_add(1).ok_or_else(|| {
-                    SpecLoopError::Workflow("provider retry counter overflowed".to_owned())
-                })?;
+                retry_count = advance_retry_counter(retry_count)?;
                 continue;
             }
             return Err(SpecLoopError::Workflow(format!(
@@ -113,6 +139,12 @@ pub(super) async fn request_with_retries(
     }
 }
 
+fn advance_retry_counter(retry_count: u8) -> Result<u8> {
+    retry_count
+        .checked_add(1)
+        .ok_or_else(|| SpecLoopError::Workflow("provider retry counter overflowed".to_owned()))
+}
+
 pub(super) enum StreamFailure {
     Network,
     RetryableProvider,
@@ -123,6 +155,7 @@ async fn read_streamed_response(
     mut response: reqwest::Response,
     deadline: Option<Instant>,
     cancelled: &AtomicBool,
+    reporter: &mut UsageReporter<'_>,
 ) -> std::result::Result<Value, StreamFailure> {
     let mut pending = Vec::new();
     let mut state = SseState::default();
@@ -149,7 +182,7 @@ async fn read_streamed_response(
                     "OpenAI Responses stream contains invalid UTF-8: {error}"
                 )))
             })?;
-            state.accept_line(&line)?;
+            state.accept_line(&line, reporter)?;
         }
         if state.completed.is_some() {
             if !pending.is_empty() || !state.is_event_empty() {
@@ -195,9 +228,13 @@ pub(super) enum ResponseLifecycle {
 }
 
 impl SseState {
-    fn accept_line(&mut self, line: &str) -> std::result::Result<(), StreamFailure> {
+    fn accept_line(
+        &mut self,
+        line: &str,
+        reporter: &mut UsageReporter<'_>,
+    ) -> std::result::Result<(), StreamFailure> {
         if line.is_empty() {
-            return self.finish_event();
+            return self.finish_event(reporter);
         }
         if let Some(data) = line.strip_prefix("data:") {
             if !self.data.is_empty() {
@@ -215,7 +252,10 @@ impl SseState {
         Ok(())
     }
 
-    fn finish_event(&mut self) -> std::result::Result<(), StreamFailure> {
+    fn finish_event(
+        &mut self,
+        reporter: &mut UsageReporter<'_>,
+    ) -> std::result::Result<(), StreamFailure> {
         if self.data.is_empty() && self.event_name.is_none() {
             return Ok(());
         }
@@ -248,16 +288,29 @@ impl SseState {
                 "OpenAI Responses stream event name disagrees with its payload".to_owned(),
             )));
         }
-        self.accept_event(&event_type, &event)?;
+        self.accept_event_observed(&event_type, &event, reporter)?;
         self.event_name = None;
         self.data.clear();
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn accept_event(
         &mut self,
         event_type: &str,
         event: &Value,
+    ) -> std::result::Result<(), StreamFailure> {
+        let mut snapshot = UsageSnapshot::default();
+        let mut observer = |_: &UsageSnapshot| Ok(());
+        let mut reporter = UsageReporter::new(&mut snapshot, &mut observer);
+        self.accept_event_observed(event_type, event, &mut reporter)
+    }
+
+    fn accept_event_observed(
+        &mut self,
+        event_type: &str,
+        event: &Value,
+        reporter: &mut UsageReporter<'_>,
     ) -> std::result::Result<(), StreamFailure> {
         match event_type {
             "error" => {
@@ -319,7 +372,7 @@ impl SseState {
                     "OpenAI Responses stream reported a provider failure".to_owned(),
                 )))
             }
-            "response.completed" => self.accept_completed_event(event_type, event),
+            "response.completed" => self.accept_completed_event(event_type, event, reporter),
             "response.output_item.done" => {
                 if !matches!(self.lifecycle, ResponseLifecycle::InProgress) {
                     return Err(invalid_event_order(event_type));
@@ -348,6 +401,7 @@ impl SseState {
         &mut self,
         event_type: &str,
         event: &Value,
+        reporter: &mut UsageReporter<'_>,
     ) -> std::result::Result<(), StreamFailure> {
         if !matches!(self.lifecycle, ResponseLifecycle::InProgress) {
             return Err(invalid_event_order(event_type));
@@ -362,6 +416,8 @@ impl SseState {
                 "response.completed event did not contain a settled response".to_owned(),
             )));
         }
+        reporter.snapshot.response_completed(&response);
+        reporter.report().map_err(StreamFailure::Fatal)?;
         let output = response
             .get_mut("output")
             .and_then(Value::as_array_mut)

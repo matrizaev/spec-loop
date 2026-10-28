@@ -27,9 +27,15 @@ pub enum ColorMode {
 /// Sanitizes and presents workflow output using one resolved stream color policy.
 #[derive(Clone, Debug)]
 pub struct Output {
-    stdout_color: bool,
+    stdout: StdoutPolicy,
     stderr_color: bool,
     verbose: bool,
+}
+
+#[derive(Clone, Debug)]
+struct StdoutPolicy {
+    color: bool,
+    rewrite_progress: bool,
 }
 
 impl Output {
@@ -61,7 +67,10 @@ impl Output {
             ColorMode::Never => false,
         };
         Self {
-            stdout_color: enabled(stdout_terminal),
+            stdout: StdoutPolicy {
+                color: enabled(stdout_terminal),
+                rewrite_progress: stdout_terminal && term != Some(std::ffi::OsStr::new("dumb")),
+            },
             stderr_color: enabled(stderr_terminal),
             verbose,
         }
@@ -70,7 +79,10 @@ impl Output {
     /// Creates a formatter that emits plain text without ANSI styling.
     pub const fn plain() -> Self {
         Self {
-            stdout_color: false,
+            stdout: StdoutPolicy {
+                color: false,
+                rewrite_progress: false,
+            },
             stderr_color: false,
             verbose: false,
         }
@@ -79,7 +91,7 @@ impl Output {
     /// Sanitizes and writes human-readable text to stdout.
     pub fn stdout(&self, text: &str) -> Result<()> {
         let rendered = sanitize(text);
-        let styled = style_status(&rendered, self.stdout_color);
+        let styled = style_status(&rendered, self.stdout.color);
         write_stdout(&styled)
     }
 
@@ -99,14 +111,22 @@ impl Output {
         self.stdout(&format!("{text}\n"))
     }
 
+    /// Creates a role-scoped usage reporter that refreshes its terminal block in place.
+    pub const fn usage_progress(&self) -> UsageProgress<'_> {
+        UsageProgress {
+            output: self,
+            state: UsageProgressState::Initial,
+        }
+    }
+
     /// Writes a cyan stage heading and dimmed secondary lines.
     pub fn stage(&self, text: &str) -> Result<()> {
-        write_stdout(&render_stage(text, self.stdout_color))
+        write_stdout(&render_stage(text, self.stdout.color))
     }
 
     /// Writes indented, dimmed secondary metadata to stdout.
     pub fn metadata(&self, text: &str) -> Result<()> {
-        write_stdout(&render_metadata(text, self.stdout_color))
+        write_stdout(&render_metadata(text, self.stdout.color))
     }
 
     /// Presents a validated typed response in concise or verbose structured form.
@@ -115,10 +135,10 @@ impl Output {
         let mut lines = rendered.split_inclusive('\n');
         let mut styled = String::new();
         if let Some(heading) = lines.next() {
-            styled.push_str(&style(heading, "\x1b[1;36m", self.stdout_color));
+            styled.push_str(&style(heading, "\x1b[1;36m", self.stdout.color));
         }
         for line in lines {
-            styled.push_str(&style_status(line, self.stdout_color));
+            styled.push_str(&style_status(line, self.stdout.color));
         }
         write_stdout(&styled)
     }
@@ -126,6 +146,68 @@ impl Output {
     /// Returns a sanitized text preview bounded by Unicode scalar count.
     pub fn display_text(text: &str, limit: usize) -> String {
         preview(text, limit)
+    }
+}
+
+/// Holds terminal rewrite state for one role's repeated usage reports.
+pub struct UsageProgress<'a> {
+    output: &'a Output,
+    state: UsageProgressState,
+}
+
+#[derive(Clone, Copy)]
+enum UsageProgressState {
+    Initial,
+    AppendOnly,
+    Replace { lines: usize },
+}
+
+impl UsageProgress<'_> {
+    /// Sanitizes and writes a report, replacing prior role output only on capable terminals.
+    pub fn report(&mut self, text: &str) -> Result<()> {
+        let rendered = style_status(&sanitize(text), self.output.stdout.color);
+        let (rendered, state) =
+            render_usage_report(&rendered, self.state, self.output.stdout.rewrite_progress);
+        write_stdout(&rendered)?;
+        self.state = state;
+        Ok(())
+    }
+}
+
+fn render_usage_report(
+    text: &str,
+    state: UsageProgressState,
+    rewrite: bool,
+) -> (String, UsageProgressState) {
+    match state {
+        UsageProgressState::Initial if rewrite => (
+            format!("{text}\n"),
+            UsageProgressState::Replace {
+                lines: text.split('\n').count(),
+            },
+        ),
+        UsageProgressState::Initial | UsageProgressState::AppendOnly => {
+            (format!("{text}\n"), UsageProgressState::AppendOnly)
+        }
+        UsageProgressState::Replace { lines } => {
+            let new_lines = text.split('\n').count();
+            let visible_lines = lines.max(new_lines);
+            let mut rendered = format!("\x1b[{lines}A");
+            let mut report_lines = text.split('\n');
+            for _ in 0..visible_lines {
+                rendered.push_str("\r\x1b[2K");
+                if let Some(line) = report_lines.next() {
+                    rendered.push_str(line);
+                }
+                rendered.push('\n');
+            }
+            (
+                rendered,
+                UsageProgressState::Replace {
+                    lines: visible_lines,
+                },
+            )
+        }
     }
 }
 

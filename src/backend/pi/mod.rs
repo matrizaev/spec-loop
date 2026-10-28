@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::{AgentBackend, AgentInvocation, AgentResponse, AgentRun, BackendFailure};
 use crate::commands::{ProcessTermination, run_process, status_success};
-use crate::config::{AgentConfig, AgentStage, Profile};
+use crate::config::{AgentConfig, Profile};
 use crate::error::{Result, SpecLoopError, io_error};
 use crate::output::Output;
 use crate::paths;
@@ -93,6 +93,7 @@ fn run_agent(
         continuation: None,
         stdout: output.stdout,
         stderr: output.stderr,
+        usage: None,
     })
 }
 
@@ -112,16 +113,7 @@ fn display_arguments(args: &[String]) -> Vec<&str> {
 }
 
 fn arguments(agent: &AgentConfig, role: PromptRole, prompt: &str) -> Vec<String> {
-    let stage = match role {
-        PromptRole::PlanAuthor
-        | PromptRole::PlanReview
-        | PromptRole::PlanAudit
-        | PromptRole::PlanClarification => AgentStage::Planning,
-        PromptRole::Implementation => AgentStage::Implementation,
-        PromptRole::Review | PromptRole::ReviewAudit | PromptRole::ReviewClarification => {
-            AgentStage::Review
-        }
-    };
+    let stage = role.agent_stage();
     let mut args = vec![
         "--no-session".to_owned(),
         "--mode".to_owned(),

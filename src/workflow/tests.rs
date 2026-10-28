@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
+use serde_json::json;
 use tempfile::TempDir;
 
 use super::execution::{display_output_excerpt, output_excerpt};
@@ -11,7 +12,9 @@ use super::{
     CandidateFiles, ImplementationEntry, archive_destination, run_at, validate_action_executables,
     validate_check_executables,
 };
-use crate::backend::{AgentBackend, AgentResponse, AgentRun, BackendContinuation, BackendFailure};
+use crate::backend::{
+    AgentBackend, AgentResponse, AgentRun, BackendContinuation, BackendFailure, UsageSnapshot,
+};
 use crate::config::Profile;
 use crate::error::{Result, SpecLoopError};
 use crate::paths::is_executable_file;
@@ -53,6 +56,7 @@ impl AgentBackend for FakeBuiltinBackend {
             continuation: None,
             stdout: b"fake built-in provider transcript".to_vec(),
             stderr: Vec::new(),
+            usage: None,
         })
     }
 }
@@ -65,6 +69,129 @@ struct FatalToolLimitBackend {
 struct CorrectionContinuationBackend {
     calls: Arc<Mutex<Vec<(PromptRole, String, bool)>>>,
     implementation_calls: Mutex<usize>,
+}
+
+type ScopedUsageBaseline = (String, PromptRole, Option<u64>, Option<u64>, Option<u64>);
+type ScopedUsageBaselines = Arc<Mutex<Vec<ScopedUsageBaseline>>>;
+
+struct ScopedUsageBackend {
+    baselines: ScopedUsageBaselines,
+    first_implementation: Mutex<bool>,
+}
+
+impl ScopedUsageBackend {
+    fn run_fixture(
+        &self,
+        prompt: &str,
+        role: PromptRole,
+        continuation: Option<BackendContinuation>,
+        baseline: &UsageSnapshot,
+    ) -> Result<AgentRun> {
+        let spec_id = if continuation.is_some() || prompt.contains("specs/001.md") {
+            "001"
+        } else {
+            "002"
+        };
+        self.baselines
+            .lock()
+            .expect("lock scoped usage baselines")
+            .push((
+                spec_id.to_owned(),
+                role,
+                baseline.provider_request_attempts,
+                baseline.completed_responses,
+                baseline.executed_shell_calls,
+            ));
+        let correction = continuation.is_some();
+        if let Some(state) = continuation {
+            assert_eq!(state.into_state::<u8>()?, 23);
+        }
+        let malformed_first_response =
+            if role == PromptRole::Implementation && spec_id == "001" && !correction {
+                let mut first = self
+                    .first_implementation
+                    .lock()
+                    .expect("lock first implementation flag");
+                if *first {
+                    false
+                } else {
+                    *first = true;
+                    true
+                }
+            } else {
+                false
+            };
+        let response = match (role, correction, malformed_first_response) {
+            (PromptRole::Implementation, true, _) => {
+                r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Corrected fixture response."}"#
+            }
+            (PromptRole::Implementation, false, true) => {
+                r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"invalid","extra":true}"#
+            }
+            (PromptRole::Implementation, false, false) => {
+                r#"{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Fixture implementation."}"#
+            }
+            (PromptRole::Review, false, _) => {
+                r#"{"protocol_version":1,"role":"review","status":"no_issues","findings":[]}"#
+            }
+            _ => panic!("unexpected scoped-usage backend role {role:?}"),
+        };
+        let mut usage = fixture_usage_delta();
+        if malformed_first_response {
+            usage.shell_spawned();
+        }
+        Ok(AgentRun {
+            outcome: Ok(AgentResponse {
+                response: response.to_owned(),
+                selected_model: Some("fixture-model".to_owned()),
+                response_model: None,
+            }),
+            continuation: malformed_first_response.then(|| BackendContinuation::new(23_u8)),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            usage: Some(usage),
+        })
+    }
+}
+
+impl AgentBackend for ScopedUsageBackend {
+    fn run(
+        &self,
+        _root: &Path,
+        _profile: &Profile,
+        prompt: &str,
+        role: PromptRole,
+        _cancelled: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<AgentRun> {
+        let baseline = UsageSnapshot::default();
+        self.run_fixture(prompt, role, None, &baseline)
+    }
+
+    fn run_with_continuation(
+        &self,
+        _root: &Path,
+        _profile: &Profile,
+        prompt: &str,
+        role: PromptRole,
+        _cancelled: &Arc<std::sync::atomic::AtomicBool>,
+        invocation: crate::backend::AgentInvocation<'_>,
+    ) -> Result<AgentRun> {
+        let crate::backend::AgentInvocation {
+            continuation,
+            usage_baseline,
+            ..
+        } = invocation;
+        self.run_fixture(prompt, role, continuation, &usage_baseline)
+    }
+}
+
+fn fixture_usage_delta() -> UsageSnapshot {
+    let mut usage = UsageSnapshot::default();
+    usage.request_sent();
+    usage.response_completed(&json!({
+        "usage": {"input_tokens": 120, "output_tokens": 35, "total_tokens": 155}
+    }));
+    usage
 }
 
 impl AgentBackend for CorrectionContinuationBackend {
@@ -117,6 +244,7 @@ impl AgentBackend for CorrectionContinuationBackend {
             continuation,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            usage: Some(fixture_usage_delta()),
         })
     }
 
@@ -129,6 +257,24 @@ impl AgentBackend for CorrectionContinuationBackend {
         cancelled: &Arc<std::sync::atomic::AtomicBool>,
         invocation: crate::backend::AgentInvocation<'_>,
     ) -> Result<AgentRun> {
+        match role {
+            PromptRole::Implementation if invocation.continuation.is_some() => {
+                assert_eq!(invocation.usage_baseline.provider_request_attempts, Some(1));
+                assert_eq!(invocation.usage_baseline.completed_responses, Some(1));
+                let report = invocation.usage_baseline.format_report(
+                    "implementation",
+                    "fixture-model",
+                    0,
+                    None,
+                );
+                assert!(report.contains("∑ Observed completed-response usage: 120 in"));
+            }
+            PromptRole::Implementation | PromptRole::Review => {
+                assert_eq!(invocation.usage_baseline.provider_request_attempts, Some(0));
+                assert_eq!(invocation.usage_baseline.completed_responses, Some(0));
+            }
+            _ => {}
+        }
         if let Some(continuation) = invocation.continuation {
             assert_eq!(
                 continuation.into_state::<u8>().expect("continuation state"),
@@ -147,6 +293,7 @@ impl AgentBackend for CorrectionContinuationBackend {
                     continuation: None,
                     stdout: Vec::new(),
                     stderr: Vec::new(),
+                    usage: Some(fixture_usage_delta()),
                 });
         }
         self.run(root, profile, prompt, role, cancelled)
@@ -174,6 +321,7 @@ impl AgentBackend for FatalToolLimitBackend {
             continuation: None,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            usage: None,
         })
     }
 }
@@ -262,11 +410,121 @@ fn builtin_typed_correction_uses_continuation_and_correction_only_prompt() {
             .contains("Typed final response failed validation")
     );
     assert!(calls[1].1.contains("do not invoke tools"));
-    assert!(!calls[1].1.contains("Implement only selected spec"));
+    assert!(calls[1].1.contains("Implement only selected spec"));
+    let initial_instructions = calls[0]
+        .1
+        .split("\n\nWorkflow constraints:")
+        .next()
+        .expect("initial role instructions");
+    let correction_instructions = calls[1]
+        .1
+        .split("\n\nWorkflow constraints:")
+        .next()
+        .expect("correction role instructions");
+    assert_eq!(initial_instructions, correction_instructions);
+    let schema_section = |prompt: &str| {
+        prompt
+            .split("--- Generated response schema ---\n")
+            .nth(1)
+            .and_then(|schema| {
+                schema
+                    .split("\n--- End generated response schema ---")
+                    .next()
+            })
+            .expect("canonical role schema section")
+            .to_owned()
+    };
+    assert_eq!(schema_section(&calls[0].1), schema_section(&calls[1].1));
     assert_eq!(calls[2].0, PromptRole::Review);
     drop(calls);
     fs::remove_dir_all(run_dir_observer.expect("workflow log path"))
         .expect("remove correction workflow logs");
+}
+
+#[test]
+fn workflow_usage_isolated_by_spec_and_role_across_correction_continuation() {
+    let (_temporary, root) = builtin_workflow_fixture();
+    fs::write(
+        root.join("specs/002.md"),
+        "# Second selected specification\n",
+    )
+    .expect("write second spec");
+    fs::write(
+        root.join(".spec-loop/plans/002.md"),
+        "# Second approved plan\n",
+    )
+    .expect("write second plan");
+    let cli = crate::cli::Cli::try_parse_from(["spec-loop", "--continue", "--spec", "001"])
+        .expect("parse continue workflow arguments");
+    let baselines = Arc::new(Mutex::new(Vec::new()));
+    let backend = ScopedUsageBackend {
+        baselines: Arc::clone(&baselines),
+        first_implementation: Mutex::new(false),
+    };
+    let mut run_dir_observer = None;
+    run_at(
+        &cli,
+        root,
+        Some(Box::new(backend)),
+        false,
+        Some(&mut run_dir_observer),
+    )
+    .expect("run both specs with scoped usage");
+    let observed = baselines.lock().expect("lock observed usage baselines");
+    assert_eq!(observed.len(), 5);
+    assert_eq!(
+        observed[0],
+        (
+            "001".to_owned(),
+            PromptRole::Implementation,
+            Some(0),
+            Some(0),
+            Some(0)
+        )
+    );
+    assert_eq!(
+        observed[1],
+        (
+            "001".to_owned(),
+            PromptRole::Implementation,
+            Some(1),
+            Some(1),
+            Some(1)
+        )
+    );
+    assert_eq!(
+        observed[2],
+        (
+            "001".to_owned(),
+            PromptRole::Review,
+            Some(0),
+            Some(0),
+            Some(0)
+        )
+    );
+    assert_eq!(
+        observed[3],
+        (
+            "002".to_owned(),
+            PromptRole::Implementation,
+            Some(0),
+            Some(0),
+            Some(0)
+        )
+    );
+    assert_eq!(
+        observed[4],
+        (
+            "002".to_owned(),
+            PromptRole::Review,
+            Some(0),
+            Some(0),
+            Some(0)
+        )
+    );
+    drop(observed);
+    fs::remove_dir_all(run_dir_observer.expect("workflow log path"))
+        .expect("remove scoped usage workflow logs");
 }
 
 #[test]

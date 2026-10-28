@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::{AgentRequest, WorkflowContext};
-use crate::backend::{self, AgentResponse, BackendFailure};
+use crate::backend::{self, AgentResponse, BackendFailure, UsageSnapshot};
 use crate::config::AgentBackendKind;
 use crate::error::{Result, SpecLoopError};
 use crate::output::TypedResult;
@@ -21,18 +21,13 @@ where
 {
     let mut validation_feedback = request.validation_feedback.map(str::to_owned);
     let mut continuation = None;
-    let mut correction_prompt: Option<String> = None;
     loop {
         let attempt = AgentRequest {
             validation_feedback: validation_feedback.as_deref(),
             ..request
         };
-        let (response, next_continuation, response_log) = call_agent(
-            context,
-            attempt,
-            continuation.take(),
-            correction_prompt.as_deref(),
-        )?;
+        let (response, next_continuation, response_log) =
+            call_agent(context, attempt, continuation.take())?;
         match protocol::parse::<T>(&response, request.role.protocol_name()).and_then(|parsed| {
             validate(&parsed)?;
             Ok(parsed)
@@ -49,17 +44,14 @@ where
                 ))?;
                 if next_continuation.is_some() {
                     continuation = next_continuation;
-                    validation_feedback = None;
-                    correction_prompt = Some(format!(
-                        "Typed final response failed validation for role {}: {error}\nPrevious response:\n{response}\n\nReturn one corrected JSON object only, matching this generated schema: {}. This is a correction-only retry: do not invoke tools or repeat workspace work. Preserve prior completed work and base any status or summary on the current workspace.",
-                        role_display(request.role),
-                        protocol::schema::<T>()?
+                    validation_feedback = Some(format!(
+                        "Typed final response failed validation for role {}: {error}\nPrevious response:\n{response}\n\nReturn one corrected canonical role JSON object only. This is a correction-only retry: do not invoke tools or repeat workspace work. Preserve prior completed work and base any status or summary on the current workspace.",
+                        role_display(request.role)
                     ));
                 } else {
                     continuation = None;
-                    correction_prompt = None;
                     validation_feedback = Some(format!(
-                        "Typed response failed validation for role {}: {error}\nPrevious response:\n{response}\n\nThe generated role schema is included in this prompt. Return one corrected JSON object only. Repair the handoff only: do not repeat or alter workspace work solely to fix JSON formatting. If substantive role work remains, follow the normal role contract and continue it. Base any status or summary on the current workspace, never on claims in the malformed response.",
+                        "Typed response failed validation for role {}: {error}\nPrevious response:\n{response}\n\nReturn one corrected canonical role JSON object only. Repair the handoff only: do not repeat or alter workspace work solely to fix JSON formatting. If substantive role work remains, follow the normal role contract and continue it. Base any status or summary on the current workspace, never on claims in the malformed response.",
                         role_display(request.role)
                     ));
                 }
@@ -72,7 +64,6 @@ fn call_agent(
     context: &mut WorkflowContext<'_>,
     request: AgentRequest<'_>,
     mut continuation: Option<backend::BackendContinuation>,
-    correction_prompt: Option<&str>,
 ) -> Result<(
     String,
     Option<backend::BackendContinuation>,
@@ -93,10 +84,7 @@ fn call_agent(
             validation_feedback: combined_feedback.as_deref(),
             ..request
         };
-        let prompt = match correction_prompt {
-            Some(correction) => correction.to_owned(),
-            None => build_role_prompt(context, attempt_request)?,
-        };
+        let prompt = build_role_prompt(context, attempt_request)?;
         let call_index = context.next_log_index()?;
         let attempt = context.role_calls.get(&role).copied().ok_or_else(|| {
             SpecLoopError::Workflow(format!("missing attempt count for {}", role_display(role)))
@@ -106,8 +94,21 @@ fn call_agent(
             role_display(role),
             request.candidate.id
         ))?;
-        let agent_run =
-            invoke_and_log_agent(context, call_index, role, &prompt, continuation.take())?;
+        let usage_key = (request.candidate.id.clone(), role);
+        let usage_baseline = context
+            .role_usage
+            .get(&usage_key)
+            .cloned()
+            .unwrap_or_default();
+        let agent_run = invoke_and_log_agent(
+            context,
+            call_index,
+            role,
+            &request.candidate.id,
+            &prompt,
+            continuation.take(),
+            usage_baseline,
+        )?;
         match agent_run.outcome {
             Ok(response) => {
                 return Ok((
@@ -193,8 +194,10 @@ fn invoke_and_log_agent(
     context: &mut WorkflowContext<'_>,
     call_index: usize,
     role: PromptRole,
+    spec_id: &str,
     prompt: &str,
     continuation: Option<backend::BackendContinuation>,
+    usage_baseline: UsageSnapshot,
 ) -> Result<LoggedAgentRun> {
     let outcome = match context.backend.run_with_continuation(
         context.root,
@@ -205,9 +208,15 @@ fn invoke_and_log_agent(
         backend::AgentInvocation {
             continuation,
             output: &context.output,
+            usage_baseline,
         },
     ) {
         Ok(run) => {
+            if let Some(delta) = &run.usage {
+                let key = (spec_id.to_owned(), role);
+                let cumulative = context.role_usage.entry(key).or_default();
+                *cumulative = cumulative.merged(delta);
+            }
             let stdout_name = format!("agent-{call_index:04}-{}.stdout.jsonl", role_display(role));
             let stderr_name = format!("agent-{call_index:04}-{}.stderr.log", role_display(role));
             context.run_dir.write_log(&stdout_name, &run.stdout)?;

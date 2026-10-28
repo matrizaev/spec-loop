@@ -83,14 +83,17 @@ fn stage_overrides_apply_to_every_role_family_and_fall_back_globally() {
             planning: AgentStageConfig {
                 model: Some("provider/planning".to_owned()),
                 thinking: None,
+                context_window_tokens: None,
             },
             implementation: AgentStageConfig {
                 model: None,
                 thinking: Some(ThinkingLevel::Medium),
+                context_window_tokens: None,
             },
             review: AgentStageConfig {
                 model: Some("provider/review".to_owned()),
                 thinking: Some(ThinkingLevel::High),
+                context_window_tokens: None,
             },
         },
         ..AgentConfig::default()

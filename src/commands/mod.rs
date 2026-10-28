@@ -88,6 +88,27 @@ pub fn run_process_until(
     max_output_bytes: Option<usize>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<ChildOutput> {
+    run_process_until_with_spawn_observer(
+        program,
+        args,
+        cwd,
+        deadline,
+        max_output_bytes,
+        cancelled,
+        || Ok(()),
+    )
+}
+
+/// Runs a process and invokes the observer immediately after its successful spawn.
+pub fn run_process_until_with_spawn_observer(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    deadline: Option<Instant>,
+    max_output_bytes: Option<usize>,
+    cancelled: &Arc<AtomicBool>,
+    on_spawn: impl FnOnce() -> Result<()>,
+) -> Result<ChildOutput> {
     run_process_with_options(
         program,
         args,
@@ -99,6 +120,7 @@ pub fn run_process_until(
             environment: &[],
             cancelled,
         },
+        on_spawn,
     )
 }
 
@@ -122,6 +144,7 @@ fn run_process_with_os_args(
             environment,
             cancelled,
         },
+        || Ok(()),
     )
 }
 
@@ -130,6 +153,7 @@ fn run_process_with_options(
     args: &[impl AsRef<OsStr>],
     cwd: &Path,
     options: ProcessOptions<'_>,
+    on_spawn: impl FnOnce() -> Result<()>,
 ) -> Result<ChildOutput> {
     let ProcessOptions {
         timeout,
@@ -164,6 +188,17 @@ fn run_process_with_options(
     let mut child = command
         .spawn()
         .map_err(|source| io_error("start child process", program, source))?;
+    if let Err(error) = on_spawn() {
+        terminate_child(&mut child, program)?;
+        child.wait().map_err(|source| {
+            io_error(
+                "wait for child after spawn observer failure",
+                program,
+                source,
+            )
+        })?;
+        return Err(error);
+    }
     let Some(stdout) = child.stdout.take() else {
         terminate_child(&mut child, program)?;
         child

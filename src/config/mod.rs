@@ -203,6 +203,8 @@ pub struct AgentConfig {
     pub executable: PathBuf,
     pub model: Option<String>,
     pub thinking: Option<ThinkingLevel>,
+    /// Optional user-provided built-in model context limit.
+    pub context_window_tokens: Option<u64>,
     pub stages: AgentStages,
     pub timeout_seconds: Option<u64>,
     pub max_tool_calls: Option<usize>,
@@ -216,6 +218,7 @@ impl Default for AgentConfig {
             executable: PathBuf::from("pi"),
             model: None,
             thinking: None,
+            context_window_tokens: None,
             stages: AgentStages::default(),
             timeout_seconds: None,
             max_tool_calls: None,
@@ -239,6 +242,8 @@ pub struct AgentStages {
 pub struct AgentStageConfig {
     pub model: Option<String>,
     pub thinking: Option<ThinkingLevel>,
+    /// Optional user-provided context limit for the stage's selected model.
+    pub context_window_tokens: Option<u64>,
 }
 
 /// Role family used to resolve model and thinking settings.
@@ -267,6 +272,22 @@ impl AgentConfig {
 
     pub fn thinking_for(&self, stage: AgentStage) -> Option<ThinkingLevel> {
         self.stage_config(stage).thinking.or(self.thinking)
+    }
+
+    /// Returns the user-provided context limit applicable to the selected stage model.
+    ///
+    /// A stage limit always applies to its stage. A global limit applies only when
+    /// the stage inherits the global model, because a stage model override may have
+    /// a different context window.
+    pub fn context_window_tokens_for(&self, stage: AgentStage) -> Option<u64> {
+        let stage_config = self.stage_config(stage);
+        stage_config.context_window_tokens.or_else(|| {
+            stage_config
+                .model
+                .is_none()
+                .then_some(self.context_window_tokens)
+                .flatten()
+        })
     }
 
     const fn stage_config(&self, stage: AgentStage) -> &AgentStageConfig {
@@ -368,6 +389,32 @@ fn validate_plan_and_archive(plan: &PlanConfig, archive: &ArchiveConfig) -> Resu
 }
 
 fn validate_agent(agent: &AgentConfig) -> Result<()> {
+    for (field, value) in [
+        ("agent.context_window_tokens", agent.context_window_tokens),
+        (
+            "agent.stages.planning.context_window_tokens",
+            agent.stages.planning.context_window_tokens,
+        ),
+        (
+            "agent.stages.implementation.context_window_tokens",
+            agent.stages.implementation.context_window_tokens,
+        ),
+        (
+            "agent.stages.review.context_window_tokens",
+            agent.stages.review.context_window_tokens,
+        ),
+    ] {
+        if value == Some(0) {
+            return Err(SpecLoopError::Config(format!(
+                "{field} must be positive when set"
+            )));
+        }
+        if agent.backend == AgentBackendKind::Pi && value.is_some() {
+            return Err(SpecLoopError::Config(format!(
+                "{field} is only valid for the built-in backend"
+            )));
+        }
+    }
     match agent.backend {
         AgentBackendKind::Builtin => {
             if agent.model.as_deref().is_none_or(str::is_empty) {

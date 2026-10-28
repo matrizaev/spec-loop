@@ -9,22 +9,36 @@ use serde_json::{Value, json};
 
 use super::BuiltinConversation;
 use super::provider::ensure_active;
-use crate::commands::{ProcessTermination, run_process_until};
+use crate::backend::builtin::usage::UsageReporter;
+use crate::commands::{ProcessTermination, run_process_until_with_spawn_observer};
 use crate::config::Profile;
 use crate::error::{Result, SpecLoopError};
 
 #[cfg(test)]
 mod tests;
 
+pub(super) struct ShellExecutionContext<'a> {
+    pub root: &'a Path,
+    pub profile: &'a Profile,
+    pub deadline: Option<Instant>,
+    pub cancelled: &'a Arc<AtomicBool>,
+    pub conversation: &'a mut BuiltinConversation,
+    pub transcript: &'a mut Vec<u8>,
+}
+
 pub(super) fn execute_shell_calls(
-    root: &Path,
-    profile: &Profile,
-    deadline: Option<Instant>,
-    cancelled: &Arc<AtomicBool>,
+    context: ShellExecutionContext<'_>,
     calls: Vec<ShellCall>,
-    conversation: &mut BuiltinConversation,
-    transcript: &mut Vec<u8>,
+    reporter: &mut UsageReporter<'_>,
 ) -> Result<()> {
+    let ShellExecutionContext {
+        root,
+        profile,
+        deadline,
+        cancelled,
+        conversation,
+        transcript,
+    } = context;
     for call in calls {
         ensure_active(deadline, cancelled)?;
         if let (Some(tool_calls), Some(limit)) =
@@ -39,12 +53,16 @@ pub(super) fn execute_shell_calls(
                 SpecLoopError::Workflow("built-in shell call counter overflowed".to_owned())
             })?;
         }
-        let result = run_shell(
+        let result = run_shell_with_observer(
             root,
             &call.command,
             profile.agent.max_tool_output_bytes(),
             deadline,
             cancelled,
+            || {
+                reporter.snapshot.shell_spawned();
+                reporter.report()
+            },
         )?;
         append_transcript(transcript, &call.command, &result.log_output)?;
         match result.termination {
@@ -103,7 +121,24 @@ pub(super) fn completed_output(response: &Value) -> Result<Vec<Value>> {
         .ok_or_else(|| SpecLoopError::Agent("OpenAI Responses output is missing".to_owned()))
 }
 
+fn contains_refusal(item: &Value) -> bool {
+    item.get("type").and_then(Value::as_str) == Some("message")
+        && item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+            })
+}
+
 pub(super) fn parse_output_items(output: &[Value]) -> Result<(Vec<ShellCall>, Option<String>)> {
+    if output.iter().any(contains_refusal) {
+        return Err(SpecLoopError::Agent(
+            "OpenAI Responses refused the role request; review the role input and retry after resolving the refusal".to_owned(),
+        ));
+    }
     let mut calls = Vec::new();
     let mut final_text = String::new();
     let mut saw_text = false;
@@ -260,6 +295,7 @@ fn append_rendered_character(
     }
 }
 
+#[cfg(test)]
 pub(super) fn run_shell(
     root: &Path,
     command: &str,
@@ -267,15 +303,29 @@ pub(super) fn run_shell(
     deadline: Option<Instant>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<ShellResult> {
+    run_shell_with_observer(root, command, max_output_bytes, deadline, cancelled, || {
+        Ok(())
+    })
+}
+
+fn run_shell_with_observer(
+    root: &Path,
+    command: &str,
+    max_output_bytes: usize,
+    deadline: Option<Instant>,
+    cancelled: &Arc<AtomicBool>,
+    on_spawn: impl FnOnce() -> Result<()>,
+) -> Result<ShellResult> {
     #[cfg(unix)]
     {
-        let output = run_process_until(
+        let output = run_process_until_with_spawn_observer(
             Path::new("/bin/sh"),
             &["-c".to_owned(), command.to_owned()],
             root,
             deadline,
             Some(max_output_bytes),
             cancelled,
+            on_spawn,
         )?;
         let termination = if cancelled.load(Ordering::Relaxed) {
             ProcessTermination::Interrupted
@@ -314,7 +364,14 @@ pub(super) fn run_shell(
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, command, max_output_bytes, deadline, cancelled);
+        let _ = (
+            root,
+            command,
+            max_output_bytes,
+            deadline,
+            cancelled,
+            on_spawn,
+        );
         Err(SpecLoopError::Workflow(
             "built-in shell tool is supported only on POSIX platforms with `/bin/sh`".to_owned(),
         ))

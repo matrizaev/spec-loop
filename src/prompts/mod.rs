@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::config::{AgentBackendKind, Profile, PromptConfig};
+use crate::config::{AgentBackendKind, AgentStage, Profile, PromptConfig};
 use crate::error::{Result, SpecLoopError};
 use crate::paths::expand_template;
 use crate::protocol::{
@@ -24,6 +24,17 @@ pub enum PromptRole {
 }
 
 impl PromptRole {
+    /// Maps every protocol role to the one shared model/configuration stage family.
+    pub const fn agent_stage(self) -> AgentStage {
+        match self {
+            Self::PlanAuthor | Self::PlanReview | Self::PlanAudit | Self::PlanClarification => {
+                AgentStage::Planning
+            }
+            Self::Implementation => AgentStage::Implementation,
+            Self::Review | Self::ReviewAudit | Self::ReviewClarification => AgentStage::Review,
+        }
+    }
+
     pub const fn protocol_name(self) -> &'static str {
         match self {
             Self::PlanAuthor => "plan_author",

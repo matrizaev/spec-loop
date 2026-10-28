@@ -1,8 +1,8 @@
 use std::ffi::OsStr;
 
 use super::{
-    ColorMode, Output, TypedResult, preview, render_metadata, render_stage, sanitize, style,
-    style_status,
+    ColorMode, Output, TypedResult, UsageProgressState, preview, render_metadata, render_stage,
+    render_usage_report, sanitize, style, style_status,
 };
 use crate::protocol::{
     Actionability, AuditResult, Citation, Classification, EvidenceResult, Finding,
@@ -22,8 +22,9 @@ fn color_policy_detects_streams_independently_and_honors_overrides() {
         Some(OsStr::new("xterm")),
         None,
     );
-    assert!(auto.stdout_color);
+    assert!(auto.stdout.color);
     assert!(!auto.stderr_color);
+    assert!(auto.stdout.rewrite_progress);
     let reverse = Output::with_environment(
         ColorMode::Auto,
         false,
@@ -32,7 +33,7 @@ fn color_policy_detects_streams_independently_and_honors_overrides() {
         Some(OsStr::new("xterm")),
         None,
     );
-    assert!(!reverse.stdout_color);
+    assert!(!reverse.stdout.color);
     assert!(reverse.stderr_color);
     let blocked = Output::with_environment(
         ColorMode::Auto,
@@ -42,7 +43,8 @@ fn color_policy_detects_streams_independently_and_honors_overrides() {
         Some(OsStr::new("dumb")),
         None,
     );
-    assert!(!blocked.stdout_color && !blocked.stderr_color);
+    assert!(!blocked.stdout.color && !blocked.stderr_color);
+    assert!(!blocked.stdout.rewrite_progress);
     let no_color = Output::with_environment(
         ColorMode::Auto,
         false,
@@ -51,7 +53,7 @@ fn color_policy_detects_streams_independently_and_honors_overrides() {
         None,
         Some(OsStr::new("1")),
     );
-    assert!(!no_color.stdout_color && !no_color.stderr_color);
+    assert!(!no_color.stdout.color && !no_color.stderr_color);
     let empty_no_color = Output::with_environment(
         ColorMode::Auto,
         false,
@@ -60,7 +62,7 @@ fn color_policy_detects_streams_independently_and_honors_overrides() {
         None,
         Some(OsStr::new("")),
     );
-    assert!(empty_no_color.stdout_color && empty_no_color.stderr_color);
+    assert!(empty_no_color.stdout.color && empty_no_color.stderr_color);
     let forced = Output::with_environment(
         ColorMode::Always,
         false,
@@ -69,8 +71,8 @@ fn color_policy_detects_streams_independently_and_honors_overrides() {
         Some(OsStr::new("dumb")),
         Some(OsStr::new("1")),
     );
-    assert!(forced.stdout_color && forced.stderr_color);
-    assert!(style_status("[PASS] ready", forced.stdout_color).starts_with("\x1b[32m"));
+    assert!(forced.stdout.color && forced.stderr_color);
+    assert!(style_status("[PASS] ready", forced.stdout.color).starts_with("\x1b[32m"));
     for (label, color) in [
         ("[BLOCKED]", "\x1b[33m"),
         ("[RETRY]", "\x1b[33m"),
@@ -78,16 +80,40 @@ fn color_policy_detects_streams_independently_and_honors_overrides() {
         ("[FAIL]", "\x1b[31m"),
         ("[ERROR]", "\x1b[31m"),
     ] {
-        assert!(style_status(label, forced.stdout_color).starts_with(color));
+        assert!(style_status(label, forced.stdout.color).starts_with(color));
     }
-    assert!(style_status("  metadata", forced.stdout_color).starts_with("\x1b[2m"));
-    assert!(style("[RUNNING] stage", "\x1b[1;36m", forced.stdout_color).contains("\x1b[1;36m"));
+    assert!(style_status("  metadata", forced.stdout.color).starts_with("\x1b[2m"));
+    assert!(style("[RUNNING] stage", "\x1b[1;36m", forced.stdout.color).contains("\x1b[1;36m"));
     let never = Output::with_environment(ColorMode::Never, false, true, true, None, None);
-    assert!(!never.stdout_color && !never.stderr_color);
+    assert!(!never.stdout.color && !never.stderr_color);
+    assert!(never.stdout.rewrite_progress);
     assert_eq!(
-        style_status("[PASS] ready", never.stdout_color),
+        style_status("[PASS] ready", never.stdout.color),
         "[PASS] ready"
     );
+}
+
+#[test]
+fn usage_reports_replace_the_same_terminal_block_and_append_when_redirected() {
+    let (initial, mut state) =
+        render_usage_report("first line\nsecond line", UsageProgressState::Initial, true);
+    assert_eq!(initial, "first line\nsecond line\n");
+
+    let (updated, next_state) = render_usage_report("short update", state, true);
+    assert_eq!(updated, "\x1b[2A\r\x1b[2Kshort update\n\r\x1b[2K\n");
+    state = next_state;
+
+    let (expanded, state) = render_usage_report("one\ntwo\nthree", state, true);
+    assert_eq!(
+        expanded,
+        "\x1b[2A\r\x1b[2Kone\n\r\x1b[2Ktwo\n\r\x1b[2Kthree\n"
+    );
+    assert!(matches!(state, UsageProgressState::Replace { lines: 3 }));
+
+    let (first, state) = render_usage_report("pipe one", UsageProgressState::Initial, false);
+    let (second, _) = render_usage_report("pipe two", state, false);
+    assert_eq!(first, "pipe one\n");
+    assert_eq!(second, "pipe two\n");
 }
 
 #[test]

@@ -9,4 +9,12 @@ backend = "builtin"
 model = "your-chatgpt-model"
 # Positive limit applies per built-in role; Pi does not accept this field.
 # max_tool_output_bytes defaults to a combined 1,048,576-byte stdout/stderr payload cap per shell call; neither stream has a reserved share.
+# Optional positive limit supplied by you, not a measured limit for this example model:
+# context_window_tokens = 128000
 max_tool_calls = 100
+
+[agent.stages.implementation]
+# A stage limit overrides the global one. A stage model override without its own
+# context limit does not inherit the global context limit.
+# model = "your-implementation-model"
+# context_window_tokens = 128000
