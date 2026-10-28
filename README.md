@@ -19,6 +19,25 @@ make check
 
 See [`examples/profiles/basic.toml`](examples/profiles/basic.toml), [`examples/profiles/planned-archive.toml`](examples/profiles/planned-archive.toml), and [`examples/profiles/status-update.toml`](examples/profiles/status-update.toml). These profiles demonstrate ordinary user-configured actions; Spec Loop itself has no Git integration for status, diffs, staging, or commits.
 
+## Get Started
+
+Adopt Spec Loop in an existing repository with these steps:
+
+1. Install the `spec-loop` executable and make sure it is on `PATH`. From a checkout of this repository, you can install it with `cargo install --path /path/to/spec-loop`. Confirm it is available with `spec-loop --help`.
+2. From the root of the repository where you want to use Spec Loop, copy [`examples/profiles/starter.toml`](examples/profiles/starter.toml) to `.spec-loop.toml`. If you already have a profile, merge the settings rather than replacing it. Spec Loop reads this file only from the current working directory.
+3. Configure the profile's agent backend, executable, and model for your environment. The starter uses Pi. Set its `model` to one available in your Pi configuration. Add the repository's actual test, lint, or build commands as `[[checks]]` entries; the starter intentionally defines no checks, so none will run until you add them. The default review context is `git diff`; replace it if the repository does not use Git.
+4. Create `specs/` and add a focused specification such as `specs/001-add-feature.md`. The starter profile selects `specs/*.md` files whose names begin with a numeric ID. State the goal, requirements, and observable acceptance criteria. Add or configure repository instruction files under `[prompts]` if the agents need local conventions.
+5. From the repository root, author and review the plan, then run implementation and review:
+
+	```sh
+	spec-loop --spec 001 --plan
+	spec-loop --spec 001
+	```
+
+	Replace `001` with your spec ID. The normal run uses the approved plan at `.spec-loop/plans/{spec_id}.md`.
+
+The starter profile does not archive specs or stage, commit, or otherwise alter Git state. Configure lifecycle actions only after reviewing their exact effects. Agent tools and configured commands run with your user's permissions; they are not sandboxed. The built-in backend is available as an alternative, but its workflow execution is currently incomplete; see [Profile schema v3](#profile-schema-v3) before choosing it.
+
 ## Workflow
 
 1. Current working directory is project root. Spec Loop requires `.spec-loop.toml` there and never searches parent directories.

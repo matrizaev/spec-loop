@@ -1,0 +1,20 @@
+# Minimal repository-agnostic starting profile. Configure the Pi model and add
+# project-specific checks before using it for implementation work.
+schema_version = 3
+
+[specs]
+active_globs = ["specs/*.md"]
+id_regex = '^specs/(?P<id>[0-9]+)(?:-[a-z0-9-]+)?\.md$'
+ordering = "numeric"
+selection = "any"
+
+[plan]
+path_template = ".spec-loop/plans/{spec_id}.md"
+
+[review.context]
+argv = ["git", "diff"]
+
+[agent]
+backend = "pi"
+executable = "pi"
+model = "provider/model-name"
