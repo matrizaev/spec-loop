@@ -1,6 +1,6 @@
 # Spec 013: Deduplication and Simplification
 
-**Status:** Active
+**Status:** Complete
 
 ## Goal
 
