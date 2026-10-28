@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 use super::{Cli, WorkflowMode};
 use crate::output::ColorMode;
@@ -17,6 +17,16 @@ fn workflow_output_options_parse_and_are_rejected_for_auth() {
         .expect("auth with verbose parses for explicit rejection");
     assert!(auth_verbose.validate_auth_options().is_err());
     assert!(Cli::try_parse_from(["spec-loop", "--color", "rainbow"]).is_err());
+}
+
+#[test]
+fn top_level_help_is_concise_and_keeps_security_warning() {
+    let help = Cli::command().render_long_help().to_string();
+
+    assert!(help.len() < 3_000, "{help}");
+    assert!(help.contains("Use external sandboxing tools"), "{help}");
+    assert!(!help.contains("1,048,576"), "{help}");
+    assert!(!help.contains("Built-in usage reports"), "{help}");
 }
 
 #[test]

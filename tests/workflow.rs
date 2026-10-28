@@ -906,9 +906,8 @@ fn workflow_help_documents_output_modes_and_auth_rejects_them() {
     assert_success(&help);
     let help_text = String::from_utf8_lossy(&help.stdout);
     assert!(help_text.contains("--verbose"));
-    assert!(help_text.contains("--color <auto|always|never>"));
-    assert!(help_text.contains("never raw JSON or provider transcripts"));
-    assert!(help_text.contains("NO_COLOR"));
+    assert!(help_text.contains("--color <WHEN>"));
+    assert!(help_text.contains("Use external sandboxing tools"));
 
     let fixture = Fixture::new(false, false);
     for arguments in [
@@ -1171,7 +1170,9 @@ fn auth_status_and_help_work_without_project_profile() {
         .output()
         .expect("run top-level help");
     assert_success(&help);
-    assert!(String::from_utf8_lossy(&help.stdout).contains("Authentication commands do not load"));
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("Manage built-in ChatGPT authorization.")
+    );
 }
 
 #[test]
