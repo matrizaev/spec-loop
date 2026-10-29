@@ -151,9 +151,38 @@ fn lossy_stream_rendering_respects_combined_output_byte_limit() {
     assert_eq!(stdout.len() + stderr.len(), 6);
     assert!(stdout.is_char_boundary(stdout.len()));
     assert!(stderr.is_char_boundary(stderr.len()));
-    assert_eq!(stdout, "�");
-    assert_eq!(stderr, "�");
+    assert_eq!(stdout, "��");
+    assert_eq!(stderr, "");
     assert!(stdout_truncated);
+    assert!(stderr_truncated);
+}
+
+#[test]
+fn rendering_prioritizes_stdout_and_preserves_utf8_prefixes() {
+    for (stdout_input, stderr_input, limit, expected_stdout, expected_stderr) in [
+        ("", "", 0, "", ""),
+        ("out", "err", 0, "", ""),
+        ("out", "err", 5, "out", "er"),
+        ("out", "err", 6, "out", "err"),
+        ("🦀x", "err", 3, "", "err"),
+        ("🦀x", "err", 4, "🦀", ""),
+        ("x", "🦀z", 4, "x", ""),
+        ("x", "🦀z", 5, "x", "🦀"),
+    ] {
+        let (stdout, stderr, stdout_truncated, stderr_truncated) =
+            render_captured_streams(stdout_input.as_bytes(), stderr_input.as_bytes(), limit);
+        assert_eq!(stdout, expected_stdout, "stdout for limit {limit}");
+        assert_eq!(stderr, expected_stderr, "stderr for limit {limit}");
+        assert!(stdout.len() + stderr.len() <= limit);
+        assert_eq!(stdout_truncated, stdout != stdout_input);
+        assert_eq!(stderr_truncated, stderr != stderr_input);
+    }
+
+    let (stdout, stderr, stdout_truncated, stderr_truncated) =
+        render_captured_streams(b"x", &[0xff, 0xfe], 5);
+    assert_eq!(stdout, "x");
+    assert_eq!(stderr, "�");
+    assert!(!stdout_truncated);
     assert!(stderr_truncated);
 }
 

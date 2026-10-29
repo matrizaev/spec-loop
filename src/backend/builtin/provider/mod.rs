@@ -62,89 +62,100 @@ pub(super) async fn request_with_observations(
             .post(endpoint)
             .bearer_auth(token)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(encoded.clone())
-            .send();
-        let send = async {
-            reporter.snapshot.request_sent();
-            reporter.report()?;
-            Ok::<_, SpecLoopError>(request.await)
-        };
-        let response_result = await_limited(send, deadline, cancelled).await??;
-        let response = match response_result {
-            Ok(response) => response,
-            Err(_) if retry_count < MAX_PROVIDER_RETRIES => {
-                wait_before_retry(retry_count, None, deadline, cancelled).await?;
-                retry_count = advance_retry_counter(retry_count)?;
-                continue;
-            }
-            Err(_) => {
-                return Err(SpecLoopError::Workflow(format!(
-                    "OpenAI Responses request failed after {MAX_PROVIDER_RETRIES} retries"
-                )));
-            }
-        };
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        if status.is_success() {
-            match read_streamed_response(response, deadline, cancelled, reporter).await {
-                Ok(completed) => return Ok(completed),
-                Err(StreamFailure::Network | StreamFailure::RetryableProvider)
-                    if retry_count < MAX_PROVIDER_RETRIES =>
-                {
-                    wait_before_retry(retry_count, retry_after.as_deref(), deadline, cancelled)
-                        .await?;
-                    retry_count = advance_retry_counter(retry_count)?;
-                    continue;
+            .body(encoded.clone());
+        match request_once(request, deadline, cancelled, reporter).await? {
+            RequestAttempt::Completed(response) => return Ok(response),
+            RequestAttempt::Retryable {
+                retry_after,
+                exhausted_error,
+            } => {
+                if retry_count >= MAX_PROVIDER_RETRIES {
+                    return Err(exhausted_error);
                 }
-                Err(StreamFailure::Network | StreamFailure::RetryableProvider) => {
-                    return Err(SpecLoopError::Workflow(format!(
-                        "OpenAI Responses stream failed after {MAX_PROVIDER_RETRIES} retries"
-                    )));
-                }
-                Err(StreamFailure::Fatal(error)) => return Err(error),
-            }
-        }
-        let bytes = match await_limited(response.bytes(), deadline, cancelled).await? {
-            Ok(bytes) => bytes,
-            Err(_) if retry_count < MAX_PROVIDER_RETRIES => {
-                wait_before_retry(retry_count, None, deadline, cancelled).await?;
-                retry_count = advance_retry_counter(retry_count)?;
-                continue;
-            }
-            Err(_) => {
-                return Err(SpecLoopError::Workflow(format!(
-                    "could not read OpenAI Responses result after {MAX_PROVIDER_RETRIES} retries"
-                )));
-            }
-        };
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            return Err(SpecLoopError::Workflow(
-                "ChatGPT authorization or direct-use permission was rejected; run `spec-loop auth login` and verify ChatGPT plan access".to_owned(),
-            ));
-        }
-        if status.as_u16() == 429 || status.is_server_error() {
-            if usage_limit_error(&bytes) {
-                return Err(SpecLoopError::Workflow(
-                    "ChatGPT subscription or usage limit was reached; review plan access and usage limits".to_owned(),
-                ));
-            }
-            if retry_count < MAX_PROVIDER_RETRIES {
                 wait_before_retry(retry_count, retry_after.as_deref(), deadline, cancelled).await?;
                 retry_count = advance_retry_counter(retry_count)?;
-                continue;
             }
-            return Err(SpecLoopError::Workflow(format!(
+        }
+    }
+}
+
+// Fatal failures use Result; only retryable attempts reach the shared retry boundary.
+enum RequestAttempt {
+    Completed(Value),
+    Retryable {
+        retry_after: Option<String>,
+        exhausted_error: SpecLoopError,
+    },
+}
+
+async fn request_once(
+    request: reqwest::RequestBuilder,
+    deadline: Option<Instant>,
+    cancelled: &AtomicBool,
+    reporter: &mut UsageReporter<'_>,
+) -> Result<RequestAttempt> {
+    let send = async {
+        reporter.snapshot.request_sent();
+        reporter.report()?;
+        Ok::<_, SpecLoopError>(request.send().await)
+    };
+    let Ok(response) = await_limited(send, deadline, cancelled).await?? else {
+        return Ok(RequestAttempt::Retryable {
+            retry_after: None,
+            exhausted_error: SpecLoopError::Workflow(format!(
+                "OpenAI Responses request failed after {MAX_PROVIDER_RETRIES} retries"
+            )),
+        });
+    };
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if status.is_success() {
+        return match read_streamed_response(response, deadline, cancelled, reporter).await {
+            Ok(completed) => Ok(RequestAttempt::Completed(completed)),
+            Err(StreamFailure::Network | StreamFailure::RetryableProvider) => {
+                Ok(RequestAttempt::Retryable {
+                    retry_after,
+                    exhausted_error: SpecLoopError::Workflow(format!(
+                        "OpenAI Responses stream failed after {MAX_PROVIDER_RETRIES} retries"
+                    )),
+                })
+            }
+            Err(StreamFailure::Fatal(error)) => Err(error),
+        };
+    }
+    let Ok(bytes) = await_limited(response.bytes(), deadline, cancelled).await? else {
+        return Ok(RequestAttempt::Retryable {
+            retry_after: None,
+            exhausted_error: SpecLoopError::Workflow(format!(
+                "could not read OpenAI Responses result after {MAX_PROVIDER_RETRIES} retries"
+            )),
+        });
+    };
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(SpecLoopError::Workflow(
+            "ChatGPT authorization or direct-use permission was rejected; run `spec-loop auth login` and verify ChatGPT plan access".to_owned(),
+        ));
+    }
+    if status.as_u16() == 429 || status.is_server_error() {
+        if usage_limit_error(&bytes) {
+            return Err(SpecLoopError::Workflow(
+                "ChatGPT subscription or usage limit was reached; review plan access and usage limits".to_owned(),
+            ));
+        }
+        return Ok(RequestAttempt::Retryable {
+            retry_after,
+            exhausted_error: SpecLoopError::Workflow(format!(
                 "OpenAI Responses provider failure (HTTP {}) after {} retries",
                 status.as_u16(),
                 MAX_PROVIDER_RETRIES
-            )));
-        }
-        return Err(request_rejection(status.as_u16(), &bytes));
+            )),
+        });
     }
+    Err(request_rejection(status.as_u16(), &bytes))
 }
 
 fn request_rejection(status: u16, body: &[u8]) -> SpecLoopError {

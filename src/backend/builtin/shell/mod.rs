@@ -1,6 +1,4 @@
-use std::iter::Peekable;
 use std::path::Path;
-use std::str::Chars;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -235,64 +233,24 @@ pub(super) fn render_captured_streams(
     stderr: &[u8],
     max_output_bytes: usize,
 ) -> (String, String, bool, bool) {
-    let stdout = String::from_utf8_lossy(stdout);
-    let stderr = String::from_utf8_lossy(stderr);
-    let mut stdout_chars = stdout.chars().peekable();
-    let mut stderr_chars = stderr.chars().peekable();
-    let mut stdout_output = String::new();
-    let mut stderr_output = String::new();
-    let mut remaining = max_output_bytes;
-    let mut stdout_done = false;
-    let mut stderr_done = false;
-    let mut stdout_truncated = false;
-    let mut stderr_truncated = false;
-    let mut next_stdout = true;
-
-    while !stdout_done || !stderr_done {
-        let render_stdout = if stdout_done {
-            false
-        } else if stderr_done {
-            true
-        } else {
-            next_stdout
-        };
-        let (done, truncated) = if render_stdout {
-            append_rendered_character(&mut stdout_chars, &mut stdout_output, &mut remaining)
-        } else {
-            append_rendered_character(&mut stderr_chars, &mut stderr_output, &mut remaining)
-        };
-        if render_stdout {
-            stdout_done = done;
-            stdout_truncated |= truncated;
-        } else {
-            stderr_done = done;
-            stderr_truncated |= truncated;
-        }
-        next_stdout = !render_stdout;
-    }
-
-    (
-        stdout_output,
-        stderr_output,
-        stdout_truncated,
-        stderr_truncated,
-    )
+    let mut stdout = String::from_utf8_lossy(stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(stderr).into_owned();
+    // Capture has its own shared raw-byte cap. If decoding expands that payload,
+    // retain stdout first, then stderr, matching their display order.
+    let stdout_truncated = truncate_rendered_stream(&mut stdout, max_output_bytes);
+    let stderr_truncated = truncate_rendered_stream(&mut stderr, max_output_bytes - stdout.len());
+    (stdout, stderr, stdout_truncated, stderr_truncated)
 }
 
-fn append_rendered_character(
-    characters: &mut Peekable<Chars<'_>>,
-    output: &mut String,
-    remaining: &mut usize,
-) -> (bool, bool) {
-    match characters.next() {
-        None => (true, false),
-        Some(character) if character.len_utf8() <= *remaining => {
-            output.push(character);
-            *remaining -= character.len_utf8();
-            (false, false)
-        }
-        Some(_) => (true, true),
+fn truncate_rendered_stream(output: &mut String, max_bytes: usize) -> bool {
+    let mut end = max_bytes.min(output.len());
+    // Zero is always a boundary, so this backs up at most three bytes.
+    while !output.is_char_boundary(end) {
+        end -= 1;
     }
+    let truncated = end < output.len();
+    output.truncate(end);
+    truncated
 }
 
 #[cfg(test)]

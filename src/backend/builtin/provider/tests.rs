@@ -91,6 +91,75 @@ fn provider_retry_counts_each_send_and_completed_response_once() {
 }
 
 #[test]
+fn mixed_http_and_stream_failures_share_one_retry_limit() {
+    for succeeds in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+        let address = listener.local_addr().expect("provider fixture address");
+        let transient_stream = || {
+            let mut reply = Reply::sse(sse_event(
+                "error",
+                &json!({"type": "error", "error": {"code": "server_error"}}),
+            ));
+            reply.headers = "Retry-After: 0\r\n";
+            reply
+        };
+        let terminal = if succeeds {
+            Reply::sse(completed_sse(&json!({
+                "type": "response.completed",
+                "response": {"status": "completed", "output": []}
+            })))
+        } else {
+            transient_stream()
+        };
+        let server = serve_responses(
+            listener,
+            [
+                Reply::http("503 Service Unavailable", "temporary".to_owned()),
+                transient_stream(),
+                Reply::http("429 Too Many Requests", "temporary".to_owned()),
+                terminal,
+            ],
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build provider client");
+        let mut usage = UsageSnapshot::default();
+        let mut observe = |_: &UsageSnapshot| Ok(());
+        let mut reporter = UsageReporter::new(&mut usage, &mut observe);
+        let result = crate::runtime::block_on(request_with_observations(
+            &client,
+            &format!("http://{address}/responses"),
+            "fixture-access-token",
+            &json!({"model": "fixture", "stream": true}),
+            Some(server.deadline()),
+            &AtomicBool::new(false),
+            &mut reporter,
+        ))
+        .expect("construct provider runtime");
+        if succeeds {
+            assert_eq!(
+                result.expect("fourth attempt succeeds")["status"],
+                "completed"
+            );
+        } else {
+            assert_eq!(
+                result.expect_err("mixed retries must exhaust").to_string(),
+                "workflow stopped: OpenAI Responses stream failed after 3 retries"
+            );
+        }
+        assert_eq!(usage.provider_request_attempts, Some(4));
+        assert_eq!(usage.completed_responses, Some(u64::from(succeeds)));
+        let requests = server.join().expect("join provider fixture");
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests.windows(2).all(|pair| pair.first() == pair.get(1)),
+            "retries must preserve exact request bytes"
+        );
+    }
+}
+
+#[test]
 fn request_attempt_is_reported_while_provider_response_is_held() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");

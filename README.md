@@ -22,7 +22,7 @@ Built-in-only options:
 
 - `agent.context_window_tokens` and per-stage limits are positive user-provided values, not model facts. A stage limit overrides the global limit. A stage model override without its own limit has unknown context capacity. No limit is inferred from model names or fetched from a catalog. Pi rejects these fields.
 - If `agent.max_tool_calls` is omitted, there is no Spec Loop shell-call count ceiling. A positive value caps calls per role; zero is invalid. This does not imply unlimited provider access, runtime, output, or external resources. Pi rejects the field.
-- `agent.max_tool_output_bytes` defaults to a combined stdout/stderr cap of 1,048,576 bytes per shell call; neither stream has a reserved share. Overrides must be positive. Pi rejects the field.
+- `agent.max_tool_output_bytes` defaults to a combined stdout/stderr cap of 1,048,576 bytes per shell call; neither stream has a reserved share. Capture consumes the shared budget as pipes are read, without stable stream priority. If lossy UTF-8 decoding expands captured bytes, rendering keeps stdout first, then stderr within the remaining budget, without splitting characters. Overrides must be positive. Pi rejects the field.
 
 ## Backends and security
 
