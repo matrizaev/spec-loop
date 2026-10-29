@@ -18,6 +18,7 @@ pub struct UsageSnapshot {
     pub executed_shell_calls: Option<u64>,
     /// Numeric usage from the latest completed response, if any.
     pub latest_response: Option<ResponseUsage>,
+    compaction_usage: UsageTotals,
     cumulative: UsageTotals,
 }
 
@@ -28,6 +29,7 @@ impl Default for UsageSnapshot {
             completed_responses: Some(0),
             executed_shell_calls: Some(0),
             latest_response: None,
+            compaction_usage: UsageTotals::default(),
             cumulative: UsageTotals::default(),
         }
     }
@@ -52,6 +54,12 @@ impl UsageSnapshot {
         self.latest_response = Some(usage);
     }
 
+    /// Records documented usage from one completed native compaction response.
+    pub fn compaction_completed(&mut self, response: &Value) {
+        self.compaction_usage
+            .record(&ResponseUsage::from_response(response));
+    }
+
     /// Merges another invocation's observed delta without changing either input.
     pub fn merged(&self, delta: &Self) -> Self {
         let latest_response = delta
@@ -69,6 +77,7 @@ impl UsageSnapshot {
                 delta.executed_shell_calls,
             ),
             latest_response,
+            compaction_usage: self.compaction_usage.merged(&delta.compaction_usage),
             cumulative: self.cumulative.merged(&delta.cumulative),
         }
     }
@@ -84,7 +93,7 @@ impl UsageSnapshot {
         let latest = self.latest_response.as_ref();
         let cumulative = &self.cumulative;
         format!(
-            "📊 Built-in · {role} · {model}\n↻ {} req · ✓ {} completed · ⚙ {} shell calls · {elapsed_seconds}s\n🧠 Last response: {} in · {} out · {} total\n  Context {} / user limit {}\n  Cache {} · reasoning {}\n∑ Observed completed-response usage\n  {} in · {} out · {} total\n  Cache {} · reasoning {}",
+            "📊 Built-in · {role} · {model}\n↻ {} req · ✓ {} completed · ⚙ {} shell calls · {elapsed_seconds}s\n🧠 Last response: {} in · {} out · {} total\n  Context {} / user limit {}\n  Cache {} · reasoning {}\n∑ Observed completed-response usage\n  {} in · {} out · {} total\n  Cache {} · reasoning {}\n∑ Native compaction usage\n  {} in · {} out · {} total",
             display(self.provider_request_attempts),
             display(self.completed_responses),
             display(self.executed_shell_calls),
@@ -100,6 +109,9 @@ impl UsageSnapshot {
             display(cumulative.total_tokens),
             display(cumulative.cached_input_tokens),
             display(cumulative.reasoning_output_tokens),
+            display(self.compaction_usage.input_tokens),
+            display(self.compaction_usage.output_tokens),
+            display(self.compaction_usage.total_tokens),
         )
     }
 }
@@ -215,6 +227,27 @@ impl UsageTotals {
             ),
         }
     }
+}
+
+/// Returns whether trustworthy latest generation usage reaches the checked 80% limit.
+pub(super) fn compaction_threshold_reached(
+    enabled: bool,
+    limit: Option<u64>,
+    usage: Option<&ResponseUsage>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    let (Some(limit), Some(total)) = (limit, usage.and_then(|usage| usage.total)) else {
+        return false;
+    };
+    if limit == 0 {
+        return false;
+    }
+    u128::from(total)
+        .checked_mul(5)
+        .zip(u128::from(limit).checked_mul(4))
+        .is_some_and(|(observed, threshold)| observed >= threshold)
 }
 
 fn unsigned(value: Option<&Value>) -> Option<u64> {

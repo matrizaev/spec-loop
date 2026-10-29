@@ -1,6 +1,6 @@
 # Spec 015: Hierarchical Agent Instructions and Native Compaction
 
-**Status:** Active
+**Status:** Complete
 
 ## Goal
 

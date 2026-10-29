@@ -13,7 +13,7 @@ use super::{
     AgentBackend, AgentInvocation, AgentResponse, AgentRun, BackendContinuation, BackendFailure,
 };
 use crate::auth;
-use crate::backend::builtin::usage::{UsageReporter, UsageSnapshot};
+use crate::backend::builtin::usage::{ResponseUsage, UsageReporter, UsageSnapshot};
 use crate::config::Profile;
 use crate::error::{Result, SpecLoopError};
 use crate::prompts::{self, PromptRole};
@@ -31,14 +31,34 @@ mod tests;
 pub mod usage;
 
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
-const SYSTEM_INSTRUCTIONS: &str = "Use the shell tool for local commands. Tool calls and tool results are transport only. Return the role's final answer as assistant text.";
+const SYSTEM_INSTRUCTIONS: &str = r"Use the shell tool for local commands. Tool calls and tool results are transport only. Return the role's final answer as assistant text.
+
+Before inspecting workspace file contents or modifying a file, establish the applicable `AGENTS.md` hierarchy from the workspace root through that file's parent directory, root to leaf, by reading each full instruction or reusing full contents already available in current context. Path-only listings and searches needed to locate relevant files and instruction files may come first. For a file not yet created, use its intended parent. Establish each relevant tree, sharing already checked ancestors; do not discover instructions from sibling or unrelated directories or recursively scan unrelated directories. Configured role-instruction paths remain required wherever configured, but are not necessarily the complete hierarchy: their required reading does not expand `AGENTS.md` scope, change precedence, or prove nested instruction discovery. Deeper applicable instructions override conflicting ancestor rules only within their own scope; retain nonconflicting ancestor rules. Report unresolved repository/configured-instruction conflicts rather than silently choosing.
+
+Within this invocation, check each directory segment once and remember checked directories even when no `AGENTS.md` exists; read each applicable instruction file once. Reuse shared ancestors and full contents already supplied or read, but a path or summary alone is not full contents. For later files, check only previously unchecked segments. Refresh affected discovery or contents when there is reason to believe instructions were created, changed, moved, or deleted, or when full contents are no longer available. A fresh role invocation establishes its own hierarchy; a continuation retaining this context may reuse it under these refresh rules. Permission errors, failed discovery commands, and incomplete or truncated output do not establish absence or complete reading. Resolve uncertainty with available tools; otherwise stop affected work and report the path and failure through the role's existing contract.
+
+Use only tools available to this backend. Locate relevant paths, establish their instructions, then use scoped content searches and targeted file ranges. Where supported, batch independent bounded read-only operations only after instruction discovery and preserve each operation's diagnostics; do not batch dependent operations or mutations. Prefer quiet targeted tests during iteration without replacing required verification. If output is truncated, inspect retained output or narrow later inspection; never replay a mutation solely to recover omitted output. These are efficiency guidance, not hard inspection caps or a requirement for any particular search utility. Follow existing role permissions: PlanAuthor may write only the selected plan; review, audit, and clarification roles are read-only; other roles follow their existing boundaries.";
 
 /// `OpenAI` Responses API backend using `ChatGPT` OAuth and one POSIX shell tool.
 pub(super) struct BuiltinBackend;
 
 struct BuiltinConversation {
     input: Vec<Value>,
+    current_task: String,
+    latest_generation_usage: Option<ResponseUsage>,
     tool_calls: Option<usize>,
+}
+
+struct CompactionContext<'a> {
+    client: &'a reqwest::Client,
+    endpoint: &'a str,
+    model: &'a str,
+    token: &'a str,
+    deadline: Option<Instant>,
+    cancelled: &'a AtomicBool,
+    conversation: &'a mut BuiltinConversation,
+    usage: &'a mut UsageSnapshot,
+    observer: &'a mut (dyn FnMut(&UsageSnapshot) -> Result<()> + Send),
 }
 
 impl AgentBackend for BuiltinBackend {
@@ -155,6 +175,91 @@ fn build_responses_request(
         request["reasoning"] = json!({"effort": thinking.provider_values().1});
     }
     Ok(request)
+}
+
+async fn compact_conversation(context: CompactionContext<'_>) -> Result<()> {
+    let CompactionContext {
+        client,
+        endpoint,
+        model,
+        token,
+        deadline,
+        cancelled,
+        conversation,
+        usage,
+        observer,
+    } = context;
+    let request = json!({
+        "model": model,
+        "instructions": SYSTEM_INSTRUCTIONS,
+        "input": conversation.input,
+    });
+    let compacted = {
+        let mut reporter = UsageReporter::new(usage, observer);
+        provider::compact_with_observations(
+            client,
+            &format!("{}/compact", endpoint.trim_end_matches('/')),
+            token,
+            &request,
+            deadline,
+            cancelled,
+            &mut reporter,
+        )
+        .await?
+    };
+    let compacted_input = validate_compaction_response(&compacted)?;
+    conversation.input = compacted_input;
+    conversation.input.push(json!({
+        "role": "user",
+        "content": conversation.current_task
+    }));
+    conversation.latest_generation_usage = None;
+    Ok(())
+}
+
+fn validate_compaction_response(response: &Value) -> Result<Vec<Value>> {
+    let valid_id = response.get("id").and_then(Value::as_str).is_some();
+    let valid_created_at = response
+        .get("created_at")
+        .is_some_and(|value| value.as_i64().is_some() || value.as_u64().is_some());
+    let output = response.get("output").and_then(Value::as_array);
+    let valid_header =
+        response.get("object").and_then(Value::as_str) == Some("response.compaction");
+    let Some(output) =
+        output.filter(|items| valid_id && valid_created_at && valid_header && !items.is_empty())
+    else {
+        return Err(SpecLoopError::Agent(
+            "OpenAI Responses native compaction returned malformed or incomplete state; role stopped without replacing conversation".to_owned(),
+        ));
+    };
+    let mut has_compaction_item = false;
+    for item in output {
+        let Some(kind) = item.get("type").and_then(Value::as_str) else {
+            return Err(SpecLoopError::Agent(
+                "OpenAI Responses native compaction returned an untyped output item; role stopped without replacing conversation".to_owned(),
+            ));
+        };
+        if kind == "compaction" {
+            let has_encrypted_content = item
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some();
+            let valid_optional_id = item.get("id").is_none_or(Value::is_null)
+                || item.get("id").and_then(Value::as_str).is_some();
+            if !has_encrypted_content || !valid_optional_id {
+                return Err(SpecLoopError::Agent(
+                    "OpenAI Responses native compaction returned an invalid compaction item; role stopped without replacing conversation".to_owned(),
+                ));
+            }
+            has_compaction_item = true;
+        }
+    }
+    if !has_compaction_item {
+        return Err(SpecLoopError::Agent(
+            "OpenAI Responses native compaction omitted its compaction item; role stopped without replacing conversation".to_owned(),
+        ));
+    }
+    Ok(output.clone())
 }
 
 fn normalize_structured_role_text(final_text: Option<String>) -> Result<String> {
@@ -380,6 +485,30 @@ where
     .await
 }
 
+fn start_conversation(
+    continuation: Option<BuiltinConversation>,
+    prompt: &str,
+    max_tool_calls: Option<usize>,
+) -> (bool, BuiltinConversation) {
+    let correction_only = continuation.is_some();
+    let conversation = match continuation {
+        Some(mut conversation) => {
+            prompt.clone_into(&mut conversation.current_task);
+            conversation
+                .input
+                .push(json!({"role": "user", "content": prompt}));
+            conversation
+        }
+        None => BuiltinConversation {
+            input: vec![json!({"role": "user", "content": prompt})],
+            current_task: prompt.to_owned(),
+            latest_generation_usage: None,
+            tool_calls: max_tool_calls.map(|_| 0),
+        },
+    };
+    (correction_only, conversation)
+}
+
 async fn run_role_with_token_provider_observed<F, Fut>(
     input: RoleInput<'_>,
     continuation: Option<BuiltinConversation>,
@@ -393,7 +522,6 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<String>>,
 {
-    let correction_only = continuation.is_some();
     let RoleInput {
         root,
         profile,
@@ -414,20 +542,29 @@ where
         .map_err(|error| {
             SpecLoopError::Workflow(format!("construct OpenAI Responses HTTP client: {error}"))
         })?;
-    let mut conversation = match continuation {
-        Some(mut conversation) => {
-            conversation
-                .input
-                .push(json!({"role": "user", "content": prompt}));
-            conversation
-        }
-        None => BuiltinConversation {
-            input: vec![json!({"role": "user", "content": prompt})],
-            tool_calls: profile.agent.max_tool_calls.map(|_| 0),
-        },
-    };
+    let (correction_only, mut conversation) =
+        start_conversation(continuation, prompt, profile.agent.max_tool_calls);
     loop {
         provider::ensure_active(deadline, cancelled)?;
+        if usage::compaction_threshold_reached(
+            profile.agent.context_compaction,
+            profile.agent.context_window_tokens_for(role.agent_stage()),
+            conversation.latest_generation_usage.as_ref(),
+        ) {
+            let token = provider::await_limited(token_provider(), deadline, cancelled).await??;
+            compact_conversation(CompactionContext {
+                client: &client,
+                endpoint,
+                model,
+                token: &token,
+                deadline,
+                cancelled,
+                conversation: &mut conversation,
+                usage,
+                observer,
+            })
+            .await?;
+        }
         let request =
             build_responses_request(profile, role, model, &conversation, correction_only)?;
         let token = provider::await_limited(token_provider(), deadline, cancelled).await??;
@@ -444,6 +581,8 @@ where
             )
             .await?
         };
+        let response_usage = ResponseUsage::from_response(&response);
+        conversation.latest_generation_usage = response_usage.total.map(|_| response_usage);
         let output = shell::completed_output(&response)?;
         let (calls, final_text) = shell::parse_output_items(&output)?;
         if calls.is_empty() {

@@ -227,3 +227,77 @@ fn context_percentage_uses_latest_snapshot_and_never_estimates_unavailable_value
     ));
     assert!(no_usage.contains("Context unknown / user limit 100"));
 }
+
+#[test]
+fn compaction_trigger_uses_trustworthy_checked_eighty_percent_boundary() {
+    for (total, expected) in [(799, false), (800, true)] {
+        let usage = ResponseUsage {
+            input: Some(total),
+            output: Some(0),
+            total: Some(total),
+            ..ResponseUsage::default()
+        };
+        assert_eq!(
+            super::compaction_threshold_reached(true, Some(1000), Some(&usage)),
+            expected,
+            "trigger at total={total}"
+        );
+    }
+    let max_usage = ResponseUsage {
+        input: Some(u64::MAX),
+        output: Some(0),
+        total: Some(u64::MAX),
+        ..ResponseUsage::default()
+    };
+    assert!(super::compaction_threshold_reached(
+        true,
+        Some(u64::MAX),
+        Some(&max_usage)
+    ));
+    assert!(!super::compaction_threshold_reached(
+        false,
+        Some(1000),
+        Some(&max_usage)
+    ));
+    assert!(!super::compaction_threshold_reached(
+        true,
+        None,
+        Some(&max_usage)
+    ));
+    assert!(!super::compaction_threshold_reached(true, Some(1000), None));
+    assert!(!super::compaction_threshold_reached(
+        true,
+        Some(1000),
+        Some(&ResponseUsage::default())
+    ));
+    assert!(!super::compaction_threshold_reached(
+        true,
+        Some(0),
+        Some(&max_usage)
+    ));
+}
+
+#[test]
+fn compaction_usage_is_aggregated_and_reported_separately() {
+    let compact = response(&valid_usage(42897, 12000, 54897));
+    let mut first = UsageSnapshot::default();
+    first.request_sent();
+    first.compaction_completed(&compact);
+    first.response_completed(&response(&valid_usage(10, 2, 12)));
+    let mut second = UsageSnapshot::default();
+    second.request_sent();
+    second.compaction_completed(&response(&json!({
+        "input_tokens": 1,
+        "output_tokens": 2,
+        "total_tokens": 99
+    })));
+    let merged = first.merged(&second);
+    let report = merged.format_report("implementation", "fixture-model", 0, None);
+    assert!(report.contains("↻ 2 req · ✓ 1 completed · ⚙ 0 shell calls"));
+    assert!(report.contains("🧠 Last response: 10 in · 2 out · 12 total"));
+    assert!(report.contains("∑ Observed completed-response usage\n  10 in · 2 out · 12 total"));
+    assert!(
+        report.contains("∑ Native compaction usage\n  unknown in · unknown out · unknown total")
+    );
+    assert!(!report.contains("54,897 in · 12,000 out · 66,897 total"));
+}

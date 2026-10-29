@@ -125,6 +125,47 @@ fn builtin_backend_omits_call_limit_and_requires_explicit_model() {
 }
 
 #[test]
+fn context_compaction_defaults_off_and_is_builtin_only() {
+    let omitted: Profile = toml::from_str(
+        "schema_version=3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='builtin'\nmodel='fixture-model'\n",
+    )
+    .expect("parse profile with omitted compaction option");
+    assert!(!omitted.agent.context_compaction);
+    omitted
+        .validate()
+        .expect("legacy built-in profile remains valid");
+
+    let enabled: Profile = toml::from_str(
+        "schema_version=3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='builtin'\nmodel='fixture-model'\ncontext_compaction=true\n",
+    )
+    .expect("parse opt-in profile");
+    enabled
+        .validate()
+        .expect("built-in compaction opt-in is valid");
+    assert!(enabled.agent.context_compaction);
+
+    let pi_default: Profile = toml::from_str(
+        "schema_version=3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='pi'\ncontext_compaction=false\n",
+    )
+    .expect("parse explicit disabled Pi option");
+    assert!(!pi_default.agent.context_compaction);
+    pi_default
+        .validate()
+        .expect("disabled option leaves Pi valid");
+
+    let pi: Profile = toml::from_str(
+        "schema_version=3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='pi'\ncontext_compaction=true\n",
+    )
+    .expect("parse Pi compaction option");
+    assert!(
+        pi.validate()
+            .expect_err("Pi cannot opt into built-in compaction")
+            .to_string()
+            .contains("agent.context_compaction is only valid for the built-in backend")
+    );
+}
+
+#[test]
 fn validates_backend_specific_tool_limits() {
     for (field, value) in [("max_tool_calls", 0), ("max_tool_output_bytes", 0)] {
         let profile: Profile = toml::from_str(&format!(

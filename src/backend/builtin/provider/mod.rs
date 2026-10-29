@@ -79,6 +79,61 @@ pub(super) async fn request_with_observations(
     }
 }
 
+/// Sends exactly one non-streaming native Responses compaction request.
+pub(super) async fn compact_with_observations(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: &str,
+    body: &Value,
+    deadline: Option<Instant>,
+    cancelled: &AtomicBool,
+    reporter: &mut UsageReporter<'_>,
+) -> Result<Value> {
+    ensure_active(deadline, cancelled)?;
+    let encoded = encode_request(body)?;
+    let request = client
+        .post(endpoint)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(encoded);
+    let send = async {
+        reporter.snapshot.request_sent();
+        reporter.report()?;
+        Ok::<_, SpecLoopError>(request.send().await)
+    };
+    let response = await_limited(send, deadline, cancelled)
+        .await??
+        .map_err(|_| {
+            SpecLoopError::Workflow(
+                "OpenAI Responses native compaction request failed; role stopped without retry"
+                    .to_owned(),
+            )
+        })?;
+    if !response.status().is_success() {
+        return Err(SpecLoopError::Workflow(format!(
+            "OpenAI Responses native compaction failed (HTTP {}); verify provider access and configuration; role stopped without retry",
+            response.status().as_u16()
+        )));
+    }
+    let bytes = await_limited(response.bytes(), deadline, cancelled)
+        .await?
+        .map_err(|_| {
+            SpecLoopError::Workflow(
+                "could not read OpenAI Responses native compaction result; role stopped without retry"
+                    .to_owned(),
+            )
+        })?;
+    let compacted: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        SpecLoopError::Agent(
+            "OpenAI Responses native compaction returned malformed JSON; role stopped without retry"
+                .to_owned(),
+        )
+    })?;
+    reporter.snapshot.compaction_completed(&compacted);
+    reporter.report()?;
+    Ok(compacted)
+}
+
 // Fatal failures use Result; only retryable attempts reach the shared retry boundary.
 enum RequestAttempt {
     Completed(Value),

@@ -463,6 +463,8 @@ fn shell_usage_counts_each_successfully_spawned_call() {
     let cancelled = Arc::new(AtomicBool::new(false));
     let mut conversation = BuiltinConversation {
         input: Vec::new(),
+        current_task: String::new(),
+        latest_generation_usage: None,
         tool_calls: None,
     };
     let calls = vec![

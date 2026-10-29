@@ -1154,3 +1154,108 @@ fn start_stalled_provider(stall: StallPoint) -> (String, thread::JoinHandle<(Str
     });
     (format!("http://{address}/v1/responses"), server)
 }
+
+#[test]
+fn native_compact_request_is_oauth_counted_once_and_usage_is_not_agent_completion() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind compact fixture");
+    let address = listener.local_addr().expect("compact fixture address");
+    let compacted = json!({
+        "id": "resp_001",
+        "created_at": 1_731_459_200,
+        "object": "response.compaction",
+        "output": [{"type": "compaction", "id": "cmp_001", "encrypted_content": "opaque"}],
+        "usage": {"input_tokens": 42897, "output_tokens": 12000, "total_tokens": 54897}
+    });
+    let server = serve_responses(listener, [Reply::http("200 OK", compacted.to_string())]);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build compact client");
+    let body = json!({
+        "model": "fixture-model",
+        "instructions": "shared instructions",
+        "input": [{"role": "user", "content": "full context"}]
+    });
+    let mut usage = UsageSnapshot::default();
+    let compacted_response = {
+        let mut observer = |_: &UsageSnapshot| Ok(());
+        let mut reporter = UsageReporter::new(&mut usage, &mut observer);
+        crate::runtime::block_on(super::compact_with_observations(
+            &client,
+            &format!("http://{address}/v1/responses/compact"),
+            "fixture-access-token",
+            &body,
+            Some(server.deadline()),
+            &AtomicBool::new(false),
+            &mut reporter,
+        ))
+        .expect("construct compact runtime")
+        .expect("compact once")
+    };
+    assert_eq!(compacted_response, compacted);
+    assert_eq!(usage.provider_request_attempts, Some(1));
+    assert_eq!(usage.completed_responses, Some(0));
+    assert_eq!(usage.executed_shell_calls, Some(0));
+    let report = usage.format_report("implementation", "fixture-model", 0, None);
+    assert!(report.contains("∑ Native compaction usage\n  42,897 in · 12,000 out · 54,897 total"));
+    let requests = server.join().expect("join compact fixture");
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("POST /v1/responses/compact "));
+    assert!(
+        requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fixture-access-token")
+    );
+    let request_body: Value = serde_json::from_str(
+        requests[0]
+            .split_once("\r\n\r\n")
+            .expect("compact request body")
+            .1,
+    )
+    .expect("parse compact request body");
+    assert_eq!(request_body, body);
+    assert!(request_body.get("tools").is_none());
+    assert!(request_body.get("stream").is_none());
+    assert!(request_body.get("text").is_none());
+}
+
+#[test]
+fn native_compact_http_and_json_failures_are_sanitized_and_never_retried() {
+    for reply in [
+        Reply::http("400 Bad Request", "provider-body-secret".to_owned()),
+        Reply::http("200 OK", "malformed-provider-body-secret".to_owned()),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind compact failure fixture");
+        let address = listener.local_addr().expect("compact failure address");
+        let server = serve_responses(listener, [reply]);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build compact failure client");
+        let mut usage = UsageSnapshot::default();
+        let error = {
+            let mut observer = |_: &UsageSnapshot| Ok(());
+            let mut reporter = UsageReporter::new(&mut usage, &mut observer);
+            crate::runtime::block_on(super::compact_with_observations(
+                &client,
+                &format!("http://{address}/v1/responses/compact"),
+                "fixture-access-token",
+                &json!({"model":"fixture-model","input":[],"instructions":"safe"}),
+                Some(server.deadline()),
+                &AtomicBool::new(false),
+                &mut reporter,
+            ))
+            .expect("construct compact failure runtime")
+            .expect_err("compact failure must stop")
+        };
+        assert!(!error.to_string().contains("provider-body-secret"));
+        assert!(!error.to_string().contains("fixture-access-token"));
+        assert_eq!(usage.provider_request_attempts, Some(1));
+        assert_eq!(usage.completed_responses, Some(0));
+        assert_eq!(usage.executed_shell_calls, Some(0));
+        assert_eq!(
+            server.join().expect("join compact failure fixture").len(),
+            1
+        );
+    }
+}

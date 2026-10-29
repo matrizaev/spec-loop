@@ -21,6 +21,7 @@ Optional per-stage model and thinking settings override global values. Thinking 
 Built-in-only options:
 
 - `agent.context_window_tokens` and per-stage limits are positive user-provided values, not model facts. A stage limit overrides the global limit. A stage model override without its own limit has unknown context capacity. No limit is inferred from model names or fetched from a catalog. Pi rejects these fields.
+- `agent.context_compaction` defaults to `false` and opts the built-in backend into the native Responses API compaction operation; Pi cannot enable it. With an applicable user-supplied context limit and trustworthy usage from the latest completed generation, compaction runs before the next generation request when input plus output usage is at least 80% of that limit. It does not estimate missing usage or infer a limit. Unsupported or failed compaction stops the role without retrying generation, changing auth/model, or replaying shell calls. See the [official compaction guide](https://developers.openai.com/api/docs/guides/compaction) and [compact API reference](https://developers.openai.com/api/reference/resources/responses/methods/compact). These API documents do not establish ChatGPT OAuth entitlement or selected-model compatibility.
 - If `agent.max_tool_calls` is omitted, there is no Spec Loop shell-call count ceiling. A positive value caps calls per role; zero is invalid. This does not imply unlimited provider access, runtime, output, or external resources. Pi rejects the field.
 - `agent.max_tool_output_bytes` defaults to a combined stdout/stderr cap of 1,048,576 bytes per shell call; neither stream has a reserved share. Capture consumes the shared budget as pipes are read, without stable stream priority. If lossy UTF-8 decoding expands captured bytes, rendering keeps stdout first, then stderr within the remaining budget, without splitting characters. Overrides must be positive. Pi rejects the field.
 
@@ -52,7 +53,7 @@ Permissions are owner-restricted where supported. If the OS credential store is 
 
 Run logs are stored outside the project with restrictive permissions where supported. They may contain workspace data, credentials, or inherited secrets; secret removal is not guaranteed. Terminal output strips control sequences from displayed agent text, but retained logs and provider transcripts are unchanged.
 
-Built-in usage reports observed completed-response token counts, not billing, quota, remaining access, or failed-request usage. Missing or invalid counts display as `unknown`, not zero. Context percentages compare the last response's input-plus-output tokens with a user-provided limit; they do not predict next-request capacity. Pi runs do not show built-in telemetry.
+Built-in usage reports observed completed-response token counts, not billing, quota, remaining access, or failed-request usage. Missing or invalid counts display as `unknown`, not zero. Context percentages compare the last response's input-plus-output tokens with a user-provided limit; they do not predict next-request capacity. Native compact requests count toward provider request attempts, but not completed agent responses or shell calls; valid documented compaction usage is reported separately from generation usage. Pi runs do not show built-in telemetry.
 
 ## Development and releases
 

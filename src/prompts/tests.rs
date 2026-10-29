@@ -5,6 +5,91 @@ use crate::config::Profile;
 use crate::protocol::{self, PlanReviewResponse, ReviewResult};
 
 #[test]
+fn configured_role_instruction_paths_and_write_boundaries_remain_required() {
+    let profile: Profile = toml::from_str(
+        r"schema_version = 3
+[specs]
+active_globs = ['specs/*.md']
+id_regex = '(?P<id>.*)'
+[agent]
+backend = 'builtin'
+model = 'fixture-model'
+[prompts]
+plan_author = ['role-instructions/plan-author.md']
+plan_review = ['role-instructions/plan-review.md']
+plan_audit = ['role-instructions/plan-audit.md']
+plan_review_clarification = ['role-instructions/plan-clarification.md']
+implementation = ['role-instructions/implementation.md']
+review = ['role-instructions/review.md']
+review_audit = ['role-instructions/review-audit.md']
+review_clarification = ['role-instructions/review-clarification.md']
+",
+    )
+    .expect("profile with configured role instructions");
+    let roles = [
+        (PromptRole::PlanAuthor, "plan-author"),
+        (PromptRole::PlanReview, "plan-review"),
+        (PromptRole::PlanAudit, "plan-audit"),
+        (PromptRole::PlanClarification, "plan-clarification"),
+        (PromptRole::Implementation, "implementation"),
+        (PromptRole::Review, "review"),
+        (PromptRole::ReviewAudit, "review-audit"),
+        (PromptRole::ReviewClarification, "review-clarification"),
+    ];
+    let mut prompts = Vec::new();
+    for (role, instruction_name) in roles {
+        let prompt = build_prompt(
+            Path::new("/project"),
+            &profile,
+            PromptContext {
+                role,
+                spec_id: "1",
+                spec_path: Path::new("specs/1.md"),
+                plan_path: Some(Path::new(".spec-loop/plans/1.md")),
+                feedback: None,
+                validation_feedback: None,
+                checks: "",
+                implementation_summary: None,
+            },
+        )
+        .expect("build role prompt");
+        let configured_path = format!("role-instructions/{instruction_name}.md");
+        assert!(prompt.contains(&configured_path));
+        assert!(
+            prompt.contains("Read and follow it using the selected backend's available tools.")
+        );
+        prompts.push((role, prompt));
+    }
+
+    let author = &prompts[0].1;
+    assert!(author.contains("Create or revise selected plan only; do not implement."));
+    for (role, prompt) in &prompts {
+        if matches!(
+            role,
+            PromptRole::PlanReview
+                | PromptRole::PlanAudit
+                | PromptRole::Review
+                | PromptRole::ReviewAudit
+        ) {
+            assert!(prompt.contains("Review and audit roles must not mutate repository files."));
+        }
+        if matches!(role, PromptRole::PlanAudit | PromptRole::ReviewAudit) {
+            assert!(prompt.contains("Do not add, remove, or rewrite findings."));
+        }
+    }
+    assert!(
+        prompts[3]
+            .1
+            .contains("Provide citations only for requested plan-review finding IDs.")
+    );
+    assert!(
+        prompts[7]
+            .1
+            .contains("Provide citations only for requested implementation-review finding IDs.")
+    );
+}
+
+#[test]
 fn finding_audits_receive_skeptical_proportionate_correction_contract() {
     let profile: Profile = toml::from_str(
             "schema_version = 3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='(?P<id>.*)'\n[agent]\nbackend='pi'\n",

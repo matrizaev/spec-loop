@@ -223,6 +223,8 @@ pub struct AgentConfig {
     pub thinking: Option<ThinkingLevel>,
     /// Optional user-provided built-in model context limit.
     pub context_window_tokens: Option<u64>,
+    /// Opts the built-in backend into native Responses API compaction.
+    pub context_compaction: bool,
     pub stages: AgentStages,
     pub timeout_seconds: Option<u64>,
     pub max_tool_calls: Option<usize>,
@@ -237,6 +239,7 @@ impl Default for AgentConfig {
             model: None,
             thinking: None,
             context_window_tokens: None,
+            context_compaction: false,
             stages: AgentStages::default(),
             timeout_seconds: None,
             max_tool_calls: None,
@@ -432,6 +435,11 @@ fn validate_agent(agent: &AgentConfig) -> Result<()> {
                 "{field} is only valid for the built-in backend"
             )));
         }
+    }
+    if agent.backend == AgentBackendKind::Pi && agent.context_compaction {
+        return Err(SpecLoopError::Config(
+            "agent.context_compaction is only valid for the built-in backend".to_owned(),
+        ));
     }
     match agent.backend {
         AgentBackendKind::Builtin => {

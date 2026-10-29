@@ -419,6 +419,75 @@ fn missing_shell_fails_before_provider_request() {
 }
 
 #[test]
+fn builtin_system_instruction_hierarchy_is_shared_by_every_role() {
+    let profile = builtin_test_profile();
+    let roles = [
+        PromptRole::PlanAuthor,
+        PromptRole::PlanReview,
+        PromptRole::PlanAudit,
+        PromptRole::PlanClarification,
+        PromptRole::Implementation,
+        PromptRole::Review,
+        PromptRole::ReviewAudit,
+        PromptRole::ReviewClarification,
+    ];
+    let conversation = super::BuiltinConversation {
+        input: Vec::new(),
+        current_task: String::new(),
+        latest_generation_usage: None,
+        tool_calls: None,
+    };
+    for role in roles {
+        let request =
+            super::build_responses_request(&profile, role, "fixture-model", &conversation, false)
+                .expect("build role request");
+        assert_eq!(request["instructions"], super::SYSTEM_INSTRUCTIONS);
+        assert_eq!(request["text"]["format"]["name"], role.protocol_name());
+    }
+
+    let instructions = super::SYSTEM_INSTRUCTIONS;
+    for required in [
+        "Before inspecting workspace file contents or modifying a file",
+        "from the workspace root through that file's parent directory, root to leaf",
+        "reading each full instruction or reusing full contents already available in current context",
+        "Path-only listings and searches",
+        "For a file not yet created, use its intended parent",
+        "sharing already checked ancestors",
+        "sibling or unrelated directories",
+        "Deeper applicable instructions override conflicting ancestor rules only within their own scope",
+        "retain nonconflicting ancestor rules",
+        "Configured role-instruction paths remain required wherever configured",
+        "are not necessarily the complete hierarchy",
+        "does not expand `AGENTS.md` scope, change precedence",
+        "check each directory segment once and remember checked directories even when no `AGENTS.md` exists",
+        "read each applicable instruction file once",
+        "a path or summary alone is not full contents",
+        "check only previously unchecked segments",
+        "created, changed, moved, or deleted",
+        "when full contents are no longer available",
+        "A fresh role invocation establishes its own hierarchy",
+        "Permission errors, failed discovery commands, and incomplete or truncated output do not establish absence or complete reading",
+        "stop affected work and report the path and failure through the role's existing contract",
+        "Report unresolved repository/configured-instruction conflicts",
+        "Locate relevant paths, establish their instructions, then use scoped content searches and targeted file ranges",
+        "batch independent bounded read-only operations only after instruction discovery",
+        "preserve each operation's diagnostics",
+        "Prefer quiet targeted tests during iteration without replacing required verification",
+        "never replay a mutation solely to recover omitted output",
+        "not hard inspection caps or a requirement for any particular search utility",
+        "PlanAuthor may write only the selected plan",
+        "review, audit, and clarification roles are read-only",
+    ] {
+        assert!(
+            instructions.contains(required),
+            "missing guidance: {required}"
+        );
+    }
+    assert!(!instructions.contains("automatically discover"));
+    assert!(!instructions.contains("new tool"));
+}
+
+#[test]
 fn all_roles_map_to_their_configured_stage_family() {
     let roles = [
         (PromptRole::PlanAuthor, AgentStage::Planning),
@@ -621,6 +690,7 @@ model='fixture-model'
             .expect("provider request body");
         let payload: Value = serde_json::from_str(payload).expect("parse request body");
         assert_eq!(payload["input"][0]["content"], expected_prompt);
+        assert_eq!(payload["instructions"], super::SYSTEM_INSTRUCTIONS);
         assert_eq!(payload["text"]["format"]["type"], "json_schema");
         assert_eq!(payload["text"]["format"]["name"], role.protocol_name());
         assert_eq!(payload["text"]["format"]["strict"], true);
@@ -1469,4 +1539,559 @@ fn malformed_typed_response_correction_reuses_completed_shell_state() {
         bodies[2]["input"][4]["content"],
         "Correct malformed typed response only; do not invoke tools."
     );
+}
+
+fn compaction_profile(context_limit: Option<u64>, stage_model_override: bool) -> Profile {
+    let context_limit = context_limit.map_or_else(String::new, |limit| {
+        format!("context_window_tokens={limit}\n")
+    });
+    let stage_override = if stage_model_override {
+        "[agent.stages.implementation]\nmodel='stage-model'\n"
+    } else {
+        ""
+    };
+    let profile: Profile = toml::from_str(&format!(
+        "schema_version=3\n[specs]\nactive_globs=['specs/*.md']\nid_regex='^specs/(?P<id>[0-9]+)\\\\.md$'\n[agent]\nbackend='builtin'\nmodel='fixture-model'\ncontext_compaction=true\n{context_limit}max_tool_calls=2\n{stage_override}"
+    ))
+    .expect("parse compaction test profile");
+    profile
+        .validate()
+        .expect("validate compaction test profile");
+    profile
+}
+
+fn compact_response(output: &Value) -> Value {
+    json!({
+        "id": "resp_001",
+        "created_at": 1_731_459_200,
+        "object": "response.compaction",
+        "output": output,
+        "usage": {"input_tokens": 42, "output_tokens": 10, "total_tokens": 52}
+    })
+}
+
+fn shell_turn(command: &str, input_tokens: u64) -> Value {
+    response_with_usage(
+        &json!([{
+            "type": "function_call",
+            "call_id": "compact-tool-once",
+            "name": "spec_loop.shell",
+            "arguments": serde_json::to_string(&json!({"command": command}))
+                .expect("serialize compaction shell command")
+        }]),
+        input_tokens,
+        0,
+    )
+}
+
+fn final_implementation_response() -> Value {
+    response_with_usage(
+        &json!([{
+            "type": "message",
+            "content": [{
+                "type": "output_text",
+                "text": r#"{"response":{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Compacted continuation completed."}}"#
+            }]
+        }]),
+        4,
+        1,
+    )
+}
+
+fn assert_compaction_wire(requests: &[String], task: &str, retained: &Value, compact_item: &Value) {
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].starts_with("POST /v1/responses "));
+    assert!(requests[1].starts_with("POST /v1/responses/compact "));
+    assert!(requests[2].starts_with("POST /v1/responses "));
+    assert!(requests.iter().all(|request| {
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fixture-access-token")
+            && !request.to_ascii_lowercase().contains("x-api-key")
+    }));
+    let compact_request = provider_request_payload(&requests[1]);
+    assert_eq!(compact_request["model"], "fixture-model");
+    assert_eq!(compact_request["instructions"], super::SYSTEM_INSTRUCTIONS);
+    let original_input = compact_request["input"].as_array().expect("full input");
+    assert_eq!(original_input.len(), 3);
+    assert_eq!(original_input[0]["content"], task);
+    assert_eq!(original_input[1]["type"], "function_call");
+    assert_eq!(original_input[1]["call_id"], "compact-tool-once");
+    assert_eq!(original_input[2]["type"], "function_call_output");
+    assert!(
+        original_input[2]["output"]
+            .as_str()
+            .is_some_and(|text| text.contains("exit_status=0"))
+    );
+    let next_generation = provider_request_payload(&requests[2]);
+    assert_eq!(
+        next_generation["input"],
+        json!([retained, compact_item, {"role":"user","content":task}])
+    );
+    assert_eq!(next_generation["model"], "fixture-model");
+    assert_eq!(next_generation["instructions"], super::SYSTEM_INSTRUCTIONS);
+    assert_eq!(
+        next_generation["tools"][0],
+        super::shell::shell_tool_definition()
+    );
+    assert_eq!(next_generation["tool_choice"], "auto");
+    assert_eq!(next_generation["text"]["format"]["type"], "json_schema");
+    assert_eq!(next_generation["text"]["format"]["name"], "implementation");
+    assert_eq!(next_generation["text"]["format"]["strict"], true);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_compaction_runs_after_tool_results_and_reuses_canonical_typed_state() {
+    let temporary = TempDir::new().expect("create compact project");
+    let marker = temporary.path().join("compacted-side-effect");
+    let command = format!("printf x >> '{}'", marker.display());
+    let retained = json!({
+        "type": "message",
+        "id": "retained-message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "retained provider item"}]
+    });
+    let compact_item = json!({
+        "type": "compaction",
+        "id": "cmp_001",
+        "encrypted_content": "opaque-native-state"
+    });
+    let canonical_output = json!([retained, compact_item]);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind compaction provider");
+    let address = listener.local_addr().expect("compaction address");
+    let server = serve_responses(
+        listener,
+        [
+            Reply::sse(completed_sse(&shell_turn(&command, 800))),
+            Reply::http("200 OK", compact_response(&canonical_output).to_string()),
+            Reply::sse(completed_sse(&final_implementation_response())),
+        ],
+    );
+    let profile = compaction_profile(Some(1000), false);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut transcript = Vec::new();
+    let mut completed_conversation = None;
+    let mut usage = crate::backend::UsageSnapshot::default();
+    let task = "execute once, then continue with native compaction";
+    let result = crate::runtime::block_on(run_role_with_usage(
+        RoleInput {
+            root: temporary.path(),
+            profile: &profile,
+            prompt: task,
+            role: PromptRole::Implementation,
+            cancelled: &cancelled,
+            deadline: None,
+            endpoint: &format!("http://{address}/v1/responses"),
+            token: "fixture-access-token",
+        },
+        None,
+        &mut completed_conversation,
+        &mut transcript,
+        &mut usage,
+    ))
+    .expect("construct native compaction runtime")
+    .expect("finish after compaction");
+    assert!(result.response.contains("Compacted continuation completed"));
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("read shell effect"),
+        "x"
+    );
+    assert_eq!(usage.provider_request_attempts, Some(3));
+    assert_eq!(usage.completed_responses, Some(2));
+    assert_eq!(usage.executed_shell_calls, Some(1));
+    assert_eq!(
+        usage.latest_response.as_ref().and_then(|item| item.total),
+        Some(5)
+    );
+    assert_eq!(
+        completed_conversation
+            .as_ref()
+            .and_then(|conversation| conversation.tool_calls),
+        Some(1),
+        "compaction must not reset per-role shell count"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&transcript)
+            .matches("$ printf")
+            .count(),
+        1
+    );
+
+    let requests = server.join().expect("join compaction provider");
+    assert_compaction_wire(&requests, task, &retained, &compact_item);
+    let report = usage.format_report("implementation", "fixture-model", 0, Some(1000));
+    assert!(report.contains("∑ Native compaction usage\n  42 in · 10 out · 52 total"));
+}
+
+#[cfg(unix)]
+#[test]
+fn native_compaction_skips_below_threshold_missing_usage_and_unapplicable_limit() {
+    for (label, limit, stage_override, usage_tokens) in [
+        ("below", Some(1000), false, Some(799)),
+        ("missing-usage", Some(1000), false, None),
+        ("stage-limit-unknown", Some(1000), true, Some(900)),
+    ] {
+        let temporary = TempDir::new().expect("create no-compaction project");
+        let marker = temporary.path().join(label);
+        let command = format!("printf x >> '{}'", marker.display());
+        let first = usage_tokens.map_or_else(
+            || {
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "output": shell_turn(&command, 1)["response"]["output"].clone()
+                    }
+                })
+            },
+            |tokens| shell_turn(&command, tokens),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind no-compaction provider");
+        let address = listener.local_addr().expect("no-compaction address");
+        let server = serve_responses(
+            listener,
+            [
+                Reply::sse(completed_sse(&first)),
+                Reply::sse(completed_sse(&final_implementation_response())),
+            ],
+        );
+        let profile = compaction_profile(limit, stage_override);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut transcript = Vec::new();
+        let mut conversation = None;
+        let mut usage = crate::backend::UsageSnapshot::default();
+        let result = crate::runtime::block_on(run_role_with_usage(
+            RoleInput {
+                root: temporary.path(),
+                profile: &profile,
+                prompt: "one tool turn must not be replayed",
+                role: PromptRole::Implementation,
+                cancelled: &cancelled,
+                deadline: None,
+                endpoint: &format!("http://{address}/v1/responses"),
+                token: "fixture-access-token",
+            },
+            None,
+            &mut conversation,
+            &mut transcript,
+            &mut usage,
+        ))
+        .expect("construct no-compaction runtime")
+        .expect("complete without compaction");
+        assert!(result.response.contains("Compacted continuation completed"));
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("read shell effect"),
+            "x"
+        );
+        assert_eq!(usage.provider_request_attempts, Some(2));
+        assert_eq!(usage.completed_responses, Some(2));
+        assert_eq!(usage.executed_shell_calls, Some(1));
+        let requests = server.join().expect("join no-compaction provider");
+        assert_eq!(requests.len(), 2, "{label} must skip compact endpoint");
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("POST /v1/responses "))
+        );
+    }
+}
+
+#[test]
+fn compaction_response_validation_rejects_incomplete_native_state() {
+    let valid = compact_response(&json!([
+        {"type":"compaction","encrypted_content":"opaque"}
+    ]));
+    assert_eq!(
+        super::validate_compaction_response(&valid)
+            .expect("valid state")
+            .len(),
+        1
+    );
+    for item in [
+        json!({"type":"compaction","encrypted_content":"opaque"}),
+        json!({"type":"compaction","id":null,"encrypted_content":"opaque"}),
+    ] {
+        let response = compact_response(&json!([item]));
+        assert_eq!(
+            super::validate_compaction_response(&response)
+                .expect("optional native item ID is valid")
+                .len(),
+            1
+        );
+    }
+    for response in [
+        json!({"created_at":1,"object":"response.compaction","output":[{"type":"compaction","encrypted_content":"x"}]}),
+        json!({"id":"r","created_at":"1","object":"response.compaction","output":[{"type":"compaction","encrypted_content":"x"}]}),
+        json!({"id":"r","created_at":1,"object":"wrong","output":[{"type":"compaction","encrypted_content":"x"}]}),
+        json!({"id":"r","created_at":1,"object":"response.compaction"}),
+        json!({"id":"r","created_at":1,"object":"response.compaction","output":[]}),
+        json!({"id":"r","created_at":1,"object":"response.compaction","output":[{}]}),
+        json!({"id":"r","created_at":1,"object":"response.compaction","output":[{"type":"message"}]}),
+        json!({"id":"r","created_at":1,"object":"response.compaction","output":[{"type":"compaction","encrypted_content":1}]}),
+        json!({"id":"r","created_at":1,"object":"response.compaction","output":[{"type":"compaction","encrypted_content":"x","id":1}]}),
+    ] {
+        assert!(
+            super::validate_compaction_response(&response).is_err(),
+            "{response}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_native_compaction_stops_after_effect_without_retry_or_state_replacement() {
+    let temporary = TempDir::new().expect("create compact failure project");
+    let marker = temporary.path().join("completed-effect");
+    let command = format!("printf x > '{}'", marker.display());
+    for compact_reply in [
+        Reply::http(
+            "404 Not Found",
+            "unsupported-provider-detail-secret".to_owned(),
+        ),
+        Reply::http(
+            "200 OK",
+            json!({
+                "id":"resp_001",
+                "created_at":1_731_459_200,
+                "object":"response.compaction",
+                "output":[{"type":"message","content":[]}]
+            })
+            .to_string(),
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind failed compact provider");
+        let address = listener.local_addr().expect("failed compact address");
+        let server = serve_responses(
+            listener,
+            [
+                Reply::sse(completed_sse(&shell_turn(&command, 800))),
+                compact_reply,
+            ],
+        );
+        let profile = compaction_profile(Some(1000), false);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut transcript = Vec::new();
+        let mut completed_conversation = None;
+        let mut usage = crate::backend::UsageSnapshot::default();
+        let error = crate::runtime::block_on(run_role_with_usage(
+            RoleInput {
+                root: temporary.path(),
+                profile: &profile,
+                prompt: "effect must not repeat after compaction fails",
+                role: PromptRole::Implementation,
+                cancelled: &cancelled,
+                deadline: None,
+                endpoint: &format!("http://{address}/v1/responses"),
+                token: "fixture-access-token",
+            },
+            None,
+            &mut completed_conversation,
+            &mut transcript,
+            &mut usage,
+        ))
+        .expect("construct failed compaction runtime")
+        .expect_err("failed compaction stops role");
+        assert!(error.to_string().contains("compaction"));
+        assert!(
+            !error
+                .to_string()
+                .contains("unsupported-provider-detail-secret")
+        );
+        assert!(!error.to_string().contains("opaque"));
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("read completed effect"),
+            "x"
+        );
+        assert!(
+            completed_conversation.is_none(),
+            "invalid state is never handed off"
+        );
+        assert_eq!(usage.provider_request_attempts, Some(2));
+        assert_eq!(usage.completed_responses, Some(1));
+        assert_eq!(usage.executed_shell_calls, Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&transcript)
+                .matches("$ printf")
+                .count(),
+            1
+        );
+        let requests = server.join().expect("join failed compaction provider");
+        assert_eq!(
+            requests.len(),
+            2,
+            "must not generate or retry after compact failure"
+        );
+        assert!(requests[0].starts_with("POST /v1/responses "));
+        assert!(requests[1].starts_with("POST /v1/responses/compact "));
+    }
+}
+
+#[test]
+fn correction_continuation_compacts_invocation_local_native_state_without_tool_replay() {
+    let initial_text = response_with_usage(
+        &json!([{
+            "type": "message",
+            "content": [{"type": "output_text", "text": r#"{"response":{"unexpected":"typed schema failure"}}"#}]
+        }]),
+        800,
+        0,
+    );
+    let compacted_output = json!([
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"canonical retained"}]},
+        {"type":"compaction","encrypted_content":"opaque-correction-state"}
+    ]);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind correction compaction provider");
+    let address = listener
+        .local_addr()
+        .expect("correction compaction address");
+    let server = serve_responses(
+        listener,
+        [
+            Reply::sse(completed_sse(&initial_text)),
+            Reply::http("200 OK", compact_response(&compacted_output).to_string()),
+            Reply::sse(completed_sse(&final_implementation_response())),
+        ],
+    );
+    let temporary = TempDir::new().expect("create correction project");
+    let profile = compaction_profile(Some(1000), false);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut transcript = Vec::new();
+    let mut conversation = None;
+    let mut initial_usage = crate::backend::UsageSnapshot::default();
+    let first = crate::runtime::block_on(run_role_with_usage(
+        RoleInput {
+            root: temporary.path(),
+            profile: &profile,
+            prompt: "original role task",
+            role: PromptRole::Implementation,
+            cancelled: &cancelled,
+            deadline: None,
+            endpoint: &format!("http://{address}/v1/responses"),
+            token: "fixture-access-token",
+        },
+        None,
+        &mut conversation,
+        &mut transcript,
+        &mut initial_usage,
+    ))
+    .expect("construct initial role runtime")
+    .expect("receive malformed typed handoff for correction");
+    assert!(first.response.contains("typed schema failure"));
+    let mut correction_usage = crate::backend::UsageSnapshot::default();
+    let correction_task = "correct the typed handoff only";
+    let corrected = crate::runtime::block_on(run_role_with_usage(
+        RoleInput {
+            root: temporary.path(),
+            profile: &profile,
+            prompt: correction_task,
+            role: PromptRole::Implementation,
+            cancelled: &cancelled,
+            deadline: None,
+            endpoint: &format!("http://{address}/v1/responses"),
+            token: "fixture-access-token",
+        },
+        conversation,
+        &mut None,
+        &mut transcript,
+        &mut correction_usage,
+    ))
+    .expect("construct correction runtime")
+    .expect("correct typed response after native compaction");
+    assert!(
+        corrected
+            .response
+            .contains("Compacted continuation completed")
+    );
+    assert_eq!(initial_usage.provider_request_attempts, Some(1));
+    assert_eq!(correction_usage.provider_request_attempts, Some(2));
+    assert_eq!(correction_usage.completed_responses, Some(1));
+    assert_eq!(correction_usage.executed_shell_calls, Some(0));
+    let requests = server.join().expect("join correction compaction provider");
+    assert_eq!(requests.len(), 3);
+    let compact_request = provider_request_payload(&requests[1]);
+    assert_eq!(compact_request["input"][0]["content"], "original role task");
+    assert!(
+        compact_request["input"]
+            .to_string()
+            .contains("typed schema failure")
+    );
+    assert_eq!(compact_request["input"][2]["content"], correction_task);
+    let next = provider_request_payload(&requests[2]);
+    let mut expected_input = compacted_output
+        .as_array()
+        .expect("canonical array")
+        .clone();
+    expected_input.push(json!({"role":"user","content":correction_task}));
+    assert_eq!(next["input"], json!(expected_input));
+    assert_eq!(next["tool_choice"], "none");
+}
+
+#[test]
+fn compaction_is_not_attempted_when_disabled_or_after_final_generation() {
+    for (enabled, has_followup) in [(false, true), (true, false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind no-next-generation provider");
+        let address = listener.local_addr().expect("no-next-generation address");
+        let final_response = response_with_usage(
+            &json!([{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": r#"{"response":{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Final response."}}"#
+                }]
+            }]),
+            900,
+            0,
+        );
+        let replies = if has_followup {
+            vec![
+                Reply::sse(completed_sse(&shell_turn("true", 900))),
+                Reply::sse(completed_sse(&final_implementation_response())),
+            ]
+        } else {
+            vec![Reply::sse(completed_sse(&final_response))]
+        };
+        let server = serve_responses(listener, replies);
+        let profile = if enabled {
+            compaction_profile(Some(1000), false)
+        } else {
+            let mut profile = compaction_profile(Some(1000), false);
+            profile.agent.context_compaction = false;
+            profile
+        };
+        let temporary = TempDir::new().expect("create no-compaction project");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut transcript = Vec::new();
+        let mut conversation = None;
+        let mut usage = crate::backend::UsageSnapshot::default();
+        crate::runtime::block_on(run_role_with_usage(
+            RoleInput {
+                root: temporary.path(),
+                profile: &profile,
+                prompt: "no compaction after final or when disabled",
+                role: PromptRole::Implementation,
+                cancelled: &cancelled,
+                deadline: None,
+                endpoint: &format!("http://{address}/v1/responses"),
+                token: "fixture-access-token",
+            },
+            None,
+            &mut conversation,
+            &mut transcript,
+            &mut usage,
+        ))
+        .expect("construct no-compaction runtime")
+        .expect("complete without compaction");
+        let requests = server.join().expect("join no-compaction provider");
+        assert_eq!(requests.len(), if has_followup { 2 } else { 1 });
+        assert!(
+            requests
+                .iter()
+                .all(|request| request.starts_with("POST /v1/responses "))
+        );
+        assert_eq!(
+            usage.provider_request_attempts,
+            Some(if has_followup { 2 } else { 1 })
+        );
+    }
 }
