@@ -20,8 +20,6 @@ use crate::prompts::{self, PromptRole};
 use crate::protocol::provider as protocol_provider;
 use crate::runtime;
 
-#[cfg(test)]
-mod api_probe;
 #[cfg(all(test, unix))]
 mod blocker_tests;
 mod provider;

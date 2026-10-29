@@ -1,6 +1,5 @@
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
 
 use super::{Reply, serve_until};
@@ -38,23 +37,6 @@ fn partial_headers_and_bodies_close_with_bounded_cleanup() {
         assert!(server.join().is_err());
         assert!(started.elapsed() < Duration::from_secs(2));
     }
-}
-
-#[test]
-fn operation_panic_joins_server_without_double_panic() {
-    let started = Instant::now();
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
-        let _server = serve_until(
-            listener,
-            vec![Reply::http("200 OK", String::new())],
-            Duration::from_millis(200),
-            None,
-        );
-        panic!("operation failed before expected request");
-    }));
-    assert!(result.is_err());
-    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]

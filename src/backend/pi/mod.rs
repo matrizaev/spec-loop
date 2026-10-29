@@ -15,8 +15,6 @@ use crate::paths;
 use crate::prompts::PromptRole;
 
 #[cfg(test)]
-mod api_probe;
-#[cfg(test)]
 mod tests;
 
 /// Pi's machine-readable subprocess backend.
