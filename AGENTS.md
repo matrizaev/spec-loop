@@ -3,6 +3,7 @@
 ## Scope
 
 - Read relevant source, tests, configuration, and documentation before changing them. Make the smallest complete change consistent with clean, hexagonal architecture: explicit API and layer boundaries with clear responsibilities, domain-driven design, and strong types that enforce invariants and make invalid states unrepresentable.
+- Keep context small. Use `rg` before opening broad files; read only relevant code, tests, migrations, and docs. Do not recursively inspect the repository or open research, historical material, or unrelated upstream sources without a task-specific reason.
 
 ## Rust engineering
 
