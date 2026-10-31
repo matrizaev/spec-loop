@@ -42,11 +42,23 @@ Use only tools available to this backend. Locate relevant paths, establish their
 /// `OpenAI` Responses API backend using `ChatGPT` OAuth and one POSIX shell tool.
 pub(super) struct BuiltinBackend;
 
+#[derive(Default)]
 struct BuiltinConversation {
     input: Vec<Value>,
     current_task: String,
     latest_generation_usage: Option<ResponseUsage>,
     tool_calls: Option<usize>,
+}
+
+struct GenerationRequestContext<'a> {
+    client: &'a reqwest::Client,
+    endpoint: &'a str,
+    token: &'a str,
+    request: &'a Value,
+    incremental_input: Option<&'a [Value]>,
+    transport: &'a mut provider::ConversationTransport,
+    deadline: Option<Instant>,
+    cancelled: &'a AtomicBool,
 }
 
 struct CompactionContext<'a> {
@@ -437,7 +449,10 @@ async fn run_role_with_access_token(
     input: RoleInput<'_>,
     transcript: &mut Vec<u8>,
 ) -> Result<AgentResponse> {
-    run_role_with_continuation(input, None, &mut None, transcript).await
+    Box::pin(run_role_with_continuation(
+        input, None, &mut None, transcript,
+    ))
+    .await
 }
 
 #[cfg(test)]
@@ -448,7 +463,7 @@ async fn run_role_with_continuation(
     transcript: &mut Vec<u8>,
 ) -> Result<AgentResponse> {
     let token = input.token.to_owned();
-    run_role_with_token_provider(
+    Box::pin(run_role_with_token_provider(
         input,
         continuation,
         move || {
@@ -457,7 +472,7 @@ async fn run_role_with_continuation(
         },
         completed_conversation,
         transcript,
-    )
+    ))
     .await
 }
 
@@ -485,26 +500,81 @@ where
     .await
 }
 
+enum CompletedGeneration {
+    Final(AgentResponse),
+    ToolCalls(Vec<shell::ShellCall>),
+}
+
+fn parse_completed_generation(
+    response: &Value,
+    correction_only: bool,
+    model: &str,
+) -> Result<(Vec<Value>, CompletedGeneration)> {
+    let output = shell::completed_output(response)?;
+    let (calls, final_text) = shell::parse_output_items(&output)?;
+    if calls.is_empty() {
+        let response_text = normalize_structured_role_text(final_text)?;
+        let agent_response = AgentResponse {
+            response: response_text,
+            selected_model: Some(model.to_owned()),
+            response_model: response
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|reported| reported != model),
+        };
+        return Ok((output, CompletedGeneration::Final(agent_response)));
+    }
+    if correction_only {
+        return Err(SpecLoopError::Workflow(
+            "built-in response correction requested a tool call; completed workspace work was not replayed".to_owned(),
+        ));
+    }
+    Ok((output, CompletedGeneration::ToolCalls(calls)))
+}
+
+async fn send_generation_request(
+    context: GenerationRequestContext<'_>,
+    usage: &mut UsageSnapshot,
+    observer: &mut (dyn FnMut(&UsageSnapshot) -> Result<()> + Send),
+) -> Result<Value> {
+    let mut reporter = UsageReporter::new(usage, observer);
+    provider::request_with_conversation_observations(
+        provider::ConversationProviderRequest {
+            client: context.client,
+            endpoint: context.endpoint,
+            token: context.token,
+            body: context.request,
+            incremental_input: context.incremental_input,
+            transport: context.transport,
+            deadline: context.deadline,
+            cancelled: context.cancelled,
+        },
+        &mut reporter,
+    )
+    .await
+}
+
 fn start_conversation(
     continuation: Option<BuiltinConversation>,
     prompt: &str,
     max_tool_calls: Option<usize>,
 ) -> (bool, BuiltinConversation) {
     let correction_only = continuation.is_some();
-    let conversation = match continuation {
-        Some(mut conversation) => {
-            prompt.clone_into(&mut conversation.current_task);
-            conversation
-                .input
-                .push(json!({"role": "user", "content": prompt}));
-            conversation
-        }
-        None => BuiltinConversation {
-            input: vec![json!({"role": "user", "content": prompt})],
+    let conversation = if let Some(mut conversation) = continuation {
+        prompt.clone_into(&mut conversation.current_task);
+        conversation
+            .input
+            .push(json!({"role": "user", "content": prompt}));
+        conversation
+    } else {
+        let initial_input = json!({"role": "user", "content": prompt});
+        BuiltinConversation {
+            input: vec![initial_input],
             current_task: prompt.to_owned(),
             latest_generation_usage: None,
             tool_calls: max_tool_calls.map(|_| 0),
-        },
+        }
     };
     (correction_only, conversation)
 }
@@ -544,6 +614,8 @@ where
         })?;
     let (correction_only, mut conversation) =
         start_conversation(continuation, prompt, profile.agent.max_tool_calls);
+    let mut transport = provider::ConversationTransport::default();
+    let mut incremental_input = None;
     loop {
         provider::ensure_active(deadline, cancelled)?;
         if usage::compaction_threshold_reached(
@@ -551,6 +623,8 @@ where
             profile.agent.context_window_tokens_for(role.agent_stage()),
             conversation.latest_generation_usage.as_ref(),
         ) {
+            transport.reset_chain();
+            incremental_input = None;
             let token = provider::await_limited(token_provider(), deadline, cancelled).await??;
             compact_conversation(CompactionContext {
                 client: &client,
@@ -568,44 +642,35 @@ where
         let request =
             build_responses_request(profile, role, model, &conversation, correction_only)?;
         let token = provider::await_limited(token_provider(), deadline, cancelled).await??;
-        let response = {
-            let mut reporter = UsageReporter::new(usage, observer);
-            provider::request_with_observations(
-                &client,
+        let response = send_generation_request(
+            GenerationRequestContext {
+                client: &client,
                 endpoint,
-                &token,
-                &request,
+                token: &token,
+                request: &request,
+                incremental_input: incremental_input.as_deref(),
+                transport: &mut transport,
                 deadline,
                 cancelled,
-                &mut reporter,
-            )
-            .await?
-        };
+            },
+            usage,
+            observer,
+        )
+        .await?;
         let response_usage = ResponseUsage::from_response(&response);
         conversation.latest_generation_usage = response_usage.total.map(|_| response_usage);
-        let output = shell::completed_output(&response)?;
-        let (calls, final_text) = shell::parse_output_items(&output)?;
-        if calls.is_empty() {
-            let response_text = normalize_structured_role_text(final_text)?;
-            conversation.input.extend(output);
-            *completed_conversation = Some(conversation);
-            return Ok(AgentResponse {
-                response: response_text,
-                selected_model: Some(model.to_owned()),
-                response_model: response
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .filter(|reported| reported != model),
-            });
-        }
-        if correction_only {
-            return Err(SpecLoopError::Workflow(
-                "built-in response correction requested a tool call; completed workspace work was not replayed".to_owned(),
-            ));
-        }
+        let (output, generation) = parse_completed_generation(&response, correction_only, model)?;
+        let calls = match generation {
+            CompletedGeneration::Final(agent_response) => {
+                conversation.input.extend(output);
+                *completed_conversation = Some(conversation);
+                return Ok(agent_response);
+            }
+            CompletedGeneration::ToolCalls(calls) => calls,
+        };
 
         conversation.input.extend(output);
+        let result_start = conversation.input.len();
         let mut reporter = UsageReporter::new(usage, observer);
         shell::execute_shell_calls(
             shell::ShellExecutionContext {
@@ -619,5 +684,6 @@ where
             calls,
             &mut reporter,
         )?;
+        incremental_input = Some(conversation.input[result_start..].to_vec());
     }
 }

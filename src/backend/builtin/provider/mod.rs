@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use self::request::encode_request;
+pub(super) use self::websocket::{
+    ConversationProviderRequest, ConversationTransport, request_with_conversation_observations,
+};
 use crate::backend::builtin::usage::UsageReporter;
 #[cfg(test)]
 use crate::backend::builtin::usage::UsageSnapshot;
@@ -13,6 +16,11 @@ use crate::error::{Result, SpecLoopError};
 mod request;
 #[cfg(test)]
 mod tests;
+mod websocket;
+#[cfg(test)]
+mod websocket_config_tests;
+#[cfg(test)]
+mod websocket_tests;
 
 const MAX_PROVIDER_RETRIES: u8 = 3;
 const MAX_RETRY_DELAY_SECONDS: u64 = 30;
@@ -42,6 +50,7 @@ pub(super) async fn request_with_retries(
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn request_with_observations(
     client: &reqwest::Client,
     endpoint: &str,
@@ -287,15 +296,9 @@ async fn read_streamed_response(
         }
     }
     if !pending.is_empty() || !state.is_event_empty() {
-        return Err(StreamFailure::Fatal(SpecLoopError::Agent(
-            "OpenAI Responses stream ended with a partial event".to_owned(),
-        )));
+        return Err(StreamFailure::RetryableProvider);
     }
-    state.completed.ok_or_else(|| {
-        StreamFailure::Fatal(SpecLoopError::Agent(
-            "OpenAI Responses stream ended without response.completed".to_owned(),
-        ))
-    })
+    state.completed.ok_or(StreamFailure::RetryableProvider)
 }
 
 #[derive(Default)]
@@ -401,6 +404,9 @@ impl SseState {
         event: &Value,
         reporter: &mut UsageReporter<'_>,
     ) -> std::result::Result<(), StreamFailure> {
+        if is_ignorable_provider_event(event_type) {
+            return Ok(());
+        }
         match event_type {
             "error" => {
                 let code = event
@@ -452,11 +458,6 @@ impl SseState {
                             .to_owned(),
                     )));
                 }
-                if event_type == "response.failed"
-                    && code.is_some_and(is_transient_provider_failure_code)
-                {
-                    return Err(StreamFailure::RetryableProvider);
-                }
                 Err(StreamFailure::Fatal(SpecLoopError::Workflow(
                     "OpenAI Responses stream reported a provider failure".to_owned(),
                 )))
@@ -505,8 +506,6 @@ impl SseState {
                 "response.completed event did not contain a settled response".to_owned(),
             )));
         }
-        reporter.snapshot.response_completed(&response);
-        reporter.report().map_err(StreamFailure::Fatal)?;
         let output = response
             .get_mut("output")
             .and_then(Value::as_array_mut)
@@ -518,6 +517,8 @@ impl SseState {
         if output.is_empty() {
             *output = std::mem::take(&mut self.output_items);
         }
+        reporter.snapshot.response_completed(&response);
+        reporter.report().map_err(StreamFailure::Fatal)?;
         self.lifecycle = ResponseLifecycle::Settled;
         self.completed = Some(response);
         Ok(())
@@ -526,6 +527,10 @@ impl SseState {
     const fn is_event_empty(&self) -> bool {
         self.event_name.is_none() && self.data.is_empty()
     }
+}
+
+fn is_ignorable_provider_event(event_type: &str) -> bool {
+    event_type == "codex.response.metadata" || event_type.starts_with("responsesapi.")
 }
 
 fn invalid_event_order(event_type: &str) -> StreamFailure {

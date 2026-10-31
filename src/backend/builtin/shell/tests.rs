@@ -266,6 +266,18 @@ fn builtin_sync_backend_enforces_one_role_deadline_across_provider_and_shell() {
         use std::time::Duration;
 
         let deadline = Instant::now() + WATCHDOG;
+        let mut handshake = accept_until(&listener, deadline).expect("accept WebSocket setup");
+        let handshake_request =
+            read_request_until(&mut handshake, deadline).expect("read WebSocket setup");
+        assert!(super::super::test_support::is_websocket_upgrade(
+            &handshake_request
+        ));
+        write_until(
+            &mut handshake,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            deadline,
+        )
+        .expect("reject unavailable WebSocket setup");
         let mut stream = accept_until(&listener, deadline).expect("accept provider request");
         let request = read_request_until(&mut stream, deadline).expect("read provider request");
         thread::sleep(Duration::from_millis(650));
@@ -461,12 +473,7 @@ fn shell_usage_counts_each_successfully_spawned_call() {
     let temporary = TempDir::new().expect("create shell usage fixture");
     let profile = builtin_test_profile();
     let cancelled = Arc::new(AtomicBool::new(false));
-    let mut conversation = BuiltinConversation {
-        input: Vec::new(),
-        current_task: String::new(),
-        latest_generation_usage: None,
-        tool_calls: None,
-    };
+    let mut conversation = BuiltinConversation::default();
     let calls = vec![
         ShellCall {
             call_id: "first".to_owned(),

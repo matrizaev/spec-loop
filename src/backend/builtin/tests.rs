@@ -28,7 +28,7 @@ async fn run_role_with_usage(
 ) -> crate::error::Result<super::AgentResponse> {
     let token = input.token.to_owned();
     let mut observer = |_: &crate::backend::UsageSnapshot| Ok(());
-    super::run_role_with_token_provider_observed(
+    Box::pin(super::run_role_with_token_provider_observed(
         input.with_test_deadline(),
         continuation,
         move || {
@@ -39,7 +39,7 @@ async fn run_role_with_usage(
         transcript,
         usage,
         &mut observer,
-    )
+    ))
     .await
 }
 
@@ -431,12 +431,7 @@ fn builtin_system_instruction_hierarchy_is_shared_by_every_role() {
         PromptRole::ReviewAudit,
         PromptRole::ReviewClarification,
     ];
-    let conversation = super::BuiltinConversation {
-        input: Vec::new(),
-        current_task: String::new(),
-        latest_generation_usage: None,
-        tool_calls: None,
-    };
+    let conversation = super::BuiltinConversation::default();
     for role in roles {
         let request =
             super::build_responses_request(&profile, role, "fixture-model", &conversation, false)
@@ -1629,6 +1624,8 @@ fn assert_compaction_wire(requests: &[String], task: &str, retained: &Value, com
         json!([retained, compact_item, {"role":"user","content":task}])
     );
     assert_eq!(next_generation["model"], "fixture-model");
+    assert_eq!(next_generation["store"], false);
+    assert!(next_generation.get("previous_response_id").is_none());
     assert_eq!(next_generation["instructions"], super::SYSTEM_INSTRUCTIONS);
     assert_eq!(
         next_generation["tools"][0],
@@ -1660,10 +1657,12 @@ fn native_compaction_runs_after_tool_results_and_reuses_canonical_typed_state() 
     let canonical_output = json!([retained, compact_item]);
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind compaction provider");
     let address = listener.local_addr().expect("compaction address");
+    let mut first_turn = shell_turn(&command, 800);
+    first_turn["response"]["id"] = json!("resp_before_compaction");
     let server = serve_responses(
         listener,
         [
-            Reply::sse(completed_sse(&shell_turn(&command, 800))),
+            Reply::sse(completed_sse(&first_turn)),
             Reply::http("200 OK", compact_response(&canonical_output).to_string()),
             Reply::sse(completed_sse(&final_implementation_response())),
         ],

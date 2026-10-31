@@ -138,7 +138,16 @@ fn serve_until(
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    requests.push(read_request_until(&mut stream, deadline)?);
+                    let request = read_request_until(&mut stream, deadline)?;
+                    if is_websocket_upgrade(&request) {
+                        write_until(
+                            &mut stream,
+                            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            deadline,
+                        )?;
+                        continue;
+                    }
+                    requests.push(request);
                     let fallback = Reply::http(
                         "400 Bad Request",
                         r#"{"error":{"code":"unexpected_request"}}"#.to_owned(),
@@ -241,7 +250,10 @@ pub(super) fn read_request_until(stream: &mut TcpStream, deadline: Instant) -> i
         if count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "provider request closed early",
+                format!(
+                    "provider request closed early after {} bytes",
+                    request.len()
+                ),
             ));
         }
         request.extend_from_slice(
@@ -257,15 +269,20 @@ pub(super) fn read_request_until(stream: &mut TcpStream, deadline: Instant) -> i
                 .get(..header_end)
                 .ok_or_else(|| io::Error::other("invalid header boundary"))?,
         );
-        let length = headers
+        let method_is_get = headers
             .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>())
-            })
-            .ok_or_else(|| io::Error::other("missing fixture Content-Length"))?
-            .map_err(io::Error::other)?;
+            .next()
+            .is_some_and(|line| line.starts_with("GET "));
+        let content_length = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>())
+        });
+        let length = match content_length {
+            Some(length) => length.map_err(io::Error::other)?,
+            None if method_is_get => 0,
+            None => return Err(io::Error::other("missing fixture Content-Length")),
+        };
         let end = header_end
             .checked_add(4)
             .and_then(|start| start.checked_add(length))
@@ -274,6 +291,15 @@ pub(super) fn read_request_until(stream: &mut TcpStream, deadline: Instant) -> i
             return String::from_utf8(request).map_err(io::Error::other);
         }
     }
+}
+
+/// Identifies the WebSocket setup requests that HTTP-only loopback fixtures reject.
+pub(super) fn is_websocket_upgrade(request: &str) -> bool {
+    request.lines().any(|line| {
+        line.split_once(':').is_some_and(|(name, value)| {
+            name.eq_ignore_ascii_case("upgrade") && value.trim().eq_ignore_ascii_case("websocket")
+        })
+    })
 }
 
 /// Builds a validated built-in profile without credentials or external resources.

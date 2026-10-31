@@ -36,7 +36,7 @@ impl Default for UsageSnapshot {
 }
 
 impl UsageSnapshot {
-    /// Records one HTTP request handed to the provider client.
+    /// Records one provider generation request attempt.
     pub fn request_sent(&mut self) {
         increment(&mut self.provider_request_attempts);
     }

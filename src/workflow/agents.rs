@@ -284,9 +284,13 @@ fn invoke_and_log_agent(
                         .write_log(&response_name, response.response.as_bytes())?;
                     Some(context.run_dir.log_path(&response_name))
                 }
-                Err(error) => {
+                Err(failure) => {
+                    let label = match failure.kind() {
+                        backend::BackendFailureKind::Retryable => "RETRY",
+                        backend::BackendFailureKind::Fatal => "ERROR",
+                    };
                     context.output.progress(&format!(
-                        "[RETRY] Agent {} diagnostics: {error}",
+                        "[{label}] Agent {} diagnostics: {failure}",
                         role_display(role)
                     ))?;
                     None

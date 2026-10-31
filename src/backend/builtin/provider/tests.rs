@@ -160,6 +160,52 @@ fn mixed_http_and_stream_failures_share_one_retry_limit() {
 }
 
 #[test]
+fn incomplete_streams_retry_within_shared_provider_retry_limit() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
+    let address = listener.local_addr().expect("provider fixture address");
+    let partial_event =
+        format!("{RESPONSE_STARTED}event: response.output_text.delta\ndata: partial");
+    let retry_reply = || {
+        let mut reply = Reply::sse(partial_event.clone());
+        reply.headers = "Retry-After: 0\r\n";
+        reply
+    };
+    let server = serve_responses(
+        listener,
+        [retry_reply(), retry_reply(), retry_reply(), retry_reply()],
+    );
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("build provider client");
+    let mut usage = UsageSnapshot::default();
+    let mut observer = |_: &UsageSnapshot| Ok(());
+    let mut reporter = UsageReporter::new(&mut usage, &mut observer);
+    let result = crate::runtime::block_on(request_with_observations(
+        &client,
+        &format!("http://{address}/v1/responses"),
+        "fixture-access-token",
+        &json!({"model": "fixture-model", "stream": true}),
+        Some(server.deadline()),
+        &AtomicBool::new(false),
+        &mut reporter,
+    ))
+    .expect("construct provider runtime");
+
+    assert_eq!(
+        result
+            .expect_err("incomplete streams exhaust retry cap")
+            .to_string(),
+        "workflow stopped: OpenAI Responses stream failed after 3 retries"
+    );
+    assert_eq!(usage.provider_request_attempts, Some(4));
+    assert_eq!(usage.completed_responses, Some(0));
+    let requests = server.join().expect("join provider fixture");
+    assert_eq!(requests.len(), 4);
+    assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
 fn request_attempt_is_reported_while_provider_response_is_held() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
@@ -233,7 +279,7 @@ fn request_attempt_is_reported_while_provider_response_is_held() {
 }
 
 #[test]
-fn completed_usage_is_observed_before_malformed_output_validation() {
+fn malformed_completed_output_does_not_advance_usage() {
     let mut state = SseState::default();
     let mut usage = UsageSnapshot::default();
     let mut live_count = 0_u64;
@@ -268,12 +314,9 @@ fn completed_usage_is_observed_before_malformed_output_validation() {
             Err(StreamFailure::Fatal(_))
         ));
     }
-    assert_eq!(usage.completed_responses, Some(1));
-    assert_eq!(
-        usage.latest_response.as_ref().and_then(|item| item.total),
-        Some(3)
-    );
-    assert_eq!(live_count, 1);
+    assert_eq!(usage.completed_responses, Some(0));
+    assert_eq!(usage.latest_response, None);
+    assert_eq!(live_count, 0);
 }
 
 #[cfg(unix)]
@@ -342,6 +385,142 @@ fn incomplete_response_after_shell_effect_is_fatal_without_replay_or_handoff() {
     let requests = server.join().expect("join incomplete-response fixture");
     assert_eq!(requests.len(), 2);
     assert!(requests.iter().all(|request| request.starts_with("POST ")));
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_completion_retries_only_current_request_and_preserves_completed_history() {
+    let temporary = TempDir::new().expect("create retry project");
+    let completed_marker = temporary.path().join("completed-effect");
+    let incomplete_marker = temporary.path().join("incomplete-effect");
+    let [first_response, incomplete_stream, final_response] =
+        recovery_response_script(&completed_marker, &incomplete_marker);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry fixture");
+    let address = listener.local_addr().expect("retry fixture address");
+    let server = serve_responses(
+        listener,
+        [
+            Reply::sse(first_response),
+            Reply::sse(incomplete_stream),
+            Reply::sse(final_response),
+        ],
+    );
+    let profile = builtin_test_profile();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let endpoint = format!("http://{address}/v1/responses");
+    let input = RoleInput {
+        root: temporary.path(),
+        profile: &profile,
+        prompt: "execute completed work once and finish the role",
+        role: PromptRole::Implementation,
+        cancelled: &cancelled,
+        deadline: None,
+        endpoint: &endpoint,
+        token: "fixture-access-token",
+    };
+    let token = input.token.to_owned();
+    let mut conversation = None;
+    let mut transcript = Vec::new();
+    let mut usage = UsageSnapshot::default();
+    let mut observer = |_: &UsageSnapshot| Ok(());
+    let result = crate::runtime::block_on(super::super::run_role_with_token_provider_observed(
+        input.with_test_deadline(),
+        None,
+        move || {
+            let token = token.clone();
+            async move { Ok(token) }
+        },
+        &mut conversation,
+        &mut transcript,
+        &mut usage,
+        &mut observer,
+    ))
+    .expect("construct retry runtime")
+    .expect("retry incomplete provider stream");
+
+    assert!(result.response.contains("Completed after retry"));
+    assert_eq!(
+        std::fs::read_to_string(&completed_marker).expect("read completed effect"),
+        "x"
+    );
+    assert!(
+        !incomplete_marker.exists(),
+        "incomplete tool call must not execute"
+    );
+    assert_eq!(usage.provider_request_attempts, Some(3));
+    assert_eq!(usage.completed_responses, Some(2));
+    assert_eq!(usage.executed_shell_calls, Some(1));
+
+    let requests = server.join().expect("join retry fixture");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1], requests[2],
+        "retry exact current request bytes"
+    );
+    let payload = |request: &str| {
+        let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+        serde_json::from_str::<Value>(body).expect("parse request payload")
+    };
+    let first_payload = payload(&requests[0]);
+    assert_eq!(first_payload["store"], false);
+    assert!(first_payload.get("previous_response_id").is_none());
+    let retried_payload = payload(&requests[1]);
+    assert_eq!(retried_payload["store"], false);
+    assert!(retried_payload.get("previous_response_id").is_none());
+    let input = retried_payload["input"].as_array().expect("full history");
+    assert_eq!(input.len(), 3);
+    assert_eq!(
+        input[0]["content"],
+        "execute completed work once and finish the role"
+    );
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[2]["type"], "function_call_output");
+}
+
+fn recovery_response_script(completed_marker: &Path, incomplete_marker: &Path) -> [String; 3] {
+    let completed_command = format!("printf x >> '{}'", completed_marker.display());
+    let first_response = completed_sse(&json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp_completed_tool_turn",
+            "status": "completed",
+            "output": [shell_call_item("completed-shell-call", &completed_command)],
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}
+        }
+    }));
+    let incomplete_command = format!("touch {}", incomplete_marker.display());
+    let incomplete_call = shell_call_item("incomplete-shell-call", &incomplete_command);
+    let incomplete_stream = format!(
+        "{RESPONSE_STARTED}{}",
+        sse_event(
+            "response.output_item.done",
+            &json!({"type": "response.output_item.done", "item": incomplete_call})
+        )
+    );
+    let final_text = r#"{"response":{"protocol_version":1,"role":"implementation","status":"ready_for_review","summary":"Completed after retry."}}"#;
+    let final_response = completed_sse(&json!({
+        "type": "response.completed",
+        "response": {
+            "id": "resp_final_turn",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": final_text}]
+            }],
+            "usage": {"input_tokens": 20, "output_tokens": 3, "total_tokens": 23}
+        }
+    }));
+    [first_response, incomplete_stream, final_response]
+}
+
+fn shell_call_item(call_id: &str, command: &str) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": "spec_loop.shell",
+        "arguments": serde_json::to_string(&json!({"command": command}))
+            .expect("serialize shell call")
+    })
 }
 
 fn incomplete_response_events(completed_marker: &Path, forbidden_marker: &Path) -> [String; 2] {
@@ -702,14 +881,11 @@ fn rate_limit_error_event_retries_stream_request() {
 }
 
 #[test]
-fn rate_limit_response_failed_event_retries_stream_request() {
-    assert_transient_sse_failure_retries(
-        "response.failed",
-        &json!({
-            "type": "response.failed",
-            "response": {"error": {"code": "rate_limit_exceeded"}}
-        }),
-    );
+fn rate_limit_response_failed_event_is_fatal_without_retry() {
+    assert_response_failed_is_fatal(&json!({
+        "type": "response.failed",
+        "response": {"error": {"code": "rate_limit_exceeded"}}
+    }));
 }
 
 #[test]
@@ -724,16 +900,21 @@ fn subscription_sharing_unavailable_error_event_retries_stream_request() {
 }
 
 #[test]
-fn subscription_sharing_unavailable_response_failed_retries_stream_request() {
-    assert_transient_sse_failure_retries(
-        "response.failed",
-        &json!({
-            "type": "response.failed",
-            "response": {
-                "error": {"code": "subscription_sharing_usage_unavailable"}
-            }
-        }),
-    );
+fn subscription_sharing_unavailable_response_failed_is_fatal_without_retry() {
+    assert_response_failed_is_fatal(&json!({
+        "type": "response.failed",
+        "response": {
+            "error": {"code": "subscription_sharing_usage_unavailable"}
+        }
+    }));
+}
+
+fn assert_response_failed_is_fatal(event: &Value) {
+    let body = format!("{RESPONSE_STARTED}{}", sse_event("response.failed", event));
+    let (response, request) = fake_stream_request(body);
+    let error = response.expect_err("every response.failed event is fatal");
+    assert!(error.to_string().contains("provider failure"));
+    assert!(request.starts_with("POST /v1/responses "));
 }
 
 #[test]
@@ -769,26 +950,17 @@ fn streamed_usage_limit_errors_remain_fatal() {
 }
 
 #[test]
-fn transient_response_failed_server_error_retries_stream_request() {
+fn transient_response_failed_server_error_is_fatal_without_retry() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind provider fixture");
     let address = listener.local_addr().expect("provider fixture address");
-    let mut failure = Reply::sse(format!(
+    let body = format!(
         "{RESPONSE_STARTED}{}",
         sse_event(
             "response.failed",
             &json!({"type":"response.failed","response":{"error":{"code":"server_error"}}})
         )
-    ));
-    failure.headers = "Retry-After: 0\r\n";
-    let server = serve_responses(
-        listener,
-        [
-            failure,
-            Reply::sse(completed_sse(
-                &json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
-            )),
-        ],
     );
+    let server = serve_responses(listener, [Reply::sse(body)]);
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -802,10 +974,9 @@ fn transient_response_failed_server_error_retries_stream_request() {
         Some(server.deadline()),
         &AtomicBool::new(false),
     ))
-    .expect("construct request runtime")
-    .expect("transient streamed failure should retry");
-    assert_eq!(result["status"], "completed");
-    assert_eq!(server.join().expect("join provider fixture").len(), 2);
+    .expect("construct request runtime");
+    assert!(result.is_err());
+    assert_eq!(server.join().expect("join provider fixture").len(), 1);
 }
 
 #[test]
@@ -916,6 +1087,18 @@ fn direct_route_admission_denials_are_fatal_before_model_dispatch() {
         let observed_dispatches = Arc::clone(&model_dispatches);
         let deadline = std::time::Instant::now() + WATCHDOG;
         let server = thread::spawn(move || {
+            let mut handshake = accept_until(&listener, deadline).expect("accept WebSocket setup");
+            let handshake_request =
+                read_request_until(&mut handshake, deadline).expect("read WebSocket setup");
+            assert!(super::super::test_support::is_websocket_upgrade(
+                &handshake_request
+            ));
+            write_until(
+                &mut handshake,
+                b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                deadline,
+            )
+            .expect("reject unavailable WebSocket setup");
             let mut stream = accept_until(&listener, deadline).expect("accept admission request");
             let request =
                 read_request_until(&mut stream, deadline).expect("read admission request");
@@ -1119,7 +1302,19 @@ fn start_stalled_provider(stall: StallPoint) -> (String, thread::JoinHandle<(Str
     let address = listener.local_addr().expect("stalled provider address");
     let deadline = Instant::now() + WATCHDOG;
     let server = thread::spawn(move || {
-        let mut stream = accept_until(&listener, deadline).expect("accept stalled request");
+        let mut handshake = accept_until(&listener, deadline).expect("accept WebSocket setup");
+        let handshake_request =
+            read_request_until(&mut handshake, deadline).expect("read WebSocket setup");
+        assert!(super::super::test_support::is_websocket_upgrade(
+            &handshake_request
+        ));
+        write_until(
+            &mut handshake,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            deadline,
+        )
+        .expect("reject unavailable WebSocket setup");
+        let mut stream = accept_until(&listener, deadline).expect("accept stalled HTTP request");
         let first_request =
             read_request_until(&mut stream, deadline).expect("read stalled request");
         match stall {
