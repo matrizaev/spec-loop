@@ -5,6 +5,58 @@ use crate::config::Profile;
 use crate::protocol::{self, PlanReviewResponse, ReviewResult};
 
 #[test]
+fn role_prompt_schema_matches_backend_response_contract() {
+    let roles = [
+        PromptRole::PlanAuthor,
+        PromptRole::PlanReview,
+        PromptRole::PlanAudit,
+        PromptRole::PlanClarification,
+        PromptRole::Implementation,
+        PromptRole::Review,
+        PromptRole::ReviewAudit,
+        PromptRole::ReviewClarification,
+    ];
+    for (backend, extra) in [("pi", ""), ("builtin", "model = 'fixture-model'\n")] {
+        let profile: Profile = toml::from_str(&format!(
+            "schema_version = 3\n[specs]\nactive_globs = ['specs/*.md']\nid_regex = '(?P<id>.*)'\n[agent]\nbackend = '{backend}'\n{extra}"
+        ))
+        .expect("profile with selected backend");
+        for role in roles {
+            let prompt = build_prompt(
+                Path::new("/project"),
+                &profile,
+                PromptContext {
+                    role,
+                    spec_id: "1",
+                    spec_path: Path::new("specs/1.md"),
+                    plan_path: None,
+                    feedback: None,
+                    validation_feedback: None,
+                    checks: "",
+                    implementation_summary: None,
+                },
+            )
+            .expect("build role prompt");
+            let schema = prompt
+                .split_once("--- Generated response schema ---\n")
+                .expect("prompt response schema")
+                .1
+                .split_once("\n--- End generated response schema ---")
+                .expect("schema terminator")
+                .0;
+            let schema: serde_json::Value =
+                serde_json::from_str(schema).expect("parse prompt response schema");
+            assert_eq!(
+                schema,
+                super::response_schema_for_backend(role, profile.agent.backend)
+                    .expect("select backend response schema"),
+                "role prompt must describe the schema enforced by its backend"
+            );
+        }
+    }
+}
+
+#[test]
 fn configured_role_instruction_paths_and_write_boundaries_remain_required() {
     let profile: Profile = toml::from_str(
         r"schema_version = 3

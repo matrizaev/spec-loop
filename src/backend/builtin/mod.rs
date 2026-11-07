@@ -14,7 +14,7 @@ use super::{
 };
 use crate::auth;
 use crate::backend::builtin::usage::{ResponseUsage, UsageReporter, UsageSnapshot};
-use crate::config::Profile;
+use crate::config::{AgentBackendKind, Profile};
 use crate::error::{Result, SpecLoopError};
 use crate::prompts::{self, PromptRole};
 use crate::protocol::provider as protocol_provider;
@@ -179,7 +179,7 @@ fn build_responses_request(
                 "type": "json_schema",
                 "name": role.protocol_name(),
                 "strict": true,
-                "schema": protocol_provider::project_schema(&prompts::schema_for_role(role)?)?
+                "schema": prompts::response_schema_for_backend(role, AgentBackendKind::Builtin)?,
             }
         }
     });

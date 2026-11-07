@@ -37,13 +37,17 @@ use super::{
 use crate::error::{Result, SpecLoopError};
 
 #[test]
-fn shared_token_scope_extraction_preserves_order_and_missing_scope() {
+fn shared_token_scope_extraction_preserves_present_and_omitted_scope() {
     for (scope, expected) in [
         (
             Some("profile chatgpt.tokens.use.direct openid"),
-            vec!["profile", "chatgpt.tokens.use.direct", "openid"],
+            Some(vec![
+                "profile".to_owned(),
+                "chatgpt.tokens.use.direct".to_owned(),
+                "openid".to_owned(),
+            ]),
         ),
-        (None, Vec::new()),
+        (None, None),
     ] {
         let mut value = json!({"access_token":"fixture", "token_type":"Bearer"});
         if let Some(scope) = scope {
@@ -84,12 +88,12 @@ struct AuthorizationCapture {
 
 enum FakeTokenResponse {
     Login {
-        scopes: String,
+        scopes: Option<String>,
         nonce_override: Option<String>,
         issuer_override: Option<String>,
     },
     Refresh {
-        scopes: String,
+        scopes: Option<String>,
     },
     Error {
         body_secret: String,
@@ -413,30 +417,30 @@ fn start_fake_issuer(
                             "test-subject-a",
                             &signing_key,
                         );
-                        (
-                            "200 OK",
-                            json!({
-                                "access_token": "fixture-access-secret",
-                                "refresh_token": "fixture-refresh-secret",
-                                "token_type": "Bearer",
-                                "expires_in": 3600,
-                                "scope": scopes,
-                                "id_token": id_token
-                            })
-                            .to_string(),
-                        )
-                    }
-                    FakeTokenResponse::Refresh { scopes } => (
-                        "200 OK",
-                        json!({
-                            "access_token": "fixture-refreshed-access",
-                            "refresh_token": "fixture-refreshed-refresh",
+                        let mut response = json!({
+                            "access_token": "fixture-access-secret",
+                            "refresh_token": "fixture-refresh-secret",
                             "token_type": "Bearer",
                             "expires_in": 3600,
-                            "scope": scopes
-                        })
-                        .to_string(),
-                    ),
+                            "id_token": id_token
+                        });
+                        if let Some(scopes) = scopes {
+                            response["scope"] = json!(scopes);
+                        }
+                        ("200 OK", response.to_string())
+                    }
+                    FakeTokenResponse::Refresh { scopes } => ("200 OK", {
+                        let mut response = json!({
+                        "access_token": "fixture-refreshed-access",
+                        "refresh_token": "fixture-refreshed-refresh",
+                        "token_type": "Bearer",
+                        "expires_in": 3600
+                        });
+                        if let Some(scopes) = scopes {
+                            response["scope"] = json!(scopes);
+                        }
+                        response.to_string()
+                    }),
                     FakeTokenResponse::Error { body_secret } => (
                         "400 Bad Request",
                         json!({"error": "invalid_grant", "detail": body_secret}).to_string(),
@@ -536,7 +540,7 @@ fn login_exchanges_code_and_validates_pkce_state_and_signed_identity_offline() {
         ..
     } = run_fake_login(
         FakeTokenResponse::Login {
-            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
+            scopes: Some("openid offline_access chatgpt.tokens.use.direct".to_owned()),
             nonce_override: None,
             issuer_override: None,
         },
@@ -603,6 +607,35 @@ fn login_exchanges_code_and_validates_pkce_state_and_signed_identity_offline() {
 }
 
 #[test]
+fn login_accepts_omitted_unchanged_scope_response() {
+    let FakeLoginRun {
+        result,
+        server,
+        saved_registration,
+        ..
+    } = run_fake_login(
+        FakeTokenResponse::Login {
+            scopes: None,
+            nonce_override: None,
+            issuer_override: None,
+        },
+        true,
+        false,
+    );
+    result.expect("accept omitted scope when requested scopes are unchanged");
+    assert_eq!(server.join().expect("join fake issuer").len(), 3);
+    let registration = saved_registration
+        .lock()
+        .expect("lock saved registration")
+        .clone()
+        .expect("save credential after omitted scope response");
+    let credential = registration
+        .fallback_credential
+        .expect("persist credential scopes");
+    assert_eq!(credential.scopes, super::requested_authorization_scopes());
+}
+
+#[test]
 fn successful_fake_login_persists_at_resolved_auth_directory() {
     let temporary = TempDir::new().expect("create custom auth directory fixture");
     let auth_dir = temporary.path().join("selected-auth");
@@ -617,7 +650,7 @@ fn successful_fake_login_persists_at_resolved_auth_directory() {
         temporary,
         path.clone(),
         FakeTokenResponse::Login {
-            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
+            scopes: Some("openid offline_access chatgpt.tokens.use.direct".to_owned()),
             nonce_override: None,
             issuer_override: None,
         },
@@ -646,7 +679,7 @@ fn login_rejects_missing_permission_wrong_state_and_invalid_nonce_without_saving
         ..
     } = run_fake_login(
         FakeTokenResponse::Login {
-            scopes: "openid offline_access".to_owned(),
+            scopes: Some("openid offline_access".to_owned()),
             nonce_override: None,
             issuer_override: None,
         },
@@ -669,7 +702,7 @@ fn login_rejects_missing_permission_wrong_state_and_invalid_nonce_without_saving
         ..
     } = run_fake_login(
         FakeTokenResponse::Login {
-            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
+            scopes: Some("openid offline_access chatgpt.tokens.use.direct".to_owned()),
             nonce_override: None,
             issuer_override: None,
         },
@@ -695,7 +728,7 @@ fn login_rejects_missing_permission_wrong_state_and_invalid_nonce_without_saving
         ..
     } = run_fake_login(
         FakeTokenResponse::Login {
-            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
+            scopes: Some("openid offline_access chatgpt.tokens.use.direct".to_owned()),
             nonce_override: Some("wrong-nonce".to_owned()),
             issuer_override: None,
         },
@@ -721,7 +754,7 @@ fn login_rejects_missing_permission_wrong_state_and_invalid_nonce_without_saving
         ..
     } = run_fake_login(
         FakeTokenResponse::Login {
-            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
+            scopes: Some("openid offline_access chatgpt.tokens.use.direct".to_owned()),
             nonce_override: None,
             issuer_override: Some("http://issuer-mismatch.invalid".to_owned()),
         },
@@ -743,7 +776,7 @@ fn login_rejects_missing_permission_wrong_state_and_invalid_nonce_without_saving
 fn failed_first_login_retry_reuses_persisted_host_id() {
     let first_attempt = run_fake_login(
         FakeTokenResponse::Login {
-            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
+            scopes: Some("openid offline_access chatgpt.tokens.use.direct".to_owned()),
             nonce_override: None,
             issuer_override: None,
         },
@@ -776,7 +809,7 @@ fn failed_first_login_retry_reuses_persisted_host_id() {
     let retry = run_fake_login_in(
         temporary,
         FakeTokenResponse::Login {
-            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
+            scopes: Some("openid offline_access chatgpt.tokens.use.direct".to_owned()),
             nonce_override: None,
             issuer_override: None,
         },
@@ -847,9 +880,7 @@ fn login_cancellation_and_token_errors_do_not_leak_or_persist_secrets() {
 #[test]
 fn refresh_success_and_failure_use_fake_token_endpoint_without_secret_diagnostics() {
     let (issuer, server) = start_fake_issuer(
-        FakeTokenResponse::Refresh {
-            scopes: "openid offline_access chatgpt.tokens.use.direct".to_owned(),
-        },
+        FakeTokenResponse::Refresh { scopes: None },
         3,
         Arc::new(Mutex::new(None)),
     );
@@ -878,6 +909,7 @@ fn refresh_success_and_failure_use_fake_token_endpoint_without_secret_diagnostic
         refreshed.refresh_token.as_deref(),
         Some("fixture-refreshed-refresh")
     );
+    assert_eq!(refreshed.scopes, current.scopes);
     assert_eq!(server.join().expect("join fake refresh issuer").len(), 3);
 
     let (issuer, server) = start_fake_issuer(
@@ -1610,7 +1642,7 @@ fn refreshed_token_rotates_credentials_and_requires_direct_permission() {
         &current,
         "new-access".to_owned(),
         Some("new-refresh".to_owned()),
-        vec!["chatgpt.tokens.use.direct".to_owned()],
+        Some(vec!["chatgpt.tokens.use.direct".to_owned()]),
         Some(std::time::Duration::from_secs(3600)),
     )
     .expect("accept authorized refreshed token");
@@ -1618,9 +1650,24 @@ fn refreshed_token_rotates_credentials_and_requires_direct_permission() {
     assert_eq!(refreshed.refresh_token.as_deref(), Some("new-refresh"));
     assert_eq!(refreshed.id_token, "identity-token");
 
-    let missing_permission =
-        refreshed_credential(&current, "new-access".to_owned(), None, Vec::new(), None);
-    assert!(missing_permission.is_err());
+    let omitted_scope = refreshed_credential(
+        &current,
+        "new-access".to_owned(),
+        None,
+        None,
+        Some(std::time::Duration::from_secs(3600)),
+    )
+    .expect("inherit granted scopes when refresh response omits scope");
+    assert_eq!(omitted_scope.scopes, current.scopes);
+
+    let reduced_scope = refreshed_credential(
+        &current,
+        "new-access".to_owned(),
+        None,
+        Some(Vec::new()),
+        None,
+    );
+    assert!(reduced_scope.is_err());
 }
 
 #[test]

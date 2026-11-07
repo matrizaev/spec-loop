@@ -208,8 +208,8 @@ pub fn build_prompt(root: &Path, profile: &Profile, context: PromptContext<'_>) 
         prompt.push_str("\n\n--- Response validation feedback ---\n");
         prompt.push_str(feedback);
     }
-    let schema = schema_for_role(context.role)?;
-    prompt.push_str("\n\nReturn exactly one JSON object matching this generated JSON Schema 2020-12. No Markdown fences, preamble, trailing prose, or unknown fields. Strings must be non-empty. `role` and `protocol_version` must match the schema contract.\n--- Generated response schema ---\n");
+    let schema = response_schema_for_backend(context.role, profile.agent.backend)?;
+    prompt.push_str("\n\nReturn exactly one JSON object matching the generated response schema below. No Markdown fences, preamble, trailing prose, or unknown fields. Strings must be non-empty. The role-specific response and its `role` and `protocol_version` fields must match the schema contract.\n--- Generated response schema ---\n");
     prompt
         .push_str(&serde_json::to_string_pretty(&schema).map_err(|error| {
             SpecLoopError::Agent(format!("serialize response schema: {error}"))
@@ -231,6 +231,14 @@ pub fn schema_for_role(role: PromptRole) -> Result<Value> {
         PromptRole::ReviewClarification => {
             protocol::schema_value::<ImplementationClarificationResponse>()
         }
+    }
+}
+
+pub fn response_schema_for_backend(role: PromptRole, backend: AgentBackendKind) -> Result<Value> {
+    let canonical = schema_for_role(role)?;
+    match backend {
+        AgentBackendKind::Builtin => protocol::provider::project_schema(&canonical),
+        AgentBackendKind::Pi => Ok(canonical),
     }
 }
 

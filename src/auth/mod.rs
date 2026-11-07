@@ -43,6 +43,14 @@ mod tests;
 
 const ISSUER: &str = "https://auth.openai.com";
 const DIRECT_SCOPE: &str = "chatgpt.tokens.use.direct";
+const AUTHORIZATION_SCOPES: &[&str] = &[
+    "openid",
+    "profile",
+    "email",
+    "offline_access",
+    "resource.invoke",
+    DIRECT_SCOPE,
+];
 const TOKEN_REFRESH_SKEW_SECONDS: u64 = 300;
 const KEYRING_SERVICE: &str = "spec-loop-chatgpt";
 type ConfiguredCoreClient = CoreClient<
@@ -456,16 +464,20 @@ async fn discover_provider(
     .await
 }
 
-fn token_scopes(token: &CoreTokenResponse) -> Vec<String> {
-    token
-        .scopes()
-        .map(|scopes| {
-            scopes
-                .iter()
-                .map(|scope| scope.as_str().to_owned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+fn token_scopes(token: &CoreTokenResponse) -> Option<Vec<String>> {
+    token.scopes().map(|scopes| {
+        scopes
+            .iter()
+            .map(|scope| scope.as_str().to_owned())
+            .collect::<Vec<_>>()
+    })
+}
+
+fn requested_authorization_scopes() -> Vec<String> {
+    AUTHORIZATION_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_owned())
+        .collect()
 }
 
 async fn login(
@@ -661,18 +673,15 @@ fn authorization_details(
     registration: AuthorizationRegistration<'_>,
 ) -> AuthorizationDetails {
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-    let mut request = client
-        .authorize_url(
-            CoreAuthenticationFlow::AuthorizationCode,
-            CsrfToken::new_random,
-            Nonce::new_random,
-        )
-        .add_scope(Scope::new("openid".to_owned()))
-        .add_scope(Scope::new("profile".to_owned()))
-        .add_scope(Scope::new("email".to_owned()))
-        .add_scope(Scope::new("offline_access".to_owned()))
-        .add_scope(Scope::new("resource.invoke".to_owned()))
-        .add_scope(Scope::new(DIRECT_SCOPE.to_owned()))
+    let mut request = client.authorize_url(
+        CoreAuthenticationFlow::AuthorizationCode,
+        CsrfToken::new_random,
+        Nonce::new_random,
+    );
+    for scope in AUTHORIZATION_SCOPES {
+        request = request.add_scope(Scope::new((*scope).to_owned()));
+    }
+    request = request
         .add_extra_param("resource", "https://api.openai.com/v1")
         .add_extra_param("ext_agent_host_id", host_id);
     match registration {
@@ -742,9 +751,10 @@ fn refreshed_credential(
     current: &Credential,
     access_token: String,
     refresh_token: Option<String>,
-    scopes: Vec<String>,
+    scopes: Option<Vec<String>>,
     expires_in: Option<Duration>,
 ) -> Result<Credential> {
+    let scopes = scopes.unwrap_or_else(|| current.scopes.clone());
     if !scopes.iter().any(|scope| scope == DIRECT_SCOPE) {
         return Err(SpecLoopError::Workflow(format!(
             "refreshed ChatGPT token lacks `{DIRECT_SCOPE}` permission; run `spec-loop auth login`"
@@ -1081,7 +1091,7 @@ fn credential_from_token(
     verifier: &CoreIdTokenVerifier<'_>,
     nonce: &Nonce,
 ) -> Result<(String, String, Credential)> {
-    let scopes = token_scopes(token);
+    let scopes = token_scopes(token).unwrap_or_else(requested_authorization_scopes);
     if !scopes.iter().any(|scope| scope == DIRECT_SCOPE) {
         return Err(SpecLoopError::Workflow(format!(
             "OpenAI authorization lacks required `{DIRECT_SCOPE}` permission; grant it and run `spec-loop auth login` again"
